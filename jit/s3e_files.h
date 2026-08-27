@@ -1,0 +1,39 @@
+/* s3e_files.h -- the file layer behind the s3eFile* imports.
+ *
+ * Ported from run_boz.py's VFS so the C harness resolves exactly the same
+ * bytes the Unicorn reference does. Every file the game can open is a byte
+ * range of a real file on disk, so this needs no DTRZ parser: it reads the
+ * flat index produced by loader/mkfileidx.py.
+ *
+ * Handles are guest-visible pointers (0xF1000000 + 4*slot), matching the
+ * reference harness so traces line up.
+ */
+#ifndef S3E_FILES_H
+#define S3E_FILES_H
+
+#include <stdint.h>
+
+#define S3E_FILE_HANDLE_BASE 0xF1000000u
+
+/* Marmalade error codes the game actually checks. */
+#define S3E_FILE_ERR_NONE      0
+#define S3E_FILE_ERR_NOT_FOUND 3
+
+/* `root` holds boz_files.idx and the archives it names, plus the save
+ * sandbox. Returns the number of index entries, or -1 if the index is
+ * missing (the layer then still serves loose files from root). */
+int s3e_vfs_init(const char *root);
+
+uint32_t s3e_vfs_open(const char *name, const char *mode);
+uint32_t s3e_vfs_read(uint32_t h, void *dst, uint32_t n);
+uint32_t s3e_vfs_write(uint32_t h, const void *src, uint32_t n);
+int      s3e_vfs_seek(uint32_t h, int32_t off, uint32_t origin);
+uint32_t s3e_vfs_tell(uint32_t h);
+uint32_t s3e_vfs_size(uint32_t h);
+void     s3e_vfs_close(uint32_t h);
+int      s3e_vfs_exists(const char *name);
+int      s3e_vfs_error(void);
+int      s3e_vfs_delete(const char *name);
+int      s3e_vfs_mkdir(const char *name);
+
+#endif /* S3E_FILES_H */

@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "scope": "ARMv7-A decoder classification; no semantic state assertions",
+  "encoding_convention": {
+    "A32": "one architectural 32-bit word in hexadecimal",
+    "T32": "two architectural halfwords in fetch order; encoding_hex concatenates hw1 then hw2"
+  },
+  "toolchain": "GNU Binutils arm-none-eabi-as/objdump 2.45.1, .arch armv7-a, .fpu vfpv3",
+  "groups": [
+    {
+      "id": "t32_e8_dual_table_multiple",
+      "naive_test": "hw1 & 0xFE00 == 0xE800",
+      "required_precedence": ["tbb_tbh", "ldrd_strd", "ldm_stm"]
+    },
+    {
+      "id": "t32_f8_load_hint",
+      "naive_test": "hw1 & 0xFE00 == 0xF800",
+      "required_precedence": ["preload_hint_rt15", "single_load_store"]
+    },
+    {
+      "id": "t32_fa_register_data",
+      "naive_test": "hw1 & 0xFF00 == 0xFA00",
+      "required_precedence": ["exact_op_field", "generic_register_data"]
+    },
+    {
+      "id": "a32_data_misc_extension",
+      "naive_test": "word & 0x0C000000 == 0",
+      "required_precedence": ["exact_misc", "multiply_extra", "halfword_multiply", "movw_movt", "data_processing"]
+    },
+    {
+      "id": "a32_media_vs_transfer",
+      "naive_test": "word & 0x0C000000 == 0x04000000",
+      "required_precedence": ["unconditional_space", "media_when_I_and_bit4", "single_data_transfer"]
+    },
+    {
+      "id": "vfp_vs_coprocessor",
+      "naive_test": "hw1 & 0xFE00 == 0xEC00",
+      "required_precedence": ["cp10_cp11_gate", "vmov_core_pair", "vfp_memory"]
+    }
+  ],
+  "vectors": [
+    {"id":"t32_tbb","isa":"T32","encoding_hex":"E8D1F002","halfwords":["E8D1","F002"],"mnemonic":"tbb [r1, r2]","group":"t32_e8_dual_table_multiple","expected_family":"tbb_tbh","forbidden_families":["ldrd_strd","ldm_stm"]},
+    {"id":"t32_tbh","isa":"T32","encoding_hex":"E8D1F012","halfwords":["E8D1","F012"],"mnemonic":"tbh [r1, r2, lsl #1]","group":"t32_e8_dual_table_multiple","expected_family":"tbb_tbh","forbidden_families":["ldrd_strd","ldm_stm"]},
+    {"id":"t32_ldrd","isa":"T32","encoding_hex":"E9D20101","halfwords":["E9D2","0101"],"mnemonic":"ldrd r0, r1, [r2, #4]","group":"t32_e8_dual_table_multiple","expected_family":"ldrd_strd","forbidden_families":["tbb_tbh","ldm_stm"]},
+    {"id":"t32_strd","isa":"T32","encoding_hex":"E9C20101","halfwords":["E9C2","0101"],"mnemonic":"strd r0, r1, [r2, #4]","group":"t32_e8_dual_table_multiple","expected_family":"ldrd_strd","forbidden_families":["tbb_tbh","ldm_stm"]},
+    {"id":"t32_ldmia","isa":"T32","encoding_hex":"E8B20003","halfwords":["E8B2","0003"],"mnemonic":"ldmia.w r2!, {r0, r1}","group":"t32_e8_dual_table_multiple","expected_family":"ldm_stm","forbidden_families":["tbb_tbh","ldrd_strd"]},
+    {"id":"t32_stmia","isa":"T32","encoding_hex":"E8A20003","halfwords":["E8A2","0003"],"mnemonic":"stmia.w r2!, {r0, r1}","group":"t32_e8_dual_table_multiple","expected_family":"ldm_stm","forbidden_families":["tbb_tbh","ldrd_strd"]},
+    {"id":"t32_pld","isa":"T32","encoding_hex":"F890F000","halfwords":["F890","F000"],"mnemonic":"pld [r0]","group":"t32_f8_load_hint","expected_family":"preload_hint_rt15","forbidden_families":["single_load_store","pc_load"]},
+    {"id":"t32_clz","isa":"T32","encoding_hex":"FAB1F081","halfwords":["FAB1","F081"],"mnemonic":"clz r0, r1","group":"t32_fa_register_data","expected_family":"clz","forbidden_families":["extend","sel"]},
+    {"id":"t32_sel","isa":"T32","encoding_hex":"FAA1F082","halfwords":["FAA1","F082"],"mnemonic":"sel r0, r1, r2","group":"t32_fa_register_data","expected_family":"sel","forbidden_families":["extend","clz"]},
+    {"id":"t32_uxtb","isa":"T32","encoding_hex":"FA5FF081","halfwords":["FA5F","F081"],"mnemonic":"uxtb.w r0, r1","group":"t32_fa_register_data","expected_family":"extend","forbidden_families":["sel","clz"]},
+
+    {"id":"a32_clz","isa":"A32","encoding_hex":"E16F3F10","mnemonic":"clz r3, r0","group":"a32_data_misc_extension","expected_family":"clz","forbidden_families":["data_processing_cmn"]},
+    {"id":"a32_cmn","isa":"A32","encoding_hex":"E1700001","mnemonic":"cmn r0, r1","group":"a32_data_misc_extension","expected_family":"data_processing_cmn","forbidden_families":["clz","misc"]},
+    {"id":"a32_bx","isa":"A32","encoding_hex":"E12FFF11","mnemonic":"bx r1","group":"a32_data_misc_extension","expected_family":"bx","forbidden_families":["data_processing"]},
+    {"id":"a32_blx_reg","isa":"A32","encoding_hex":"E12FFF31","mnemonic":"blx r1","group":"a32_data_misc_extension","expected_family":"blx_register","forbidden_families":["data_processing"]},
+    {"id":"a32_mrs","isa":"A32","encoding_hex":"E10F2000","mnemonic":"mrs r2, CPSR","group":"a32_data_misc_extension","expected_family":"mrs","forbidden_families":["data_processing"]},
+    {"id":"a32_msr","isa":"A32","encoding_hex":"E128F001","mnemonic":"msr CPSR_f, r1","group":"a32_data_misc_extension","expected_family":"msr","forbidden_families":["data_processing"]},
+    {"id":"a32_bkpt","isa":"A32","encoding_hex":"E1200172","mnemonic":"bkpt #0x12","group":"a32_data_misc_extension","expected_family":"bkpt","forbidden_families":["data_processing"]},
+    {"id":"a32_qadd","isa":"A32","encoding_hex":"E1012050","mnemonic":"qadd r2, r0, r1","group":"a32_data_misc_extension","expected_family":"saturating_misc","forbidden_families":["data_processing"]},
+    {"id":"a32_mul","isa":"A32","encoding_hex":"E0020190","mnemonic":"mul r2, r0, r1","group":"a32_data_misc_extension","expected_family":"multiply","forbidden_families":["data_processing"]},
+    {"id":"a32_and_reg_shift_reg","isa":"A32","encoding_hex":"E0002311","mnemonic":"and r2, r0, r1, lsl r3","group":"a32_data_misc_extension","expected_family":"data_processing","forbidden_families":["multiply","extra_load_store"]},
+    {"id":"a32_ldrh","isa":"A32","encoding_hex":"E19020B1","mnemonic":"ldrh r2, [r0, r1]","group":"a32_data_misc_extension","expected_family":"extra_load_store","forbidden_families":["data_processing","multiply"]},
+    {"id":"a32_smulbb","isa":"A32","encoding_hex":"E1620180","mnemonic":"smulbb r2, r0, r1","group":"a32_data_misc_extension","expected_family":"halfword_multiply","forbidden_families":["data_processing","misc_reject"]},
+    {"id":"a32_movw","isa":"A32","encoding_hex":"E3012234","mnemonic":"movw r2, #0x1234","group":"a32_data_misc_extension","expected_family":"movw_movt","forbidden_families":["data_processing_tst"]},
+    {"id":"a32_movt","isa":"A32","encoding_hex":"E3452678","mnemonic":"movt r2, #0x5678","group":"a32_data_misc_extension","expected_family":"movw_movt","forbidden_families":["data_processing_cmp"]},
+
+    {"id":"a32_uxtb","isa":"A32","encoding_hex":"E6EF2071","mnemonic":"uxtb r2, r1","group":"a32_media_vs_transfer","expected_family":"media_extend","forbidden_families":["single_data_transfer"]},
+    {"id":"a32_rev","isa":"A32","encoding_hex":"E6BF2F31","mnemonic":"rev r2, r1","group":"a32_media_vs_transfer","expected_family":"media_reverse","forbidden_families":["single_data_transfer"]},
+    {"id":"a32_uadd8","isa":"A32","encoding_hex":"E6502F91","mnemonic":"uadd8 r2, r0, r1","group":"a32_media_vs_transfer","expected_family":"media_parallel_add","forbidden_families":["single_data_transfer"]},
+    {"id":"a32_sel","isa":"A32","encoding_hex":"E6802FB1","mnemonic":"sel r2, r0, r1","group":"a32_media_vs_transfer","expected_family":"media_sel","forbidden_families":["single_data_transfer"]},
+    {"id":"a32_ubfx","isa":"A32","encoding_hex":"E7E621D1","mnemonic":"ubfx r2, r1, #3, #7","group":"a32_media_vs_transfer","expected_family":"media_bitfield","forbidden_families":["single_data_transfer"]},
+    {"id":"a32_ssat","isa":"A32","encoding_hex":"E6A721D1","mnemonic":"ssat r2, #8, r1, asr #3","group":"a32_media_vs_transfer","expected_family":"media_saturate","forbidden_families":["single_data_transfer"]},
+    {"id":"a32_ldr_reg","isa":"A32","encoding_hex":"E7902001","mnemonic":"ldr r2, [r0, r1]","group":"a32_media_vs_transfer","expected_family":"single_data_transfer","forbidden_families":["media"]},
+    {"id":"a32_pld","isa":"A32","encoding_hex":"F5D0F004","mnemonic":"pld [r0, #4]","group":"a32_media_vs_transfer","expected_family":"unconditional_preload_hint","forbidden_families":["single_data_transfer","pc_load"]},
+
+    {"id":"a32_vmov_to_core","isa":"A32","encoding_hex":"EC510B19","mnemonic":"vmov r0, r1, d9","group":"vfp_vs_coprocessor","expected_family":"vmov_core_pair","forbidden_families":["vfp_memory"]},
+    {"id":"a32_vmov_from_core","isa":"A32","encoding_hex":"EC410B19","mnemonic":"vmov d9, r0, r1","group":"vfp_vs_coprocessor","expected_family":"vmov_core_pair","forbidden_families":["vfp_memory"]},
+    {"id":"a32_vldm","isa":"A32","encoding_hex":"ECB18B04","mnemonic":"vldmia r1!, {d8-d9}","group":"vfp_vs_coprocessor","expected_family":"vfp_memory","forbidden_families":["vmov_core_pair"]},
+    {"id":"a32_vstm","isa":"A32","encoding_hex":"ECA18B04","mnemonic":"vstmia r1!, {d8-d9}","group":"vfp_vs_coprocessor","expected_family":"vfp_memory","forbidden_families":["vmov_core_pair"]},
+    {"id":"a32_vldr","isa":"A32","encoding_hex":"ED919B02","mnemonic":"vldr d9, [r1, #8]","group":"vfp_vs_coprocessor","expected_family":"vfp_memory","forbidden_families":["generic_coprocessor"]},
+    {"id":"a32_vstr","isa":"A32","encoding_hex":"ED819B02","mnemonic":"vstr d9, [r1, #8]","group":"vfp_vs_coprocessor","expected_family":"vfp_memory","forbidden_families":["generic_coprocessor"]},
+    {"id":"a32_mrrc_p1","isa":"A32","encoding_hex":"EC510102","mnemonic":"mrrc p1, 0, r0, r1, c2","group":"vfp_vs_coprocessor","expected_family":"generic_coprocessor_or_undef","forbidden_families":["vmov_core_pair","vfp_memory"]},
+    {"id":"a32_mcrr_p1","isa":"A32","encoding_hex":"EC410102","mnemonic":"mcrr p1, 0, r0, r1, c2","group":"vfp_vs_coprocessor","expected_family":"generic_coprocessor_or_undef","forbidden_families":["vmov_core_pair","vfp_memory"]},
+    {"id":"a32_ldc_p1","isa":"A32","encoding_hex":"ED932101","mnemonic":"ldc p1, c2, [r3, #4]","group":"vfp_vs_coprocessor","expected_family":"generic_coprocessor_or_undef","forbidden_families":["vfp_memory"]},
+    {"id":"a32_stc_p1","isa":"A32","encoding_hex":"ED832101","mnemonic":"stc p1, c2, [r3, #4]","group":"vfp_vs_coprocessor","expected_family":"generic_coprocessor_or_undef","forbidden_families":["vfp_memory"]},
+    {"id":"a32_svc","isa":"A32","encoding_hex":"EF000123","mnemonic":"svc #0x123","group":"vfp_vs_coprocessor","expected_family":"svc","forbidden_families":["vfp","generic_coprocessor"]},
+
+    {"id":"t32_vmov_to_core","isa":"T32","encoding_hex":"EC510B19","halfwords":["EC51","0B19"],"mnemonic":"vmov r0, r1, d9","group":"vfp_vs_coprocessor","expected_family":"vmov_core_pair","forbidden_families":["vfp_memory"]},
+    {"id":"t32_vmov_from_core","isa":"T32","encoding_hex":"EC410B19","halfwords":["EC41","0B19"],"mnemonic":"vmov d9, r0, r1","group":"vfp_vs_coprocessor","expected_family":"vmov_core_pair","forbidden_families":["vfp_memory"]},
+    {"id":"t32_vldm","isa":"T32","encoding_hex":"ECB18B04","halfwords":["ECB1","8B04"],"mnemonic":"vldmia r1!, {d8-d9}","group":"vfp_vs_coprocessor","expected_family":"vfp_memory","forbidden_families":["vmov_core_pair"]},
+    {"id":"t32_vstm","isa":"T32","encoding_hex":"ECA18B04","halfwords":["ECA1","8B04"],"mnemonic":"vstmia r1!, {d8-d9}","group":"vfp_vs_coprocessor","expected_family":"vfp_memory","forbidden_families":["vmov_core_pair"]}
+  ]
+}

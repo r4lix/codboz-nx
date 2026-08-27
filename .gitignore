@@ -1,0 +1,56 @@
+# ---------------------------------------------------------------- game data
+# None of this is ours to redistribute: it is Activision's shipped game and the
+# assets extracted from it. The port needs them at runtime, but they must be
+# supplied from your own copy -- see README.
+CODBOZ.apk
+*.apk
+*.obb
+*.dz
+boz.s3e
+boz.s3e.unpacked
+boz_files.idx
+com.activision.boz/
+.cache/
+
+# ------------------------------------------------------------ build output
+build/
+*.o
+*.obj
+*.elf
+*.nro
+*.nacp
+*.map
+*.exe
+*.lib
+*.pdb
+*.ilk
+__pycache__/
+.venv/
+
+# ------------------------------------------- measurement and scratch output
+# Traces are 80 MB each; frames and screenshots are rendered game content.
+*.trace
+watch_*.bin
+nxlog.txt
+nx_stdout.txt
+nx_stderr.txt
+diff/
+frames/
+frames_a/
+frames_b/
+gl_0x*/
+orient_*/
+opt1/
+save/
+gen/
+loader/out/
+*.ppm
+*.png
+*.jpg
+*.raw
+*.log
+
+# stray backups and captured output
+*.bak
+*.prediff
+nxlink_out.txt
