@@ -246,8 +246,22 @@ static int resolve(const char *name, char *real, size_t rn,
     }
 
     /* A .dz the game names but we do not have is the main archive under a
-     * variant name; serve the first mounted archive whole. */
+     * variant name; serve the first mounted archive whole.
+     *
+     * Except a *_hires one. The image carries eight asset-pack names (RVA
+     * 0x3b3952): gles1/dxt/atitc/etc, each in a standard and a _hires tier. It
+     * asks for blackops_hires.dz -- the uncompressed hi-res pack -- and every
+     * pack that actually exists is standard resolution, so substituting ours
+     * hands it an archive whose hi-res resource names are absent. Refusing the
+     * name instead lets the game fall back to a tier we can satisfy; if it has
+     * no fallback we learn that too, which the silent substitution hid.
+     *
+     * BOZ_ANY_DZ=1 restores the old behaviour. */
     if (strlen(n) > 3 && strcmp(n + strlen(n) - 3, ".dz") == 0 && g_narch > 0) {
+        if (strstr(n, "_hires") && !getenv("BOZ_ANY_DZ")) {
+            printf("  [file ] refusing %s: no hi-res pack exists here\n", n);
+            return 0;
+        }
         if (!archive_path(0, real, rn))
             return 0;
         fs = file_size(real);

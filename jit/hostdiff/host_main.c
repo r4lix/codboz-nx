@@ -293,13 +293,35 @@ static void watch_memset(GuestCpu *cpu, GuestMem *mem, void *user) {
  * r3, not r0. */
 static int g_file_shown;
 
+static int g_file_failed, g_exists_failed;
+
 static void hle_file_open(GuestCpu *cpu, GuestMem *mem, void *user) {
     char fn[256], md[16];
     (void)user;
     gstr(mem, cpu->r[0], fn, sizeof fn);
     gstr(mem, cpu->r[1], md, sizeof md);
     cpu->r[0] = s3e_vfs_open(fn, md);
-    if (g_file_shown < 24) {
+    /* Failures are the interesting half and were being hidden by the cap: the
+     * menu renders every quad with the engine's 2x2 default texture, so the
+     * question is whether the game asks for its real art and is refused. Cap
+     * the successes, never the refusals. */
+    {   /* Who chose this name? The .dz variant is picked in code, and the LR
+         * at the open call names the chooser. */
+        static int dz_shown;
+        size_t l = strlen(fn);
+        if (l > 3 && !strcmp(fn + l - 3, ".dz") && dz_shown < 4) {
+            dz_shown++;
+            printf("  [file ] .dz request %s from lr=%08x (RVA %06x)\n", fn,
+                   (unsigned)cpu->r[14], (unsigned)(cpu->r[14] - 0x4a000000u));
+        }
+    }
+    if (!cpu->r[0]) {
+        g_file_failed++;
+        if (g_file_failed <= 200)
+            printf("  [file ] MISS %s (%s)\n", fn, md);
+        else if (g_file_failed == 201)
+            printf("  [file ] ... further misses not listed\n");
+    } else if (g_file_shown < 40) {
         printf("  [file ] open %s (%s) -> %08x\n", fn, md, (unsigned)cpu->r[0]);
         g_file_shown++;
     }
@@ -310,6 +332,13 @@ static void hle_file_exists(GuestCpu *cpu, GuestMem *mem, void *user) {
     (void)user;
     gstr(mem, cpu->r[0], fn, sizeof fn);
     cpu->r[0] = (uint32_t)s3e_vfs_exists(fn);
+    /* The engine probes before it opens, so a negative probe means the asset is
+     * never even requested -- a different failure from an open that is refused. */
+    if (!cpu->r[0]) {
+        g_exists_failed++;
+        if (g_exists_failed <= 60)
+            printf("  [file ] ABSENT %s\n", fn);
+    }
 }
 
 static void hle_file_read(GuestCpu *cpu, GuestMem *mem, void *user) {

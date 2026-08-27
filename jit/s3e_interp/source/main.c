@@ -487,13 +487,25 @@ static void fast_angle_normalize(GuestCpu *cpu, GuestMem *mem, void *user) {
  * r3, not r0. */
 static int g_file_shown;
 
+static int g_file_failed, g_exists_failed;
+
 static void hle_file_open(GuestCpu *cpu, GuestMem *mem, void *user) {
     char fn[256], md[16];
     (void)user;
     gstr(mem, cpu->r[0], fn, sizeof fn);
     gstr(mem, cpu->r[1], md, sizeof md);
     cpu->r[0] = s3e_vfs_open(fn, md);
-    if (g_file_shown < 24) {
+    /* Failures are the interesting half and were being hidden by the cap: the
+     * menu renders every quad with the engine's 2x2 default texture, so the
+     * question is whether the game asks for its real art and is refused. Cap
+     * the successes, never the refusals. */
+    if (!cpu->r[0]) {
+        g_file_failed++;
+        if (g_file_failed <= 200)
+            printf("  [file ] MISS %s (%s)\n", fn, md);
+        else if (g_file_failed == 201)
+            printf("  [file ] ... further misses not listed\n");
+    } else if (g_file_shown < 40) {
         printf("  [file ] open %s (%s) -> %08x\n", fn, md, (unsigned)cpu->r[0]);
         g_file_shown++;
     }
@@ -504,6 +516,13 @@ static void hle_file_exists(GuestCpu *cpu, GuestMem *mem, void *user) {
     (void)user;
     gstr(mem, cpu->r[0], fn, sizeof fn);
     cpu->r[0] = (uint32_t)s3e_vfs_exists(fn);
+    /* The engine probes before it opens, so a negative probe means the asset is
+     * never even requested -- a different failure from an open that is refused. */
+    if (!cpu->r[0]) {
+        g_exists_failed++;
+        if (g_exists_failed <= 60)
+            printf("  [file ] ABSENT %s\n", fn);
+    }
 }
 
 static void hle_file_read(GuestCpu *cpu, GuestMem *mem, void *user) {

@@ -797,6 +797,43 @@ static unsigned char *expand_palette(unsigned f, int width, int height,
     return dst;
 }
 
+/* Texture upload census. A first-N log cannot answer "does the game ever upload
+ * real art" -- the first uploads are the engine's 2x2 default and a cap hides
+ * everything after. This tracks distinct sizes and a running total instead, and
+ * reports on a cadence so a long run stays readable. */
+typedef struct { uint16_t w, h; uint32_t fmt; uint32_t n; } TexSize;
+static TexSize g_tex_size[24];
+static unsigned g_tex_kinds;
+static uint32_t g_tex_plain, g_tex_comp, g_tex_big;
+
+static void tex_note(uint32_t w, uint32_t h, uint32_t fmt, int compressed) {
+    unsigned i;
+    if (compressed)
+        g_tex_comp++;
+    else
+        g_tex_plain++;
+    if (w >= 64u && h >= 64u)
+        g_tex_big++;
+    for (i = 0; i < g_tex_kinds; i++)
+        if (g_tex_size[i].w == (uint16_t)w && g_tex_size[i].h == (uint16_t)h &&
+            g_tex_size[i].fmt == fmt) {
+            g_tex_size[i].n++;
+            return;
+        }
+    if (g_tex_kinds < 24u) {
+        g_tex_size[g_tex_kinds].w = (uint16_t)w;
+        g_tex_size[g_tex_kinds].h = (uint16_t)h;
+        g_tex_size[g_tex_kinds].fmt = fmt;
+        g_tex_size[g_tex_kinds].n = 1;
+        g_tex_kinds++;
+        printf("  [tex  ] NEW %ux%u %s 0x%04x  (totals: %u plain, %u compressed,"
+               " %u >=64px)\n", (unsigned)w, (unsigned)h,
+               compressed ? "compressed" : "plain", (unsigned)fmt,
+               (unsigned)g_tex_plain, (unsigned)g_tex_comp,
+               (unsigned)g_tex_big);
+    }
+}
+
 static void te_CompressedTexImage2D(GuestCpu *c, GuestMem *m, void *u) {
     static unsigned seen[8];
     static int nseen, calls;
@@ -813,6 +850,7 @@ static void te_CompressedTexImage2D(GuestCpu *c, GuestMem *m, void *u) {
                (int)ga(c, m, 1), (int)ga(c, m, 6));
     }
     calls++;
+    tex_note((uint32_t)ga(c, m, 3), (uint32_t)ga(c, m, 4), f, 1);
     {   /* imageSize is given explicitly for a compressed upload, so the extent
          * is exactly known and needs no format table. */
         uint32_t bytes = (uint32_t)ga(c, m, 6);
@@ -842,15 +880,10 @@ static void te_CompressedTexImage2D(GuestCpu *c, GuestMem *m, void *u) {
 }
 
 static void te_TexImage2D(GuestCpu *c, GuestMem *m, void *u) {
-    static int shown;
     (void)u;
-    if (shown < 6) {
-        shown++;
-        printf("  [tex  ] plain %dx%d level %d internal 0x%04x fmt 0x%04x "
-               "type 0x%04x data %s\n", (int)ga(c, m, 3), (int)ga(c, m, 4),
-               (int)ga(c, m, 1), (unsigned)ga(c, m, 2), (unsigned)ga(c, m, 6),
-               (unsigned)ga(c, m, 7), ga(c, m, 8) ? "yes" : "NULL");
-    }
+    if ((int)ga(c, m, 1) == 0)          /* census the base level only */
+        tex_note((uint32_t)ga(c, m, 3), (uint32_t)ga(c, m, 4),
+                 (uint32_t)ga(c, m, 2), 0);
     {
         uint64_t bytes = image_bytes((uint32_t)ga(c, m, 3), (uint32_t)ga(c, m, 4),
                                      (uint32_t)ga(c, m, 6), (uint32_t)ga(c, m, 7));
@@ -863,6 +896,28 @@ static void te_TexImage2D(GuestCpu *c, GuestMem *m, void *u) {
                      (GLint)ga(c, m, 5), (GLenum)ga(c, m, 6),
                      (GLenum)ga(c, m, 7), p);
     }
+}
+
+/* Not previously overridden. allocate-with-NULL then fill via glTexSubImage2D
+ * is an ordinary upload pattern, and if this game uses it then every real
+ * texture went past the instrumentation unseen. It also needs the same extent
+ * validation as glTexImage2D. */
+static void te_TexSubImage2D(GuestCpu *c, GuestMem *m, void *u) {
+    static uint32_t subs;
+    uint32_t w = (uint32_t)ga(c, m, 4), h = (uint32_t)ga(c, m, 5);
+    uint64_t bytes = image_bytes(w, h, (uint32_t)ga(c, m, 6),
+                                 (uint32_t)ga(c, m, 7));
+    const void *p = gpn(m, ga(c, m, 8), bytes, "glTexSubImage2D");
+    (void)u;
+    if (++subs <= 4u || (subs % 200u) == 0u)
+        printf("  [tex  ] sub %ux%u at (%d,%d) fmt 0x%04x  (%u calls)\n",
+               (unsigned)w, (unsigned)h, (int)ga(c, m, 2), (int)ga(c, m, 3),
+               (unsigned)ga(c, m, 6), (unsigned)subs);
+    if (!p && ga(c, m, 8))
+        return;
+    glTexSubImage2D((GLenum)ga(c, m, 0), (GLint)ga(c, m, 1), (GLint)ga(c, m, 2),
+                    (GLint)ga(c, m, 3), (GLsizei)w, (GLsizei)h,
+                    (GLenum)ga(c, m, 6), (GLenum)ga(c, m, 7), p);
 }
 
 /* ------------------------------------------------------------------ lookup */
@@ -897,6 +952,7 @@ static const struct { const char *name; GuestHleFn fn; } g_egl_overrides[] = {
     { "glScissor",               te_Scissor },
     { "glTexImage2D",            te_TexImage2D },
     { "glCompressedTexImage2D",  te_CompressedTexImage2D },
+    { "glTexSubImage2D",         te_TexSubImage2D },
     { "glPixelStorei",           te_PixelStorei },
     { "glBindBuffer",            te_BindBuffer },
     { "glBufferData",            te_BufferData },
