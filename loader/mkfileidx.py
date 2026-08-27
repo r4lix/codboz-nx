@@ -29,17 +29,37 @@ MAGIC = b"BOZI"
 VERSION = 1
 
 
-def main(out_dir):
-    archives = []          # basenames, in mount order
-    index = {}             # lowered name -> (archive_idx, offset, size)
+def discover(explicit):
+    """Archive paths in mount order.
 
+    Scanning a directory picks by filename order, which is a trap now that more
+    than one pack can sit in it: blackops_atitc.dz sorts before
+    blackops_gles1.obb and would silently win, and ATITC is a texture format
+    this GPU cannot decode. Pass archives explicitly to choose deliberately.
+    """
+    if explicit:
+        return list(explicit)
+    found = []
     for d in (DATA_DIR, CACHE):
         if not os.path.isdir(d):
             continue
         for n in sorted(os.listdir(d)):
-            if not (n.endswith(".dz") or n.endswith(".obb")):
-                continue
-            path = os.path.join(d, n)
+            if n.endswith(".dz") or n.endswith(".obb"):
+                found.append(os.path.join(d, n))
+    if len(found) > 1:
+        print("NOTE: %d archives found; mount order is %s"
+              % (len(found), ", ".join(os.path.basename(f) for f in found)))
+        print("      pass paths explicitly to choose which pack wins.")
+    return found
+
+
+def main(out_dir, explicit=None):
+    archives = []          # basenames, in mount order
+    index = {}             # lowered name -> (archive_idx, offset, size)
+
+    for path in discover(explicit):
+        if True:
+            n = os.path.basename(path)
             try:
                 a = Dtrz(path)
             except Exception as e:
@@ -96,4 +116,7 @@ def main(out_dir):
     return 0
 
 
-sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else ROOT))
+_args = sys.argv[1:]
+_archives = [a for a in _args if a.endswith((".dz", ".obb"))]
+_rest = [a for a in _args if a not in _archives]
+sys.exit(main(_rest[0] if _rest else ROOT, _archives))
