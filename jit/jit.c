@@ -346,9 +346,17 @@ static int compile_arm(Guest *g, A64 *a, uint32_t start, uint32_t until,
     *out_end = 0;
     while (n < JIT_MAX_GUEST && a->n + 40 < JIT_MAX_A64) {
         uint32_t insn, op, S, rn, rd;
+        /* Reaching a hook, the halt address, or unreadable memory ends the
+         * block for reasons that have nothing to do with an encoding. Clearing
+         * out_end keeps them out of the blocker report -- left in, they show
+         * up as whatever instruction happened to precede them, with counts no
+         * lowering can ever move, which is precisely how ADD-immediate came to
+         * look like it was ending 11% of blocks. */
         if (pc == (until & ~1u) || has_hook(g, pc) ||
-            !guest_ld32(&g->mem, pc, &insn))
+            !guest_ld32(&g->mem, pc, &insn)) {
+            *out_end = 0;
             break;
+        }
         /* Assigned before the condition test, not with it. Folded together,
          * a conditional instruction ending the block left out_end holding the
          * PREVIOUS instruction -- which reported "CMP ends 14% of blocks", an
@@ -357,6 +365,19 @@ static int compile_arm(Guest *g, A64 *a, uint32_t start, uint32_t until,
         *out_end = insn;
         if ((insn >> 28) != 0xEu)
             break;
+
+        if ((insn & 0x0FBF0000u) == 0x028F0000u) {       /* ADD/SUB Rd,PC,#imm */
+            /* ADR. PC is known while compiling, so it folds to a constant --
+             * and the general path below refuses Rn == PC, which was ending
+             * 11% of blocks for an instruction with no runtime behaviour. */
+            uint32_t rdx = (insn >> 12) & 0xFu;
+            uint32_t base = pc + 8u, imm = arm_rotimm(insn);
+            if (rdx == GUEST_PC) break;
+            e_mov32(a, 9, (insn & 0x00800000u) ? base + imm : base - imm);
+            e_store_r(a, 9, rdx);
+            pc += 4; n++;
+            continue;
+        }
 
         if ((insn & 0x0FFFFFF0u) == 0x012FFF10u) {       /* BX Rm */
             e_load_r(a, 9, insn & 0xFu);
@@ -484,6 +505,8 @@ static int compile_arm(Guest *g, A64 *a, uint32_t start, uint32_t until,
     e_set_pc(a, pc);
     e_return(a, n);
     *out_count = (uint16_t)n;
+    if (n >= JIT_MAX_GUEST || a->n + 40u >= JIT_MAX_A64)
+        *out_end = 0;           /* filled up; nothing blocked it */
     return 1;
 }
 
@@ -495,8 +518,10 @@ static int compile_thumb(Guest *g, A64 *a, uint32_t start, uint32_t until,
     while (n < JIT_MAX_GUEST && a->n + 40 < JIT_MAX_A64) {
         uint32_t hw;
         if (pc == (until & ~1u) || has_hook(g, pc) ||
-            !guest_ld16(&g->mem, pc, &hw))
+            !guest_ld16(&g->mem, pc, &hw)) {
+            *out_end = 0;       /* see compile_arm */
             break;
+        }
         *out_end = hw;
 
         if ((hw & 0xF800u) >= 0xE800u) {                 /* selected T32 */
@@ -510,8 +535,30 @@ static int compile_thumb(Guest *g, A64 *a, uint32_t start, uint32_t until,
                 uint32_t S1, j1, j2, i1, i2, imm11, imm10;
                 int32_t off;
                 if ((hw & 0xF800u) != 0xF000u) break;
+                if ((hw2 & 0xD000u) == 0x8000u) {        /* conditional B.W */
+                    uint32_t cond = (hw >> 6) & 0xFu;
+                    uint32_t s2 = (hw >> 10) & 1u;
+                    uint32_t j1 = (hw2 >> 13) & 1u, j2 = (hw2 >> 11) & 1u;
+                    int32_t coff;
+                    if (cond >= 0xEu) break;             /* not a condition */
+                    coff = (int32_t)(((s2 << 20) | (j2 << 19) | (j1 << 18) |
+                                      ((hw & 0x3Fu) << 12) |
+                                      ((hw2 & 0x7FFu) << 1)) << 11) >> 11;
+                    e_ldr_w(a, 10, (unsigned)offsetof(Guest, cpu.cpsr));
+                    e_mov32(a, 11, 0xF0000000u);
+                    e_rr(a, 0x0A000000u, 10, 10, 11);
+                    emit(a, 0xD51B4200u | 10u);          /* MSR NZCV, x10 */
+                    e_mov32(a, 9, pc + 4u + (uint32_t)coff);
+                    e_mov32(a, 11, pc + 4u);
+                    emit(a, 0x1A800000u | (11u << 16) | (cond << 12) |
+                            (9u << 5) | 9u);
+                    e_store_r(a, 9, GUEST_PC);
+                    n++; e_return(a, n); *out_count = (uint16_t)n;
+                    *out_end = 0;
+                    return 1;
+                }
                 if ((hw2 & 0xD000u) != 0x9000u && (hw2 & 0xD000u) != 0xD000u)
-                    break;                       /* conditional B.W: later */
+                    break;
                 S1 = (hw >> 10) & 1u;
                 imm10 = hw & 0x3FFu;
                 j1 = (hw2 >> 13) & 1u;
@@ -531,6 +578,32 @@ static int compile_thumb(Guest *g, A64 *a, uint32_t start, uint32_t until,
                 e_set_pc(a, pc + 4u + (uint32_t)off);
                 n++; e_return(a, n); *out_count = (uint16_t)n; *out_end = 0;
                 return 1;
+            }
+
+            /* Wide load/store, 12-bit immediate (T3):
+             *   1111 1000 1 size(2) L Rn   Rt imm12
+             * The register-offset and imm8 forms are T4 and are not lowered. */
+            if ((hw & 0xFF80u) == 0xF880u) {
+                uint32_t sz = (hw >> 5) & 3u, ld = (hw >> 4) & 1u;
+                uint32_t wrn = hw & 0xFu, wrt = (hw2 >> 12) & 0xFu;
+                uint32_t wimm = hw2 & 0xFFFu;
+                int wb = (sz == 2u) ? 4 : (sz == 1u) ? 2 : 1;
+                if (sz == 3u || wrn == GUEST_PC || wrt == GUEST_PC) break;
+                if (ld) {
+                    e_load_r(a, 9, wrn);
+                    if (wimm)
+                        emit(a, 0x11000000u | (wimm << 10) | (9u << 5) | 9u);
+                    e_load_mem(a, wb, pc, n);
+                    e_store_r(a, 9, wrt);
+                } else {
+                    e_load_r(a, 14, wrt);
+                    e_load_r(a, 9, wrn);
+                    if (wimm)
+                        emit(a, 0x11000000u | (wimm << 10) | (9u << 5) | 9u);
+                    e_store_mem(a, wb, pc, n, verify);
+                }
+                pc += 4; n++;
+                continue;
             }
 
             /* Data processing, modified immediate. */
@@ -897,6 +970,8 @@ static int compile_thumb(Guest *g, A64 *a, uint32_t start, uint32_t until,
     }
     if (!n) return 0;
     e_set_pc(a, pc); e_return(a, n); *out_count = (uint16_t)n;
+    if (n >= JIT_MAX_GUEST || a->n + 40u >= JIT_MAX_A64)
+        *out_end = 0;           /* filled up; nothing blocked it */
     return 1;
 }
 
@@ -1033,13 +1108,19 @@ void guest_jit_close(Guest *g) {
  * be read side by side. */
 void guest_jit_report_blockers(Guest *g) {
     JitContext *j = (JitContext *)g->jit;
-    uint64_t weight[512];
+    static uint64_t weight[512];
+    static uint32_t worst_pc[512];
+    static uint32_t worst_ex[512];
+    static uint32_t worst_insn[512];
     uint32_t i, k;
     uint64_t total = 0;
 
     if (!j || !j->entry)
         return;
     memset(weight, 0, sizeof weight);
+    memset(worst_pc, 0, sizeof worst_pc);
+    memset(worst_ex, 0, sizeof worst_ex);
+    memset(worst_insn, 0, sizeof worst_insn);
     for (i = 0; i < JIT_CACHE_SLOTS; i++) {
         JitEntry *e = &j->entry[i];
         uint32_t idx;
@@ -1054,6 +1135,16 @@ void guest_jit_report_blockers(Guest *g) {
                            : (256u + ((e->end_insn >> 20) & 0xFFu));
         weight[idx] += e->execs;
         total += e->execs;
+        /* Keep the busiest block in each bucket. A bucket is four hex digits
+         * of an encoding and several different instructions share one -- ADR
+         * and a jump-table "ADD pc,rn,#imm" both land in ARM 0028 -- so the
+         * bucket alone has repeatedly sent me lowering the wrong thing. An
+         * address can just be disassembled. */
+        if (e->execs > worst_ex[idx]) {
+            worst_ex[idx] = e->execs;
+            worst_pc[idx] = e->key & ~1u;
+            worst_insn[idx] = e->end_insn;
+        }
     }
     if (!total)
         return;
@@ -1065,11 +1156,12 @@ void guest_jit_report_blockers(Guest *g) {
             if (weight[i] > best) { best = weight[i]; bi = i; }
         if (!best)
             break;
-        printf("  [jitb ]   %-3s %04x  %2llu%%  %llu\n",
+        printf("  [jitb ]   %-3s %04x %2llu%% %8llu  worst block %08x ends on %08x\n",
                bi < 256 ? "T16" : "ARM",
                bi < 256 ? (unsigned)(bi << 11) : (unsigned)(bi & 0xFFu),
                (unsigned long long)(best * 100ull / total),
-               (unsigned long long)best);
+               (unsigned long long)best,
+               (unsigned)worst_pc[bi], (unsigned)worst_insn[bi]);
         weight[bi] = 0;
     }
 }
