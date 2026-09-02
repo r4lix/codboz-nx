@@ -150,22 +150,62 @@ img, LOAD_BASE, gots, slot_names = load_image()
 
 
 def parse_icf(text):
-    """Marmalade ICF: [Section] headers, key=value lines, {COND} guards."""
+    """Marmalade ICF: [Section] headers, key=value lines, {COND} guards.
+
+    Must match icf_condition() in jit/s3e_config.c key for key, or the
+    reference and the harnesses answer the SDK differently and the differential
+    reports it as a CPU divergence.
+
+    The old "ANDROID appears anywhere in the condition" test was both too loose
+    and too tight: it took every per-device {ID=ANDROID "Nexus One"} block, and
+    it dropped {CLASS=ANY}, which guards 39 keys including NumMemBuckets and
+    FreeStreamData.
+    """
     cfg, sect, cond_ok = {}, "", True
+
+    def cond_matches(c):
+        if not c:
+            return True                       # {} guards 186 keys
+        if c.upper().startswith("OS="):
+            return c[3:].strip().upper() == "ANDROID"
+        if c.upper().startswith("CLASS="):
+            return c[6:].strip().upper() == "ANY"
+        if c.startswith("["):                 # {[SECTION] Key == value}
+            close, eq = c.find("]"), c.find("==")
+            if close < 0 or eq < 0 or eq < close:
+                return False
+            cur = cfg.get((c[1:close].strip().lower(),
+                           c[close + 1:eq].strip().lower()))
+            return cur is not None and cur.lower() == c[eq + 2:].strip().lower()
+        return False                          # ID=<os> "device" is never us
+
     for raw in text.splitlines():
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
         if line.startswith("{") and line.endswith("}"):
-            c = line[1:-1].strip()
-            cond_ok = (not c) or ("ANDROID" in c.upper())
+            cond_ok = cond_matches(line[1:-1].strip())
             continue
         if line.startswith("[") and line.endswith("]"):
             sect = line[1:-1].strip()
             continue
         if "=" in line and cond_ok:
             k, v = line.split("=", 1)
-            cfg[(sect.lower(), k.strip().lower())] = v.strip().strip('"')
+            v = v.strip().strip('"')
+            if v.startswith("["):             # [SECTION] Key +/- N
+                close = v.find("]")
+                rest = v[close + 1:].strip() if close >= 0 else ""
+                adj, op = 0, None
+                for o in "+-":
+                    if o in rest:
+                        op, rest, tail = o, rest.split(o)[0].strip(), rest.split(o)[1]
+                        adj = int(tail.strip(), 0) * (1 if o == "+" else -1)
+                        break
+                base = cfg.get((v[1:close].strip().lower(), rest.lower()))
+                if base is None:
+                    continue                  # unresolvable: leave it unset
+                v = str(int(base, 0) + adj)
+            cfg[(sect.lower(), k.strip().lower())] = v
     return cfg
 
 
@@ -219,7 +259,11 @@ def load_config_table(path):
 # settings that break this game if served wholesale (it faults during startup).
 # Default to answering "not set" -- the game then uses its own defaults, which
 # is what worked -- and layer the deliberate overrides on top.
-ICF = parse_icf(ICF_TEXT) if os.environ.get("BOZ_ICF_FULL") == "1" else {}
+# The game's own ICF is now served by default, matching s3e_config.c. It was
+# answered "not set" wholesale because serving it faulted startup -- true, but
+# the cause was the {COND} blocks, not the file. BOZ_ICF_FULL=0 goes back to
+# answering nothing but the overrides, for comparison.
+ICF = {} if os.environ.get("BOZ_ICF_FULL") == "0" else parse_icf(ICF_TEXT)
 _overrides = load_config_table(CONFIG_H)
 ICF.update(_overrides)
 # [RESMANAGER] ResBuildStyle is added once the archives are mounted -- it has

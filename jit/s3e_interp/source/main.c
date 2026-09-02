@@ -26,7 +26,7 @@
 #define STACK_BASE 0x20000000u
 #define STACK_SIZE (1u << 20)
 #define HEAP_BASE  0x60000000u
-#define BOZ_BUILD_LABEL "global-watch-r34 " __DATE__ " " __TIME__
+#define BOZ_BUILD_LABEL "icf-r35 " __DATE__ " " __TIME__
 /* The allocator is a pure bump allocator and free() reclaims nothing, so
  * exhaustion is self-inflicted and the game does not NULL-check malloc -- it
  * runs a C++ constructor on the result and faults writing the vtable. The
@@ -2299,6 +2299,15 @@ static void run(void) {
             printf("vfs: %d entries from %s\n", nidx, root);
         s3e_config_set_build_style(s3e_vfs_build_style());
         printf("cfg: ResBuildStyle=%s\n", s3e_config_build_style());
+    }
+    {   /* The ICF lives at a FILE offset, and `file` is still mapped. */
+        int n = 0;
+        if (g_img.hdr.config_len &&
+            (size_t)g_img.hdr.config_off + g_img.hdr.config_len <= size)
+            n = s3e_config_load_icf((const char *)file + g_img.hdr.config_off,
+                                    g_img.hdr.config_len);
+        printf("cfg: %d keys from the game's own ICF (%u bytes)\n", n,
+               (unsigned)g_img.hdr.config_len);
     }
     {   /* The BSS global holding the object read at RVA 0x23f228, resolved
          * from the GOT statically. Fixed in every run, so it can be watched

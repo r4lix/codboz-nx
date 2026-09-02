@@ -80,9 +80,28 @@
     X("Demonware", "STUNServer",                      "")                      \
     X("ONLINE",    "dispatcher",                      "")
 
+/* Load the game's own ICF -- the text blob at header +0x2c, 17 KB of it.
+ *
+ * This was previously answered "not set" wholesale, on the grounds that
+ * serving it faulted startup. That was true but the cause was the {COND}
+ * blocks: the file carries Windows, WP8, QNX and per-device Android sections
+ * alongside the ones that apply, and serving all of them is what broke. With
+ * conditions honoured, only {} and {OS=ANDROID} are taken.
+ *
+ * It matters because the file holds the engine's real sizes -- VertCacheSizeHW
+ * 120000, DataCacheSizeHW 5000000, MaxTextureStages 32, NumMemBuckets 14 --
+ * and without them the game falls back to compile-time defaults. A vertex
+ * array sized by a too-small default, filled from an asset whose element count
+ * comes from the data, is what overruns at RVA 0x2431ec.
+ *
+ * Returns the number of keys taken. Overrides in S3E_CONFIG_TABLE still win;
+ * parked keys are left to whatever the ICF says, since the reason they are
+ * parked is the PortMaster values, not the game's own. */
+int s3e_config_load_icf(const char *text, unsigned len);
+
 /* The value for [section] key, or NULL when the key is not set -- which the
  * caller must answer with S3E_RESULT_ERROR (1), never with a zeroed buffer and
- * success. Parked keys return NULL. */
+ * success. Parked keys return NULL unless the ICF supplies them. */
 const char *s3e_config_get(const char *section, const char *key);
 
 /* The value a parked key *would* have had, or NULL if it is not parked. Only

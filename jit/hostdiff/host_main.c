@@ -1409,6 +1409,16 @@ int main(int argc, char **argv) {
         s3e_config_set_build_style(s3e_vfs_build_style());
         printf("cfg: ResBuildStyle=%s\n", s3e_config_build_style());
     }
+    {   /* Must match the NRO key for key, or the differential reports config
+         * drift as a CPU divergence. */
+        int n = 0;
+        if (g_img.hdr.config_len &&
+            (size_t)g_img.hdr.config_off + g_img.hdr.config_len <= size)
+            n = s3e_config_load_icf((const char *)file + g_img.hdr.config_off,
+                                    g_img.hdr.config_len);
+        printf("cfg: %d keys from the game's own ICF (%u bytes)\n", n,
+               (unsigned)g_img.hdr.config_len);
+    }
 
     g_stack = calloc(1, STACK_SIZE);
     g_heap = calloc(1, HEAP_SIZE);
