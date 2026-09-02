@@ -24,6 +24,13 @@
  * missing (the layer then still serves loose files from root). */
 int s3e_vfs_init(const char *root);
 
+/* Which texture build the mounted archives actually hold: "etc", "dxt",
+ * "atitc" or "gles1". Feeds [RESMANAGER] ResBuildStyle, which the resource
+ * manager turns into data-<style>/ paths and a blackops_<style>.dz -- so it
+ * has to name a pack that is really there, never a hardcoded preference.
+ * Valid after s3e_vfs_init(); "gles1" when no pack was mounted. */
+const char *s3e_vfs_build_style(void);
+
 uint32_t s3e_vfs_open(const char *name, const char *mode);
 uint32_t s3e_vfs_read(uint32_t h, void *dst, uint32_t n);
 uint32_t s3e_vfs_write(uint32_t h, const void *src, uint32_t n);

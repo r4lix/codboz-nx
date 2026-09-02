@@ -190,6 +190,32 @@ int s3e_vfs_init(const char *root) {
     return g_nindex;
 }
 
+/* Mount order decides, exactly as it does for file resolution: mkfileidx.py
+ * writes the archives in the order it mounted them and the index resolves
+ * first-mount-wins, so the first pack named here is the one whose bytes the
+ * game will actually get. blackops_loader.dz matches nothing and is skipped. */
+const char *s3e_vfs_build_style(void) {
+    static const struct {
+        const char *needle, *style;
+    } packs[] = {
+        { "blackops_etc",   "etc"   },
+        { "blackops_dxt",   "dxt"   },
+        { "blackops_atitc", "atitc" },
+        { "blackops_gles1", "gles1" },
+    };
+    int i, p;
+
+    for (i = 0; i < g_narch; i++) {
+        char low[PATH_MAX_];
+        snprintf(low, sizeof low, "%s", basename_of(g_arch[i]));
+        lower_slashes(low);
+        for (p = 0; p < (int)(sizeof packs / sizeof packs[0]); p++)
+            if (strstr(low, packs[p].needle))
+                return packs[p].style;
+    }
+    return "gles1";
+}
+
 /* ------------------------------------------------------------- resolving */
 
 static const Entry *index_find(const char *lowered) {

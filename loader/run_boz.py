@@ -169,18 +169,63 @@ def parse_icf(text):
     return cfg
 
 
+CONFIG_H = os.path.join(os.path.dirname(HERE), "jit", "s3e_config.h")
+
+
+def load_config_table(path):
+    """The overrides the C harnesses answer with, read from their own header.
+
+    This reference and jit/hostdiff/host_main.c must answer the SDK
+    identically or the differential reports divergences that are really just
+    config drift, so the table is parsed rather than copied. Entries are
+    X("section", "key", "value"), one per line -- see jit/s3e_config.h.
+    """
+    import re
+
+    def macro_body(text, name):
+        """The continuation lines of `#define <name>(X)`, and nothing else.
+
+        Bounded deliberately: S3E_CONFIG_PARKED sits right below the enabled
+        table and holds keys that must stay unanswered. Scanning to end of
+        file would pull them in and put this reference back out of step with
+        the C harnesses -- the exact drift the shared header exists to stop.
+        """
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if not line.startswith("#define %s(" % name):
+                continue
+            body = []
+            while line.endswith("\\") and i + 1 < len(lines):
+                i += 1
+                line = lines[i]
+                body.append(line)
+            return "\n".join(body)
+        raise SystemExit("no %s in %s" % (name, path))
+
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    pairs = re.findall(r'X\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"\s*\)',
+                       macro_body(text, "S3E_CONFIG_TABLE"))
+    if not pairs:
+        raise SystemExit("no S3E_CONFIG_TABLE entries parsed from %s" % path)
+    parked = re.findall(r'X\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"\s*\)',
+                        macro_body(text, "S3E_CONFIG_PARKED"))
+    print("cfg: %d keys enabled, %d parked (jit/s3e_config.h)"
+          % (len(pairs), len(parked)))
+    return {(s.lower(), k.lower()): v for s, k, v in pairs}
+
+
 # The blob embedded in the .s3e is the *system* ICF: it carries Windows/WP8
 # settings that break this game if served wholesale (it faults during startup).
 # Default to answering "not set" -- the game then uses its own defaults, which
-# is what worked -- and only override the texture-page budget, whose stock
-# values (16 / 0) make it abort with "Out of T-Pages".
+# is what worked -- and layer the deliberate overrides on top.
 ICF = parse_icf(ICF_TEXT) if os.environ.get("BOZ_ICF_FULL") == "1" else {}
-ICF.update({("gx", "numtpages"): "512", ("gx", "numtpagesnomipmap"): "512"})
-# Mirrors hle_configint in host_main.c. LowMemoryDevice is a CONFIG key, not a
-# runtime memory query -- answering "not set" makes the game assume the worst
-# and open with a "DEVICE IS LOW ON RAM" dialog before the menu.
-ICF.update({("game", "lowmemorydevice"): "0"})
-print("icf: %d keys from %d bytes" % (len(ICF), len(ICF_TEXT)))
+_overrides = load_config_table(CONFIG_H)
+ICF.update(_overrides)
+# [RESMANAGER] ResBuildStyle is added once the archives are mounted -- it has
+# to name a pack that is really there. See the file layer below.
+print("icf: %d keys from %d bytes (%d overrides from s3e_config.h)"
+      % (len(ICF), len(ICF_TEXT), len(_overrides)))
 
 uc = Uc(UC_ARCH_ARM, UC_MODE_ARM)
 uc.mem_map(LOAD_BASE, align(len(img)))
@@ -342,24 +387,88 @@ for _want in ("blackops_loader.dz",):
         with _apk.open(_apk_names[_want]) as _s, open(_dst, "wb") as _d:
             _d.write(_s.read())
 
+def _idx_mount_order():
+    """The archives boz_files.idx was built from, in its own mount order.
+
+    Scanning a directory picks by filename order, which is a trap once more
+    than one pack is present: blackops_atitc.dz sorts first and would silently
+    win here while mkfileidx.py deliberately gave the C harness a different
+    one. The two would then serve different bytes and answer ResBuildStyle
+    differently, and the differential would report that as a CPU divergence.
+    So follow the index when it exists; it *is* the deliberate choice.
+    """
+    path = os.path.join(ROOT, "boz_files.idx")
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+            if head[:4] != b"BOZI":
+                return []
+            _ver, na, _ne = struct.unpack_from("<III", head, 4)
+            out = []
+            for _ in range(na):
+                (ln,) = struct.unpack("<H", fh.read(2))
+                out.append(fh.read(ln).decode("utf-8").replace("\\", "/"))
+            return out
+    except (OSError, struct.error, UnicodeDecodeError):
+        return []
+
+
 # Every resolvable file is a byte range of some real file on disk, whether it
-# is loose, an archive entry, or an extracted APK member.
-_mounts, _index = [], {}
+# is loose, an archive entry, or an extracted APK member. The index's order
+# comes first; anything else on disk is appended, so nothing that used to
+# resolve stops resolving.
+_scanned = []
 for _d in (DATA_DIR, CACHE):
     for _n in sorted(os.listdir(_d)) if os.path.isdir(_d) else []:
-        if not (_n.endswith(".dz") or _n.endswith(".obb")):
-            continue
-        _p = os.path.join(_d, _n)
-        try:
-            _a = Dtrz(_p)
-        except Exception:
-            continue
-        _mounts.append((_n, _a))
-        for _i, _nm in enumerate(_a.names):
-            _o, _s = _a.entries[_i][0], _a.entries[_i][1]
-            _index.setdefault(_nm.replace("\\", "/").lower(), (_p, _o, _s))
-            _index.setdefault(_nm.rsplit("\\", 1)[-1].lower(), (_p, _o, _s))
+        if _n.endswith(".dz") or _n.endswith(".obb"):
+            _scanned.append(os.path.join(_d, _n))
+_idx_order = _idx_mount_order()
+_ordered = [os.path.join(ROOT, *_r.split("/")) for _r in _idx_order]
+_ordered = [_p for _p in _ordered if os.path.isfile(_p)]
+_ordered += [_p for _p in _scanned if _p not in _ordered]
+
+_mounts, _index = [], {}
+for _p in _ordered:
+    _n = os.path.basename(_p)
+    try:
+        _a = Dtrz(_p)
+    except Exception:
+        continue
+    _mounts.append((_n, _a))
+    for _i, _nm in enumerate(_a.names):
+        _o, _s = _a.entries[_i][0], _a.entries[_i][1]
+        _index.setdefault(_nm.replace("\\", "/").lower(), (_p, _o, _s))
+        _index.setdefault(_nm.rsplit("\\", 1)[-1].lower(), (_p, _o, _s))
 print("mounted: %s" % ", ".join("%s(%d)" % (n, a.n_files) for n, a in _mounts))
+
+# Mirrors s3e_vfs_build_style() in jit/s3e_files.c: the first mounted texture
+# pack wins, because file resolution is first-mount-wins too. Naming a build
+# the archives do not hold would leave the resource manager with no textures at
+# all, which is worse than the software fallback it takes when the key is unset.
+_PACKS = (("blackops_etc", "etc"), ("blackops_dxt", "dxt"),
+          ("blackops_atitc", "atitc"), ("blackops_gles1", "gles1"))
+BUILD_STYLE = "gles1"
+_seen_packs = []
+for _n, _a in _mounts:
+    for _needle, _style in _PACKS:
+        if _needle in _n.lower():
+            _seen_packs.append((_n, _style))
+if _seen_packs:
+    BUILD_STYLE = _seen_packs[0][1]
+if len(_seen_packs) > 1 and not _idx_order:
+    # No index to follow, so the winner came from directory order -- the trap
+    # mkfileidx.py documents. If it disagrees with the pack the C harness
+    # mounted, the two serve different bytes and answer ResBuildStyle
+    # differently, and the differential reports that as a CPU divergence.
+    print("WARNING: %d texture packs and no boz_files.idx to choose between "
+          "them (%s); '%s' wins by directory order"
+          % (len(_seen_packs), ", ".join(n for n, _ in _seen_packs),
+             _seen_packs[0][0]))
+elif len(_seen_packs) > 1:
+    print("packs: %s (ignored: %s)"
+          % (_seen_packs[0][0], ", ".join(n for n, _ in _seen_packs[1:])))
+ICF[("resmanager", "resbuildstyle")] = BUILD_STYLE
+print("cfg: ResBuildStyle=%s" % BUILD_STYLE)
 
 _files, _next_handle, _file_err = {}, [FILE_HANDLE_BASE], [0]
 
