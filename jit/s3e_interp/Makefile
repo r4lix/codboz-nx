@@ -52,7 +52,11 @@ INCLUDES	:=	.. ../../loader
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
+# -O3 rather than -O2: the interpreter's cost is dominated by one enormous
+# switch per instruction set, and the extra inlining and jump-threading at
+# -O3 apply directly to it. -ffp-contract stays off below regardless -- that
+# one is correctness, not optimisation.
+CFLAGS	:=	-g -Wall -O3 -ffunction-sections \
 			$(ARCH) $(DEFINES)
 
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__
