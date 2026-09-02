@@ -217,6 +217,12 @@ typedef struct {
     uint32_t fault_addr;    /* set on FAULT_MEM */
     uint32_t undef_pc;      /* set on FAULT_UNDEF, with the raw encoding below */
     uint32_t undef_insn;
+    /* Optional HLE profiler. Called around every import handler with the slot
+     * index, enter=1 then enter=0. NULL disables it, so the cost is one
+     * predictable branch on a path that runs thousands of times a frame, not
+     * millions. Frame time splits into "interpreting guest code" and "inside a
+     * handler", and only this boundary can tell them apart. */
+    void   (*prof)(uint32_t slot, int enter);
     void    *jit;           /* private hybrid-JIT context; NULL when disabled */
     uint64_t jit_executed;  /* guest instructions retired by compiled blocks */
     uint32_t jit_blocks;    /* successfully compiled basic blocks */

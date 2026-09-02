@@ -2110,10 +2110,14 @@ static GuestStatus dispatch_stub(Guest *g) {
     if (idx >= g->hle.count)
         UNDEF(g, g->cpu.r[15], 0);
     s = &g->hle.slot[idx];
+    if (g->prof)
+        g->prof(idx, 1);
     if (s->fn)
         s->fn(&g->cpu, &g->mem, s->user ? s->user : g->hle.user);
     else
         g->cpu.r[0] = 0;      /* unimplemented import behaves as a no-op stub */
+    if (g->prof)
+        g->prof(idx, 0);
     branch_interworking(&g->cpu, g->cpu.r[GUEST_LR]);
     return GUEST_OK;
 }

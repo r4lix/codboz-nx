@@ -26,7 +26,7 @@
 #define STACK_BASE 0x20000000u
 #define STACK_SIZE (1u << 20)
 #define HEAP_BASE  0x60000000u
-#define BOZ_BUILD_LABEL "arm-dispatch-r22 " __DATE__ " " __TIME__
+#define BOZ_BUILD_LABEL "img-repair-r25 " __DATE__ " " __TIME__
 /* The allocator is a pure bump allocator and free() reclaims nothing, so
  * exhaustion is self-inflicted and the game does not NULL-check malloc -- it
  * runs a C++ constructor on the result and faults writing the vtable. The
@@ -488,6 +488,11 @@ static void hook_native_memset(GuestCpu *cpu, GuestMem *mem, void *user) {
 #define RVA_IMAGE_HANDLER_READY 0x2710a0u
 #define RVA_IMAGE_HANDLER_SLOTS 0x49fd88u
 
+/* r24 ruled out a use-after-free: the free guard tried here never fired once,
+ * in a run that reached the fault. These objects are never freed -- their
+ * vtable is zeroed in place while the registry still points at them, which is
+ * what the repair below exists to undo. */
+
 static void watch_image_handler(GuestCpu *cpu, GuestMem *mem, void *user) {
     static int repairs;
     static const uint32_t vtable_rva[4] = {
@@ -502,6 +507,10 @@ static void watch_image_handler(GuestCpu *cpu, GuestMem *mem, void *user) {
     if (cpu->r[6])
         guest_ld16(mem, cpu->r[6], &format);
 
+    /* The break matters: `registered` is the repair target further down, so
+     * running the loop to completion would leave it holding slot 3's pointer
+     * and repair the wrong object. r24 did exactly that -- it restored
+     * 600564e0 while 600564d0, the object that faulted, kept vtable 0. */
     for (i = 0; i < 4; i++) {
         if (guest_ld32(mem, g_img.load_base + RVA_IMAGE_HANDLER_SLOTS +
                       4u * (uint32_t)i, &registered) &&
@@ -510,7 +519,34 @@ static void watch_image_handler(GuestCpu *cpu, GuestMem *mem, void *user) {
             break;
         }
     }
-    if (slot < 0 || !guest_ld32(mem, cpu->r[0], &vtable) || vtable != 0)
+    if (!guest_ld32(mem, cpu->r[0], &vtable))
+        return;
+
+    /* r23 settled what r20 and r22 could only hint at. Both died at RVA
+     * 0x2710bc reading vtable[5] of object 0x600564d0, whose first word held
+     * 0x01980118 -- and early in r23 that same object is entirely healthy:
+     * vtable 0x4a409f78, which is exactly vtable_rva[2], slot 2, format 0x27.
+     * So the object is constructed correctly and then overwritten. 0x01980118
+     * is not a memset pattern; as little-endian halfwords it is 280 and 408,
+     * i.e. some other object's fields. With 322k frees in a session the
+     * mechanism is a use-after-free: the game frees a handler, the allocator
+     * reissues the block, and the registry keeps the stale pointer.
+     *
+     * So complain rather than repair. Writing the vtable back would scribble
+     * on whatever owns the block now; hook_free refuses the free instead. */
+    if (slot >= 0 && vtable != g_img.load_base + vtable_rva[slot]) {
+        static int warned;
+        if (warned < 8) {
+            warned++;
+            printf("  [img  ] slot%d object %08x has vtable %08x, expected "
+                   "%08x (fmt 0x%x, lr %06x)\n", slot, (unsigned)cpu->r[0],
+                   (unsigned)vtable,
+                   (unsigned)(g_img.load_base + vtable_rva[slot]),
+                   (unsigned)format,
+                   (unsigned)(cpu->r[GUEST_LR] - g_img.load_base));
+        }
+    }
+    if (slot < 0 || vtable != 0)
         return;
 
     if (format == 0x20u || format == 0x21u) expected_slot = 0;
@@ -1210,11 +1246,103 @@ static void win_release(void) {
  * s3eSurfaceShow, so g_presents would stay at 0 and the synthetic tap -- armed
  * from inside that handler -- would never fire. The game sits on "TOUCH SCREEN
  * TO START" forever. A GL swap is the same event, so it counts as a frame. */
+/* ------------------------------------------------------------ frame profile
+ *
+ * Overclocking to 2400 MHz -- 2.35x the stock CPU -- moved the frame rate only
+ * 9.6 -> 13.5. If interpreting guest instructions were the whole frame that
+ * would have been close to linear, so most of a frame is going somewhere else.
+ * This splits it: ticks spent inside HLE handlers (GL, EGL, file, everything
+ * reached through the stub page) versus ticks spent interpreting, plus the
+ * worst individual imports by name. Everything is 19.2 MHz system ticks. */
+static uint64_t g_prof_hle_ticks;         /* inside handlers, this window */
+static uint64_t g_prof_enter;             /* tick at the current handler entry */
+static uint32_t g_prof_depth;             /* handlers can re-enter via callbacks */
+static uint64_t g_prof_slot_ticks[512];
+static uint32_t g_prof_slot_calls[512];
+static uint32_t g_prof_slot;
+
+static void hle_profile(uint32_t slot, int enter) {
+    uint64_t now = armGetSystemTick();
+    if (enter) {
+        if (g_prof_depth++ == 0) {        /* only the outermost call is real */
+            g_prof_enter = now;
+            g_prof_slot = slot;
+        }
+        return;
+    }
+    if (--g_prof_depth == 0) {
+        uint64_t d = now - g_prof_enter;
+        g_prof_hle_ticks += d;
+        if (g_prof_slot < 512) {
+            g_prof_slot_ticks[g_prof_slot] += d;
+            g_prof_slot_calls[g_prof_slot]++;
+        }
+    }
+}
+
+/* Reported every 300 frames rather than every frame: the point is the split,
+ * and printing it per frame would itself distort the thing being measured. */
+static void frame_profile_report(void) {
+    static uint64_t window_start;
+    uint64_t now = armGetSystemTick(), freq = armGetSystemTickFreq();
+    uint64_t total, hle;
+    int i, best[5], b;
+
+    if (!window_start) {
+        /* Clear the slot arrays too, not just the aggregate. Missing that made
+         * the first report divide ticks accumulated since boot by one 17s
+         * window, which read as glClear 12% / s3eFileRead 11% when the honest
+         * steady-state answer is that handlers are near zero. */
+        window_start = now;
+        g_prof_hle_ticks = 0;
+        memset(g_prof_slot_ticks, 0, sizeof g_prof_slot_ticks);
+        memset(g_prof_slot_calls, 0, sizeof g_prof_slot_calls);
+        return;
+    }
+    total = now - window_start;
+    hle = g_prof_hle_ticks;
+    if (!total)
+        return;
+
+    printf("  [prof ] %llu ms/300f: handlers %llu%%, interpreting %llu%%\n",
+           (unsigned long long)(total * 1000ull / freq),
+           (unsigned long long)(hle * 100ull / total),
+           (unsigned long long)((total - (hle < total ? hle : total)) * 100ull
+                                / total));
+
+    for (b = 0; b < 5; b++) {
+        uint64_t bestv = 0;
+        best[b] = -1;
+        for (i = 0; i < 512; i++) {
+            int seen = 0, k;
+            for (k = 0; k < b; k++)
+                if (best[k] == i) seen = 1;
+            if (!seen && g_prof_slot_ticks[i] > bestv) {
+                bestv = g_prof_slot_ticks[i];
+                best[b] = i;
+            }
+        }
+        if (best[b] < 0 || !bestv)
+            break;
+        printf("  [prof ]   %-28s %3llu%%  %u calls\n",
+               slot_name((uint32_t)best[b]),
+               (unsigned long long)(bestv * 100ull / total),
+               (unsigned)g_prof_slot_calls[best[b]]);
+    }
+
+    memset(g_prof_slot_ticks, 0, sizeof g_prof_slot_ticks);
+    memset(g_prof_slot_calls, 0, sizeof g_prof_slot_calls);
+    g_prof_hle_ticks = 0;
+    window_start = now;
+}
+
 void egl_frame_presented(void) {
     g_presents++;
     tap_arm(g_presents);
     if (g_presents <= 3 || (g_presents % 100) == 0)
         printf("  [egl  ] frame %d presented via GL\n", g_presents);
+    if ((g_presents % 300) == 0)
+        frame_profile_report();
 }
 
 /* Called from the eglCreateWindowSurface thunk in jit/gl_egl.c. The guest's
@@ -1989,6 +2117,7 @@ static void run(void) {
     g_slots[n].name = "<ext stub>";
     g_slots[n].fn = hle_zero;
     g_ext_stub = GUEST_STUB_BASE + 4 * n;
+    g.prof = hle_profile;       /* frame-time split; see frame_profile_report */
     g.hle.slot = g_slots;
     g.hle.count = n + 1;
     startup_stage_write("07 imports bound");
