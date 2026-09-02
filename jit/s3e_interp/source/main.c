@@ -27,7 +27,7 @@
 #define STACK_BASE 0x20000000u
 #define STACK_SIZE (1u << 20)
 #define HEAP_BASE  0x60000000u
-#define BOZ_BUILD_LABEL "jit-r65 " __DATE__ " " __TIME__
+#define BOZ_BUILD_LABEL "jit-r78 " __DATE__ " " __TIME__
 /* The allocator is a pure bump allocator and free() reclaims nothing, so
  * exhaustion is self-inflicted and the game does not NULL-check malloc -- it
  * runs a C++ constructor on the result and faults writing the vtable. The
@@ -2672,11 +2672,23 @@ static uint32_t g_iprof[GUEST_IPROF_N];
 static void jit_report(void) {
     if (!g.jit && !g.jit_blocks)
         return;
+    /* Coverage as a share of everything executed, which is the number that
+     * actually tracks progress. Mean block length does not: lowering a branch
+     * turns blocks that previously failed to compile into valid one-instruction
+     * blocks, so the mean falls while coverage rises -- which is exactly what
+     * r71 did, 1.67 down to 1.48 while covering strictly more. */
+    if (g.executed)
+        printf("  [jit  ] covering %llu%% of instructions\n",
+               (unsigned long long)(g.jit_executed * 100ull / g.executed));
     printf("  [jit  ] %u blocks, %lluM insns via JIT, %llu verified, %u diverged\n",
            (unsigned)g.jit_blocks,
            (unsigned long long)(g.jit_executed / 1000000ull),
            (unsigned long long)g.jit_verify_blocks,
            (unsigned)g.jit_diverged);
+    printf("  [jit  ] %llu bails, %llu insns lost to them\n",
+           (unsigned long long)g.jit_bails,
+           (unsigned long long)g.jit_bail_lost);
+    guest_jit_report_blockers(&g);
 }
 
 static void i_profile_clear(void) {
@@ -3168,6 +3180,10 @@ static void run(void) {
             want_jit = 1;
         if (want_jit && guest_jit_init(&g)) {
             g.jit_verify = want_ver;
+            /* undo_active is NOT armed here: guest_run turns it on around the
+             * block being checked and off again immediately. Left on globally
+             * it logs every interpreter store too, and the rollback then undoes
+             * ordinary execution. */
             printf("jit: enabled%s\n",
                    want_ver ? ", self-verifying (slow)" : "");
         } else if (want_jit) {

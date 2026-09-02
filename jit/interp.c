@@ -2218,11 +2218,40 @@ static GuestStatus dispatch_stub(Guest *g) {
  * wrongly, a writeback register not updated. Memory is not compared because
  * nothing compiled writes it yet -- when that changes this needs an undo log,
  * not a wider comparison. */
+/* The block's writes, taken out of the shared log before the interpreter's
+ * re-run starts appending to it. */
+static GuestUndo jit_undo_snapshot[GUEST_UNDO_MAX];
+
 static int jit_verify_block(Guest *g, const GuestCpu *before, uint32_t retired) {
     GuestCpu jitted = g->cpu;
+    uint32_t nwrote = g->mem.undo_n;
     uint32_t i;
     int bad = -1;
 
+    /* Roll the block's stores back so the interpreter re-runs against the same
+     * memory it started from. Without this a block doing ldr/add/str on one
+     * address makes the re-run read what the JIT just wrote and compute a
+     * different answer -- a divergence manufactured by the check itself. The
+     * JIT's values are captured first, since they are what gets compared. */
+    if (nwrote > GUEST_UNDO_MAX)
+        nwrote = GUEST_UNDO_MAX;
+    for (i = 0; i < nwrote; i++) {
+        GuestUndo *u = &guest_undo_log[i];
+        u->val = 0;
+        (void)guest_ld32(&g->mem, u->addr, &u->val);
+        if (u->size < 4u)
+            u->val &= (1u << (u->size * 8u)) - 1u;
+        jit_undo_snapshot[i] = *u;      /* the re-run reuses the log */
+    }
+    for (i = nwrote; i-- > 0; ) {
+        GuestUndo *u = &jit_undo_snapshot[i];
+        switch (u->size) {
+        case 1:  (void)guest_st8(&g->mem, u->addr, u->old);  break;
+        case 2:  (void)guest_st16(&g->mem, u->addr, u->old); break;
+        default: (void)guest_st32(&g->mem, u->addr, u->old); break;
+        }
+    }
+    g->mem.undo_n = 0;
     g->cpu = *before;
     for (i = 0; i < retired; i++) {
         GuestStatus st = guest_is_thumb(&g->cpu) ? step_thumb(g) : step_arm(g);
@@ -2237,6 +2266,33 @@ static int jit_verify_block(Guest *g, const GuestCpu *before, uint32_t retired) 
         if (g->cpu.r[i] != jitted.r[i]) { bad = (int)i; break; }
     if (bad < 0 && (g->cpu.cpsr & 0xF8000000u) != (jitted.cpsr & 0xF8000000u))
         bad = 16;
+
+    /* Memory now holds the interpreter's stores. Anywhere the JIT wrote should
+     * agree; where it wrote and the interpreter did not, the restored original
+     * still stands and disagrees with what the JIT left, which is the same
+     * signal. A location the interpreter wrote and the JIT did not is not
+     * caught here, but that almost always shows up in the registers first. */
+    if (bad < 0) {
+        for (i = 0; i < nwrote; i++) {
+            GuestUndo *u = &jit_undo_snapshot[i];
+            uint32_t now = 0;
+            if (!guest_ld32(&g->mem, u->addr, &now))
+                continue;
+            if (u->size < 4u)
+                now &= (1u << (u->size * 8u)) - 1u;
+            if (now != u->val) {
+                g->jit_diverged++;
+                if (g->jit_diverged <= 20)
+                    printf("  [jitv ] block %08x: mem[%08x]/%u jit=%08x "
+                           "interp=%08x\n",
+                           (unsigned)before->r[15], (unsigned)u->addr,
+                           (unsigned)u->size, (unsigned)u->val, (unsigned)now);
+                g->mem.undo_n = 0;
+                return 0;
+            }
+        }
+    }
+    g->mem.undo_n = 0;
 
     if (bad >= 0) {
         g->jit_diverged++;
@@ -2362,9 +2418,25 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
          * simply continues here at the same PC. */
         if (jitctx) {
             uint32_t retired = 0;
+            int ran;
             GuestCpu before = g->cpu;
-            if (guest_jit_try_run(g, until, limit - (g->executed - start),
-                                  &retired) && retired) {
+            /* Record stores only while the block itself is running.
+             *
+             * Arming this once at startup was wrong in a way that took a
+             * corrupted run to see: guest_wptr then logs every store the
+             * INTERPRETER makes as well, so by the time a block was checked
+             * the log held thousands of unrelated writes, and rolling it back
+             * undid ordinary execution rather than the block. The log is also
+             * reset here so the interpreter's re-run cannot overwrite the
+             * entries the comparison still needs. */
+            if (g->jit_verify) {
+                g->mem.undo_n = 0;
+                g->mem.undo_active = 1;
+            }
+            ran = guest_jit_try_run(g, until, limit - (g->executed - start),
+                                    &retired);
+            g->mem.undo_active = 0;
+            if (ran && retired) {
                 if (!g->jit_verify || jit_verify_block(g, &before, retired)) {
                     g->executed += retired;
                     continue;

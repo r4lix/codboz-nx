@@ -29,7 +29,18 @@ int guest_mem_add(GuestMem *m, uint32_t base, uint32_t size, uint8_t *host,
         m->cache_base = base;
         m->cache_size = size;
         m->cache_host = host;
+        m->cache_writable = (uint32_t)writable;
     }
+    /* Point the write entry at the first writable region there is, so JIT
+     * store code never sees a null host or a zero size -- a zero size makes
+     * its bounds test underflow and admit the access instead of rejecting it. */
+    if (writable && !m->wcache_host) {
+        m->wcache = m->count - 1;
+        m->wcache_base = base;
+        m->wcache_size = size;
+        m->wcache_host = host;
+    }
+    m->undo_log = guest_undo_log;
     return 0;
 }
 
@@ -57,6 +68,7 @@ static void set_data_cache(GuestMem *m, int i) {
     m->cache_base = m->region[i].base;
     m->cache_size = m->region[i].size;
     m->cache_host = m->region[i].host;
+    m->cache_writable = (uint32_t)m->region[i].writable;
 }
 
 void *guest_ptr_slow(const GuestMem *m, uint32_t addr, uint32_t len) {
@@ -77,12 +89,43 @@ void *guest_ifetch_slow(const GuestMem *m, uint32_t addr, uint32_t len) {
     return m->region[i].host + (addr - m->region[i].base);
 }
 
+/* The write cache, kept apart from the read one; see GuestMem::wcache. */
+static void set_write_cache(GuestMem *m, int i) {
+    m->wcache = i;
+    m->wcache_base = m->region[i].base;
+    m->wcache_size = m->region[i].size;
+    m->wcache_host = m->region[i].host;
+}
+
 void *guest_wptr_slow(GuestMem *m, uint32_t addr, uint32_t len) {
     int i = find_index(m, addr, len);
     if (i < 0 || !m->region[i].writable)
         return NULL;
-    set_data_cache(m, i);
+    set_write_cache(m, i);
     return m->region[i].host + (addr - m->region[i].base);
+}
+
+GuestUndo guest_undo_log[GUEST_UNDO_MAX];
+
+/* Capture the bytes a store is about to overwrite. Reads through the region
+ * table directly rather than guest_ptr, because guest_ptr's cache is about to
+ * be updated by the store itself and borrowing it here would be one more thing
+ * to reason about on a path that only exists to keep a check honest. */
+void guest_undo_record(GuestMem *m, uint32_t addr, uint32_t size) {
+    int i;
+    GuestUndo *u;
+    if (m->undo_n >= GUEST_UNDO_MAX) {
+        m->undo_overflow++;     /* the block is too long to check; see caller */
+        return;
+    }
+    i = find_index(m, addr, size);
+    if (i < 0)
+        return;                 /* unmapped: the store will fault anyway */
+    u = &guest_undo_log[m->undo_n++];
+    u->addr = addr;
+    u->size = size;
+    u->old = 0;
+    memcpy(&u->old, m->region[i].host + (addr - m->region[i].base), size);
 }
 
 const char *guest_status_str(GuestStatus s) {

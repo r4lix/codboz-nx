@@ -26,6 +26,7 @@ int guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
     *retired = 0;
     return 0;
 }
+void guest_jit_report_blockers(Guest *g) { (void)g; }
 
 #else
 
@@ -47,6 +48,17 @@ typedef struct {
     uint16_t count;
     uint8_t  state;             /* 0 empty, 1 counting, 2 compiled, 3 reject */
     uint8_t  hits;
+    /* Why this block is not longer, and how much that costs.
+     *
+     * Blocks average 1.6 guest instructions, which is too short for the JIT to
+     * repay its own overhead, and the obvious explanation was wrong: lowering
+     * ARM loads added blocks without lengthening them. Rather than guess again,
+     * record the encoding that ended each block and weight it by how often the
+     * block actually runs -- a rejection in a block executed a million times
+     * matters, the same rejection in one executed twice does not. */
+    uint32_t execs;
+    uint32_t end_insn;          /* 0 when the block ended on its own terms */
+    uint8_t  end_thumb;
 } JitEntry;
 
 typedef struct {
@@ -161,9 +173,133 @@ static void e_load_mem(A64 *a, int bytes, uint32_t pc, uint32_t n) {
             (((mem + (unsigned)offsetof(GuestMem, cache_host)) >> 3) << 10) |
             (0u << 5) | 12u);                    /* LDR x12,[x0,#host] */
     if (bytes == 4)
-        emit(a, 0xB8604800u | (9u << 16) | (12u << 5) | 9u);  /* LDR w9,[x12,w9,uxtw] */
+        emit(a, 0xB8604800u | (9u << 16) | (12u << 5) | 9u);  /* LDR  w9,[x12,w9,uxtw] */
+    else if (bytes == 2)
+        emit(a, 0x78604800u | (9u << 16) | (12u << 5) | 9u);  /* LDRH w9,[x12,w9,uxtw] */
     else
         emit(a, 0x38604800u | (9u << 16) | (12u << 5) | 9u);  /* LDRB w9,[x12,w9,uxtw] */
+}
+
+/* ThumbExpandImm, evaluated at compile time -- imm12 is a constant in the
+ * encoding, so the whole expansion folds away and only the value is emitted.
+ * Mirrors thumb_expand_imm() in interp.c exactly; the carry-out is returned so
+ * the caller can decline the cases where it would have to be modelled. */
+static uint32_t jit_thumb_imm(uint32_t imm12, int *rotated) {
+    uint32_t b = imm12 & 0xFFu;
+    *rotated = 0;
+    if ((imm12 & 0xC00u) == 0) {
+        switch ((imm12 >> 8) & 3u) {
+        case 0:  return b;
+        case 1:  return (b << 16) | b;
+        case 2:  return (b << 24) | (b << 8);
+        default: return (b << 24) | (b << 16) | (b << 8) | b;
+        }
+    }
+    {
+        uint32_t unrot = 0x80u | (imm12 & 0x7Fu);
+        int rot = (int)((imm12 >> 7) & 0x1Fu);
+        *rotated = 1;                    /* carry-out comes from the result */
+        return (unrot >> rot) | (unrot << (32 - rot));
+    }
+}
+
+/* T32 op field -> the ARM-style opcode emit_dp() speaks. Returns -1 for the
+ * forms not lowered: ORN, RSB, ADC and SBC, which need the carry-in modelled
+ * or an operand inversion emit_dp has no encoding for. */
+static int t32_dp_op(uint32_t op) {
+    switch (op) {
+    case 0x0: return 0x0;    /* AND */
+    case 0x1: return 0xE;    /* BIC */
+    case 0x2: return 0xC;    /* ORR  (MOV when Rn == 15) */
+    case 0x4: return 0x1;    /* EOR */
+    case 0x8: return 0x4;    /* ADD */
+    case 0xD: return 0x2;    /* SUB  (CMP when Rd == 15 and S) */
+    default:  return -1;
+    }
+}
+
+/* Interworking branch to the address in w9: PC = value & ~1, CPSR.T = value&1.
+ *
+ * This is what a function return looks like in both instruction sets -- ARM
+ * BX, Thumb BX, and the register forms of BLX -- and it was the single largest
+ * ARM block terminator. The T bit has to move with the branch or the very next
+ * instruction is decoded in the wrong instruction set, so it is written even
+ * though almost every branch here stays in Thumb.
+ *
+ * The masks go through a register rather than an AND-immediate: AArch64's
+ * logical immediates are a bitmask-encoded field, and hand-deriving one is how
+ * `and w9,w9,#0xfffffffe` silently becomes `and w9,w9,#2`. */
+static void e_interwork(A64 *a) {
+    e_ldr_w(a, 10, (unsigned)offsetof(Guest, cpu.cpsr));
+    e_mov32(a, 11, ~CPSR_T);
+    e_rr(a, 0x0A000000u, 10, 10, 11);            /* clear T */
+    emit(a, 0x12000000u | (9u << 5) | 12u);      /* AND w12,w9,#1 */
+    emit(a, 0x2A000000u | (12u << 16) | (5u << 10) | (10u << 5) | 10u);
+                                                 /* ORR w10,w10,w12,LSL #5 */
+    e_str_w(a, 10, (unsigned)offsetof(Guest, cpu.cpsr));
+    e_mov32(a, 11, 0xFFFFFFFEu);
+    e_rr(a, 0x0A000000u, 9, 9, 11);              /* AND w9,w9,w11 */
+    e_store_r(a, 9, GUEST_PC);
+}
+
+/* Guest store: guest address in w9, value in w14.
+ *
+ * Same shape as e_load_mem -- bounds-check the cached region, bail to the
+ * interpreter on a miss -- with two additions. The region must be writable,
+ * because the data cache is shared with loads and can be pointing at the
+ * image when a store arrives; without that test JIT code would write into
+ * memory the interpreter refuses. And under verification each store records
+ * what it is about to overwrite, so the re-run can start from the same memory.
+ *
+ * The undo record is emitted only when verifying, but the store sequence
+ * either side of it is identical in both builds, so what gets checked is the
+ * code that ships. */
+static void e_store_mem(A64 *a, int bytes, uint32_t pc, uint32_t n, int verify) {
+    unsigned mem = (unsigned)offsetof(Guest, mem);
+    e_rr(a, 0x2A000000u, 15, 31, 9);             /* MOV w15,w9 (keep address) */
+    /* No permission test: the write cache only ever holds writable regions. */
+    e_ldr_w(a, 12, mem + (unsigned)offsetof(GuestMem, wcache_base));
+    e_rr(a, 0x4B000000u, 9, 9, 12);              /* w9 = addr - base */
+    e_ldr_w(a, 12, mem + (unsigned)offsetof(GuestMem, wcache_size));
+    emit(a, 0x51000000u | ((uint32_t)bytes << 10) | (12u << 5) | 12u);
+    e_rr(a, 0x6B000000u, 31, 9, 12);             /* CMP w9,w12 */
+    emit(a, 0x54000000u | (6u << 5) | 9u);       /* B.LS +6 */
+    e_bail(a, pc, n);
+    emit(a, 0xF9400000u |
+            (((mem + (unsigned)offsetof(GuestMem, wcache_host)) >> 3) << 10) |
+            (0u << 5) | 12u);                    /* LDR x12,[x0,#wcache_host] */
+
+    if (verify) {
+        unsigned noff = mem + (unsigned)offsetof(GuestMem, undo_n);
+        e_ldr_w(a, 10, noff);
+        e_mov32(a, 11, GUEST_UNDO_MAX);
+        e_rr(a, 0x6B000000u, 31, 10, 11);        /* CMP w10,w11 */
+        emit(a, 0x54000000u | (6u << 5) | 3u);   /* B.LO +6 (room: skip bail) */
+        e_bail(a, pc, n);
+        /* old value, same width as the store */
+        if (bytes == 4)      emit(a, 0xB8604800u | (9u << 16) | (12u << 5) | 13u);
+        else if (bytes == 2) emit(a, 0x78604800u | (9u << 16) | (12u << 5) | 13u);
+        else                 emit(a, 0x38604800u | (9u << 16) | (12u << 5) | 13u);
+        emit(a, 0xF9400000u |
+                (((mem + (unsigned)offsetof(GuestMem, undo_log)) >> 3) << 10) |
+                (0u << 5) | 11u);                /* LDR x11,[x0,#undo_log] */
+        emit(a, 0x8B000000u | (10u << 16) | (4u << 10) | (11u << 5) | 11u);
+                                                 /* ADD x11,x11,x10,LSL #4 */
+        emit(a, 0xB9000000u | (0u << 10) | (11u << 5) | 15u);   /* str w15,[x11] */
+        emit(a, 0xB9000000u | (1u << 10) | (11u << 5) | 13u);   /* str w13,[x11,#4] */
+        emit(a, 0xB9000000u | (2u << 10) | (11u << 5) | 31u);   /* str wzr,[x11,#8] */
+        e_mov32(a, 13, (uint32_t)bytes);
+        emit(a, 0xB9000000u | (3u << 10) | (11u << 5) | 13u);   /* str w13,[x11,#12] */
+        emit(a, 0x11000400u | (10u << 5) | 10u);                /* ADD w10,w10,#1 */
+        e_str_w(a, 10, noff);
+    }
+
+    if (bytes == 4)
+        emit(a, 0xB8204800u | (9u << 16) | (12u << 5) | 14u);   /* STR  w14 */
+    else if (bytes == 2)
+        emit(a, 0x78204800u | (9u << 16) | (12u << 5) | 14u);   /* STRH w14 */
+    else
+        emit(a, 0x38204800u | (9u << 16) | (12u << 5) | 14u);   /* STRB w14 */
 }
 
 static uint32_t arm_rotimm(uint32_t insn) {
@@ -205,13 +341,29 @@ static int emit_dp(A64 *a, uint32_t op, int setflags, int writes,
 }
 
 static int compile_arm(Guest *g, A64 *a, uint32_t start, uint32_t until,
-                       uint16_t *out_count) {
+                       uint16_t *out_count, uint32_t *out_end) {
     uint32_t pc = start, n = 0;
+    *out_end = 0;
     while (n < JIT_MAX_GUEST && a->n + 40 < JIT_MAX_A64) {
         uint32_t insn, op, S, rn, rd;
         if (pc == (until & ~1u) || has_hook(g, pc) ||
-            !guest_ld32(&g->mem, pc, &insn) || (insn >> 28) != 0xEu)
+            !guest_ld32(&g->mem, pc, &insn))
             break;
+        /* Assigned before the condition test, not with it. Folded together,
+         * a conditional instruction ending the block left out_end holding the
+         * PREVIOUS instruction -- which reported "CMP ends 14% of blocks", an
+         * encoding the JIT lowers perfectly well, when the real blocker was
+         * the predicated instruction after it. */
+        *out_end = insn;
+        if ((insn >> 28) != 0xEu)
+            break;
+
+        if ((insn & 0x0FFFFFF0u) == 0x012FFF10u) {       /* BX Rm */
+            e_load_r(a, 9, insn & 0xFu);
+            e_interwork(a);
+            n++; e_return(a, n); *out_count = (uint16_t)n; *out_end = 0;
+            return 1;
+        }
 
         if ((insn & 0x0E000000u) == 0x0A000000u) {       /* B / BL */
             int32_t off = (int32_t)(insn << 8) >> 6;
@@ -223,6 +375,7 @@ static int compile_arm(Guest *g, A64 *a, uint32_t start, uint32_t until,
             n++;
             e_return(a, n);
             *out_count = (uint16_t)n;
+            *out_end = 0;       /* ended on its own terms, not blocked */
             return 1;
         }
 
@@ -335,24 +488,105 @@ static int compile_arm(Guest *g, A64 *a, uint32_t start, uint32_t until,
 }
 
 static int compile_thumb(Guest *g, A64 *a, uint32_t start, uint32_t until,
-                         uint16_t *out_count) {
+                         uint16_t *out_count, uint32_t *out_end) {
     uint32_t pc = start, n = 0;
+    int verify = g->jit_verify;
+    *out_end = 0;
     while (n < JIT_MAX_GUEST && a->n + 40 < JIT_MAX_A64) {
         uint32_t hw;
         if (pc == (until & ~1u) || has_hook(g, pc) ||
             !guest_ld16(&g->mem, pc, &hw))
             break;
+        *out_end = hw;
 
         if ((hw & 0xF800u) >= 0xE800u) {                 /* selected T32 */
             uint32_t hw2, rn, rd, imm12, kind;
             if (!guest_ld16(&g->mem, pc + 2u, &hw2)) break;
-            if ((hw & 0xFA00u) != 0xF200u || (hw2 & 0x8000u)) break;
+
+            /* Branches: hw2 bit 15 set. Both end the block, and lowering them
+             * folds the branch into it rather than handing one instruction
+             * back to the interpreter every time a block ends. */
+            if (hw2 & 0x8000u) {
+                uint32_t S1, j1, j2, i1, i2, imm11, imm10;
+                int32_t off;
+                if ((hw & 0xF800u) != 0xF000u) break;
+                if ((hw2 & 0xD000u) != 0x9000u && (hw2 & 0xD000u) != 0xD000u)
+                    break;                       /* conditional B.W: later */
+                S1 = (hw >> 10) & 1u;
+                imm10 = hw & 0x3FFu;
+                j1 = (hw2 >> 13) & 1u;
+                j2 = (hw2 >> 11) & 1u;
+                imm11 = hw2 & 0x7FFu;
+                i1 = 1u - (j1 ^ S1);
+                i2 = 1u - (j2 ^ S1);
+                /* 25-bit signed displacement. The left shift is done on the
+                 * unsigned value and only then reinterpreted: casting first
+                 * and shifting a negative int32_t left is undefined. */
+                off = (int32_t)(((S1 << 24) | (i1 << 23) | (i2 << 22) |
+                                 (imm10 << 12) | (imm11 << 1)) << 7) >> 7;
+                if ((hw2 & 0xD000u) == 0xD000u) {   /* BL: LR = return | 1 */
+                    e_mov32(a, 9, (pc + 4u) | 1u);
+                    e_store_r(a, 9, GUEST_LR);
+                }
+                e_set_pc(a, pc + 4u + (uint32_t)off);
+                n++; e_return(a, n); *out_count = (uint16_t)n; *out_end = 0;
+                return 1;
+            }
+
+            /* Data processing, modified immediate. */
+            if ((hw & 0xFA00u) == 0xF000u) {
+                uint32_t op = (hw >> 5) & 0xFu, S = (hw >> 4) & 1u;
+                uint32_t drn = hw & 0xFu, drd = (hw2 >> 8) & 0xFu;
+                uint32_t di12 = (((hw >> 10) & 1u) << 11) |
+                                (((hw2 >> 12) & 7u) << 8) | (hw2 & 0xFFu);
+                int rotated, aop = t32_dp_op(op);
+                uint32_t val;
+                int logical;
+                /* Rd = 1111 with S set is how T32 spells CMP/TST/TEQ/CMN:
+                 * the result is discarded and only the flags matter, so it is
+                 * a compare rather than a write to PC. Without S it is an
+                 * unallocated form and the block ends. */
+                if (aop < 0 || (drd == GUEST_PC && !S)) break;
+                logical = (aop == 0x0 || aop == 0x1 || aop == 0xC ||
+                           aop == 0xE);
+                val = jit_thumb_imm(di12, &rotated);
+                /* A flag-setting logical takes C from the immediate's
+                 * carry-out. When the immediate is not the rotated form that
+                 * carry-out is the carry-in, so C is simply preserved and
+                 * N/Z alone is correct; when it is, C would have to be
+                 * modelled and the block ends instead. */
+                if (S && logical && rotated) break;
+                e_mov32(a, 10, val);
+                if (drn == GUEST_PC) {
+                    if (aop != 0xC || drd == GUEST_PC) break;  /* ORR -> MOV */
+                    e_rr(a, 0x2A000000u, 9, 31, 10);
+                    e_store_r(a, 9, drd);
+                    if (S) e_set_nz(a, 9);
+                } else {
+                    e_load_r(a, 9, drn);
+                    if (!emit_dp(a, (uint32_t)aop, (int)S,
+                                 drd != GUEST_PC, drd))
+                        break;
+                }
+                pc += 4; n++;
+                continue;
+            }
+            if ((hw & 0xFA00u) != 0xF200u) break;
             rn = hw & 0xFu; rd = (hw2 >> 8) & 0xFu;
             imm12 = (((hw >> 10) & 1u) << 11) |
                     (((hw2 >> 12) & 7u) << 8) | (hw2 & 0xFFu);
             kind = hw & 0xFBF0u;
             if (rd == GUEST_PC) break;
-            if (kind == 0xF240u) {                       /* MOVW */
+            if (kind == 0xF200u || kind == 0xF2A0u) {    /* ADDW / SUBW */
+                /* T4: no flags, 12-bit immediate -- exactly the width of the
+                 * AArch64 ADD/SUB immediate field, so it lowers one to one.
+                 * Rn = PC is the ADR form and is left alone. */
+                if (rn == GUEST_PC) break;
+                e_load_r(a, 9, rn);
+                emit(a, (kind == 0xF200u ? 0x11000000u : 0x51000000u) |
+                        (imm12 << 10) | (9u << 5) | 9u);
+                e_store_r(a, 9, rd);
+            } else if (kind == 0xF240u) {                 /* MOVW */
                 e_mov32(a, 9, (rn << 12) | imm12);
                 e_store_r(a, 9, rd);
             } else if (kind == 0xF2C0u) {                /* MOVT */
@@ -407,6 +641,132 @@ static int compile_thumb(Guest *g, A64 *a, uint32_t start, uint32_t until,
                 if (op == 1) e_merge_nzcv(a, CPSR_N|CPSR_Z|CPSR_C|CPSR_V);
                 else e_store_r(a, 9, rd);
             }
+        } else if ((hw & 0xFE00u) == 0xBC00u ||
+                   (hw & 0xFE00u) == 0xB400u) {          /* POP / PUSH */
+            /* The stack half of every prologue and epilogue, and the largest
+             * remaining block terminator once stores landed.
+             *
+             * The whole transfer range is bounds-checked ONCE, before any of
+             * it happens. Checking per register looked equivalent and is not:
+             * a bail on the third register of a PUSH would leave two words
+             * already written, and on a POP two guest registers already
+             * loaded, while reporting that the instruction never ran. The
+             * interpreter then re-executes from before it and never makes
+             * those writes -- which the verifier correctly reports as a
+             * divergence, because it is one. One check up front means a bail
+             * always happens with nothing yet done, and it is faster besides.
+             *
+             * SP still moves only at the end, so re-execution after a bail
+             * starts from the same stack. */
+            uint32_t list = hw & 0xFFu, extra = (hw >> 8) & 1u;
+            uint32_t pop = (hw & 0xFE00u) == 0xBC00u;
+            uint32_t cnt = extra, r, off = 0;
+            unsigned mem = (unsigned)offsetof(Guest, mem);
+            unsigned cb, cs, ch;
+            for (r = 0; r < 8; r++) if (list & (1u << r)) cnt++;
+            if (!cnt || a->n + 10u * cnt + 60u > JIT_MAX_A64)
+                break;
+            cb = pop ? (unsigned)offsetof(GuestMem, cache_base)
+                     : (unsigned)offsetof(GuestMem, wcache_base);
+            cs = pop ? (unsigned)offsetof(GuestMem, cache_size)
+                     : (unsigned)offsetof(GuestMem, wcache_size);
+            ch = pop ? (unsigned)offsetof(GuestMem, cache_host)
+                     : (unsigned)offsetof(GuestMem, wcache_host);
+            e_load_r(a, 16, GUEST_SP);
+            if (!pop)                                    /* PUSH: SP - 4*cnt */
+                emit(a, 0x51000000u | ((cnt * 4u) << 10) | (16u << 5) | 16u);
+            e_ldr_w(a, 12, mem + cb);
+            e_rr(a, 0x4B000000u, 9, 16, 12);             /* w9 = base - region */
+            e_ldr_w(a, 12, mem + cs);
+            emit(a, 0x51000000u | ((cnt * 4u) << 10) | (12u << 5) | 12u);
+            e_rr(a, 0x6B000000u, 31, 9, 12);             /* CMP w9,w12 */
+            emit(a, 0x54000000u | (6u << 5) | 9u);       /* B.LS +6 */
+            e_bail(a, pc, n);
+            emit(a, 0xF9400000u | (((mem + ch) >> 3) << 10) | (0u << 5) | 12u);
+            emit(a, 0x8B204000u | (9u << 16) | (12u << 5) | 12u);
+                                                 /* x12 = host + offset */
+            for (r = 0; r < 9; r++) {
+                uint32_t greg;
+                if (r < 8) {
+                    if (!(list & (1u << r))) continue;
+                    greg = r;
+                } else {
+                    if (!extra) break;
+                    greg = pop ? GUEST_PC : GUEST_LR;
+                }
+                if (pop) {
+                    emit(a, 0xB9400000u | ((off >> 2) << 10) | (12u << 5) | 9u);
+                    if (greg != GUEST_PC)
+                        e_store_r(a, 9, greg);           /* PC handled below */
+                } else {
+                    e_load_r(a, 9, greg);
+                    if (verify) {
+                        /* Undo record. x12 (the host base) and w9 (the value)
+                         * must survive, so this uses w10, w11 and w13 only. */
+                        unsigned noff = mem + (unsigned)offsetof(GuestMem, undo_n);
+                        e_ldr_w(a, 10, noff);
+                        e_mov32(a, 11, GUEST_UNDO_MAX);
+                        e_rr(a, 0x6B000000u, 31, 10, 11);
+                        emit(a, 0x54000000u | (6u << 5) | 3u);   /* B.LO +6 */
+                        e_bail(a, pc, n);
+                        emit(a, 0xB9400000u | ((off >> 2) << 10) | (12u << 5) | 13u);
+                        e_rr(a, 0x2A000000u, 15, 31, 16);        /* w15 = base */
+                        if (off)
+                            emit(a, 0x11000000u | (off << 10) | (15u << 5) | 15u);
+                        emit(a, 0xF9400000u |
+                                (((mem + (unsigned)offsetof(GuestMem, undo_log)) >> 3) << 10) |
+                                (0u << 5) | 11u);
+                        emit(a, 0x8B000000u | (10u << 16) | (4u << 10) | (11u << 5) | 11u);
+                        emit(a, 0xB9000000u | (0u << 10) | (11u << 5) | 15u);
+                        emit(a, 0xB9000000u | (1u << 10) | (11u << 5) | 13u);
+                        emit(a, 0xB9000000u | (2u << 10) | (11u << 5) | 31u);
+                        e_mov32(a, 13, 4u);
+                        emit(a, 0xB9000000u | (3u << 10) | (11u << 5) | 13u);
+                        emit(a, 0x11000400u | (10u << 5) | 10u);
+                        e_str_w(a, 10, noff);
+                    }
+                    emit(a, 0xB9000000u | ((off >> 2) << 10) | (12u << 5) | 9u);
+                }
+                off += 4u;
+            }
+            if (pop) {
+                e_load_r(a, 10, GUEST_SP);
+                emit(a, 0x11000000u | ((cnt * 4u) << 10) | (10u << 5) | 10u);
+                e_store_r(a, 10, GUEST_SP);
+            } else {
+                e_store_r(a, 16, GUEST_SP);
+            }
+            if (pop && extra) {                          /* POP {..., pc} */
+                e_interwork(a);                          /* w9 holds it still */
+                n++; e_return(a, n); *out_count = (uint16_t)n; *out_end = 0;
+                return 1;
+            }
+            pc += 2; n++;
+            continue;
+        } else if ((hw & 0xF500u) == 0xB100u) {          /* CBZ / CBNZ */
+            uint32_t rn = hw & 7u;
+            uint32_t off5 = (((hw >> 9) & 1u) << 5) | ((hw >> 3) & 0x1Fu);
+            e_load_r(a, 10, rn);
+            e_rr(a, 0x6B000000u, 31, 10, 31);            /* CMP w10,wzr */
+            e_mov32(a, 9, pc + 4u + off5 * 2u);          /* taken */
+            e_mov32(a, 11, pc + 2u);                     /* not taken */
+            /* CBNZ (bit 11) branches when non-zero: NE. CBZ branches on EQ. */
+            emit(a, 0x1A800000u | (11u << 16) |
+                    (((hw & 0x0800u) ? 1u : 0u) << 12) | (9u << 5) | 9u);
+            e_store_r(a, 9, GUEST_PC);
+            n++; e_return(a, n); *out_count = (uint16_t)n; *out_end = 0;
+            return 1;
+        } else if ((hw & 0xFF00u) == 0x4700u) {          /* BX / BLX Rm */
+            uint32_t rm = (hw >> 3) & 0xFu;
+            if (rm == GUEST_PC) break;           /* BX PC: rare, and not this */
+            if (hw & 0x0080u) {                  /* BLX: LR = return | 1 */
+                e_mov32(a, 9, (pc + 2u) | 1u);
+                e_store_r(a, 9, GUEST_LR);
+            }
+            e_load_r(a, 9, rm);
+            e_interwork(a);
+            n++; e_return(a, n); *out_count = (uint16_t)n; *out_end = 0;
+            return 1;
         } else if ((hw & 0xFC00u) == 0x4000u) {          /* common ALU ops */
             uint32_t op = (hw >> 6) & 0xFu, rd = hw & 7u, rm = (hw >> 3) & 7u;
             e_load_r(a, 9, rd); e_load_r(a, 10, rm);
@@ -445,10 +805,93 @@ static int compile_thumb(Guest *g, A64 *a, uint32_t start, uint32_t until,
             e_load_r(a, 9, GUEST_SP); e_mov32(a, 10, imm);
             e_rr(a, (hw & 0x80u) ? 0x4B000000u : 0x0B000000u, 9, 9, 10);
             e_store_r(a, 9, GUEST_SP);
+        } else if ((hw & 0xF000u) == 0x6000u || (hw & 0xF000u) == 0x8000u ||
+                   (hw & 0xF000u) == 0x7000u || (hw & 0xF000u) == 0x9000u ||
+                   (hw & 0xF800u) == 0x4800u) {
+            /* Thumb loads. This is the omission that actually mattered: the
+             * Thumb compiler had no memory lowering at all, so in Thumb code
+             * -- which is where gameplay lives -- a block ended at the first
+             * load or store, and no amount of lowering arithmetic moved the
+             * average off 1.6 instructions.
+             *
+             *   0110 1 LDR  Rd,[Rn,#imm5*4]      0111 1 LDRB Rd,[Rn,#imm5]
+             *   1000 1 LDRH Rd,[Rn,#imm5*2]      1001 1 LDR  Rd,[SP,#imm8*4]
+             *   0100 1 LDR  Rd,[PC,#imm8*4]      (literal pool)
+             *
+             * Stores share these encodings with the load bit clear and are
+             * deliberately still rejected: verification re-runs each block, so
+             * a block that writes memory needs the undo log first. */
+            uint32_t rd, rn, imm, bytes = 4;
+            if ((hw & 0xF800u) == 0x4800u) {         /* LDR literal */
+                rd = (hw >> 8) & 7u;
+                e_mov32(a, 9, ((pc + 4u) & ~3u) + (hw & 0xFFu) * 4u);
+            } else if ((hw & 0xF800u) == 0x9000u) {  /* STR [SP,#imm8*4] */
+                rd = (hw >> 8) & 7u;
+                e_load_r(a, 14, rd);
+                e_load_r(a, 9, GUEST_SP);
+                imm = (hw & 0xFFu) * 4u;
+                if (imm)
+                    emit(a, 0x11000000u | (imm << 10) | (9u << 5) | 9u);
+                e_store_mem(a, 4, pc, n, verify);
+                pc += 2; n++;
+                continue;
+            } else if ((hw & 0xF800u) == 0x9800u) {  /* LDR [SP,#imm8*4] */
+                rd = (hw >> 8) & 7u;
+                e_load_r(a, 9, GUEST_SP);
+                imm = (hw & 0xFFu) * 4u;
+                if (imm)
+                    emit(a, 0x11000000u | (imm << 10) | (9u << 5) | 9u);
+            } else {
+                rd = hw & 7u;
+                rn = (hw >> 3) & 7u;
+                imm = (hw >> 6) & 0x1Fu;
+                if ((hw & 0xF000u) == 0x6000u)      imm *= 4u;
+                else if ((hw & 0xF000u) == 0x8000u) { imm *= 2u; bytes = 2; }
+                else                                  bytes = 1;
+                if (!(hw & 0x0800u)) {                /* store */
+                    e_load_r(a, 14, rd);
+                    e_load_r(a, 9, rn);
+                    if (imm)
+                        emit(a, 0x11000000u | (imm << 10) | (9u << 5) | 9u);
+                    e_store_mem(a, (int)bytes, pc, n, verify);
+                    pc += 2; n++;
+                    continue;
+                }
+                e_load_r(a, 9, rn);
+                if (imm)
+                    emit(a, 0x11000000u | (imm << 10) | (9u << 5) | 9u);
+            }
+            e_load_mem(a, (int)bytes, pc, n);
+            e_store_r(a, 9, rd);
+        } else if ((hw & 0xF000u) == 0xD000u &&
+                   ((hw >> 8) & 0xFu) < 0xEu) {          /* conditional branch */
+            /* Ends the block either way, so it costs nothing to get both
+             * successors right: compute the target and the fall-through, then
+             * pick between them with the guest's own flags.
+             *
+             * ARM and AArch64 condition codes share an encoding, so the guest
+             * condition can be used verbatim -- the only work is getting the
+             * guest's NZCV into the host's, which MSR does directly. Masking
+             * first because the rest of CPSR is not flags and NZCV's low bits
+             * are RES0. */
+            uint32_t cond = (hw >> 8) & 0xFu;
+            int32_t off = (int32_t)((hw & 0xFFu) << 24) >> 23;
+            e_ldr_w(a, 10, (unsigned)offsetof(Guest, cpu.cpsr));
+            e_mov32(a, 11, 0xF0000000u);
+            e_rr(a, 0x0A000000u, 10, 10, 11);            /* AND w10,w10,w11 */
+            emit(a, 0xD51B4200u | 10u);                  /* MSR NZCV, x10 */
+            e_mov32(a, 9, pc + 4u + (uint32_t)off);      /* taken */
+            e_mov32(a, 11, pc + 2u);                     /* not taken */
+            emit(a, 0x1A800000u | (11u << 16) | (cond << 12) |
+                    (9u << 5) | 9u);                     /* CSEL w9,w9,w11,cond */
+            e_store_r(a, 9, GUEST_PC);
+            n++; e_return(a, n); *out_count = (uint16_t)n; *out_end = 0;
+            return 1;
         } else if ((hw & 0xF800u) == 0xE000u) {          /* B */
             int32_t off = (int32_t)((hw & 0x7FFu) << 21) >> 20;
             e_set_pc(a, pc + 4u + (uint32_t)off);
-            n++; e_return(a, n); *out_count = (uint16_t)n; return 1;
+            n++; e_return(a, n); *out_count = (uint16_t)n; *out_end = 0;
+            return 1;
         } else break;
         pc += 2; n++;
     }
@@ -471,10 +914,22 @@ static int compile_block(Guest *g, JitContext *j, JitEntry *e, uint32_t until) {
     uint16_t count = 0;
     uint32_t bytes, off;
     Result rc;
+    uint32_t end_insn = 0;
+    int thumb = guest_is_thumb(&g->cpu);
     memset(&a, 0, sizeof a);
-    if (g->cpu.itstate || !(guest_is_thumb(&g->cpu)
-          ? compile_thumb(g, &a, g->cpu.r[GUEST_PC], until, &count)
-          : compile_arm(g, &a, g->cpu.r[GUEST_PC], until, &count))) {
+    if (g->cpu.itstate || !(thumb
+          ? compile_thumb(g, &a, g->cpu.r[GUEST_PC], until, &count, &end_insn)
+          : compile_arm(g, &a, g->cpu.r[GUEST_PC], until, &count, &end_insn))) {
+        e->state = 3;
+        return 0;
+    }
+    e->end_insn = end_insn;
+    e->end_thumb = (uint8_t)thumb;
+    /* A block that lowered nothing is worse than no block: it stays in the
+     * cache as "compiled", so every visit to this PC pays an indirect call
+     * into generated code that immediately returns zero, and the interpreter
+     * then does all the work anyway. Reject the PC instead. */
+    if (!count) {
         e->state = 3;
         return 0;
     }
@@ -569,6 +1024,56 @@ void guest_jit_close(Guest *g) {
 }
 
 /* r16 hardware trial: enable the deliberately narrow tier automatically. */
+/* What is stopping blocks from being longer, ranked by the executions it costs.
+ *
+ * Reported per encoding rather than per reason: the encoding is what has to be
+ * lowered next, and naming it directly removes a step of interpretation. ARM
+ * rows are keyed by bits 20-27, Thumb rows by the top byte of the halfword --
+ * the same keys the interpreter's instruction mix uses, so the two reports can
+ * be read side by side. */
+void guest_jit_report_blockers(Guest *g) {
+    JitContext *j = (JitContext *)g->jit;
+    uint64_t weight[512];
+    uint32_t i, k;
+    uint64_t total = 0;
+
+    if (!j || !j->entry)
+        return;
+    memset(weight, 0, sizeof weight);
+    for (i = 0; i < JIT_CACHE_SLOTS; i++) {
+        JitEntry *e = &j->entry[i];
+        uint32_t idx;
+        if (e->state != 2 || !e->execs || !e->end_insn)
+            continue;
+        /* Thumb encodes immediate bits in the top byte, so keying on it
+         * splits one instruction class across eight rows and makes each look
+         * small: STR is 0x60-0x67 and LDR is 0x68-0x6F. That is how "no Thumb
+         * load/store lowering at all" hid behind a 20% row. Key on the major
+         * opcode instead, and report it as a representative encoding. */
+        idx = e->end_thumb ? ((e->end_insn >> 11) & 0x1Fu)
+                           : (256u + ((e->end_insn >> 20) & 0xFFu));
+        weight[idx] += e->execs;
+        total += e->execs;
+    }
+    if (!total)
+        return;
+    printf("  [jitb ] what ends blocks, by executions cost:\n");
+    for (k = 0; k < 8; k++) {
+        uint64_t best = 0;
+        uint32_t bi = 0;
+        for (i = 0; i < 512; i++)
+            if (weight[i] > best) { best = weight[i]; bi = i; }
+        if (!best)
+            break;
+        printf("  [jitb ]   %-3s %04x  %2llu%%  %llu\n",
+               bi < 256 ? "T16" : "ARM",
+               bi < 256 ? (unsigned)(bi << 11) : (unsigned)(bi & 0xFFu),
+               (unsigned long long)(best * 100ull / total),
+               (unsigned long long)best);
+        weight[bi] = 0;
+    }
+}
+
 static int jit_wanted(void) {
     static int decided;
     if (!decided) {
@@ -607,8 +1112,20 @@ int guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
     g_native_stage = 200;
     n = fn(g);
     g_native_stage = 201;
-    if (n != e->count) return 0; /* generated leaf always returns its count */
+    /* Once loads could bail mid-block this stopped being "the leaf always
+     * returns its count". A short count is a region-check miss: the block ran,
+     * updated the registers it got to, and left PC on the instruction it could
+     * not do. Reporting that as "did not run" threw away real work -- the
+     * instructions were not counted, and with verification on they were never
+     * checked either, so precisely the new code path was the one going
+     * untested. */
+    if (!n || n > e->count) return 0;
+    if (n < e->count) {
+        g->jit_bails++;
+        g->jit_bail_lost += e->count - n;
+    }
     *retired = n;
+    e->execs++;
     g->jit_executed += n;
     return 1;
 }

@@ -64,6 +64,15 @@ typedef struct {
     int      writable;
 } GuestRegion;
 
+#define GUEST_UNDO_MAX 256u
+
+typedef struct {
+    uint32_t addr;
+    uint32_t old;               /* value before the store */
+    uint32_t val;               /* value the JIT left, filled in at check time */
+    uint32_t size;
+} GuestUndo;
+
 typedef struct {
     GuestRegion region[GUEST_MAX_REGIONS];
     int         count;
@@ -94,6 +103,29 @@ typedef struct {
     uint32_t    cache_base;
     uint32_t    cache_size;
     uint8_t    *cache_host;
+    /* Whether that region may be written. The data cache is shared between
+     * reads and writes, so it can be pointing at the image -- which is not
+     * writable -- when a store arrives. JIT code has to test this or it would
+     * happily write into read-only memory the interpreter would have refused. */
+    uint32_t    cache_writable;
+    /* And again for stores, which need their own.
+     *
+     * One shared data entry thrashes exactly the way the shared
+     * instruction/data entry did: a block that loads a constant from the
+     * read-only image and then stores to the heap points the entry at the
+     * image on the load, so the store finds a region it may not write. In the
+     * interpreter that costs a slow lookup; in JIT code it ends the block, and
+     * it was throwing away 38% of everything compiled blocks were built to do.
+     *
+     * A write entry is only ever set from guest_wptr_slow, which refuses
+     * unwritable regions, so anything found here is writable by construction
+     * -- JIT store code needs no permission test at all. */
+    int         wcache;
+    uint32_t    wcache_base;
+    uint32_t    wcache_size;
+    uint8_t    *wcache_host;
+    GuestUndo  *undo_log;       /* == guest_undo_log; here so JIT code can
+                                 * reach it with one load off x0 */
     /* Optional four-byte data watch used during bring-up. The interpreter
      * stamps current_pc before every instruction; stores record the first
      * transition from non-zero to zero without changing normal semantics. */
@@ -106,7 +138,32 @@ typedef struct {
     uint32_t    watch_zero_addr;
     uint32_t    current_pc;
     uint64_t    watch_changes;
+    /* Store undo log, for JIT verification only.
+     *
+     * Verification re-runs a block through the interpreter from the same
+     * starting registers. That is only a fair comparison if it also starts
+     * from the same MEMORY: a block doing ldr/add/str on one address would
+     * have the re-run read back what the JIT just wrote and compute a
+     * different answer, reporting a divergence that is an artefact of the
+     * method rather than a bug in the lowering. Read-modify-write of a field
+     * is far too common a shape to have that firing constantly.
+     *
+     * So every store records where it wrote and what was there before, and
+     * verification rolls them back before re-running. Off unless a JIT
+     * self-check is armed, so the ordinary path pays one predictable branch. */
+    int         undo_active;
+    uint32_t    undo_n;
+    uint32_t    undo_overflow;  /* writes past the log's capacity */
 } GuestMem;
+
+/* The log itself lives outside GuestMem so the struct the interpreter touches
+ * on every access stays small: it is read on the hot path, and 4 KB of undo
+ * entries in the middle of it would push cache_base and the region array onto
+ * different lines. */
+extern GuestUndo guest_undo_log[GUEST_UNDO_MAX];
+
+/* Record a store about to happen. Only called when undo_active. */
+void guest_undo_record(GuestMem *m, uint32_t addr, uint32_t size);
 
 int   guest_mem_add(GuestMem *m, uint32_t base, uint32_t size, uint8_t *host, int writable);
 
@@ -133,7 +190,7 @@ static inline void *guest_ptr(const GuestMem *m, uint32_t addr, uint32_t len) {
 }
 
 static inline void *guest_wptr(GuestMem *m, uint32_t addr, uint32_t len) {
-    GuestRegion *r = &m->region[m->cache];
+    GuestRegion *r = &m->region[m->wcache];
     uint32_t off = addr - r->base;
     /* Store watch. watch_addr is 0 unless something armed it, so this is one
      * predictable compare; when armed it records the last writer's PC, which
@@ -147,6 +204,8 @@ static inline void *guest_wptr(GuestMem *m, uint32_t addr, uint32_t len) {
         m->watch_last_pc = m->current_pc;
         m->watch_changes++;
     }
+    if (m->undo_active)
+        guest_undo_record(m, addr, len);
     if (r->writable && off < r->size && len <= r->size - off)
         return r->host + off;
     return guest_wptr_slow(m, addr, len);
@@ -321,6 +380,14 @@ typedef struct {
      * construction today; adding store lowering means adding an undo log
      * before this stays valid. jit_verify_blocks counts what has been checked,
      * so "no divergences" can be distinguished from "nothing was tested". */
+    /* Block executions that ended early on a region-check miss, and the
+     * instructions they gave up. A block compiled to eight instructions that
+     * bails after two contributes two, so if bails are common the average
+     * block length says nothing about how much was compiled -- which is
+     * exactly the ambiguity that made four rounds of lowering look identical.
+     * jit_bail_lost is what a better memory fast path would recover. */
+    uint64_t jit_bails;
+    uint64_t jit_bail_lost;
     int      jit_verify;
     uint64_t jit_verify_blocks;
     uint32_t jit_diverged;
@@ -332,6 +399,9 @@ typedef struct {
  * compiled block and fills `retired` with that block's guest instruction
  * count. */
 int  guest_jit_init(Guest *g);
+/* Print what is terminating compiled blocks, weighted by executions. A no-op
+ * when the JIT is off or on a host where it does not exist. */
+void guest_jit_report_blockers(Guest *g);
 void guest_jit_close(Guest *g);
 int  guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
                        uint32_t *retired);
