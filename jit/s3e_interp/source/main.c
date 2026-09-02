@@ -27,7 +27,7 @@
 #define STACK_BASE 0x20000000u
 #define STACK_SIZE (1u << 20)
 #define HEAP_BASE  0x60000000u
-#define BOZ_BUILD_LABEL "perf-r62 " __DATE__ " " __TIME__
+#define BOZ_BUILD_LABEL "sched-r63 " __DATE__ " " __TIME__
 /* The allocator is a pure bump allocator and free() reclaims nothing, so
  * exhaustion is self-inflicted and the game does not NULL-check malloc -- it
  * runs a C++ constructor on the result and faults writing the vtable. The
@@ -2114,6 +2114,9 @@ static void hle_profile(uint32_t slot, int enter) {
     }
 }
 
+/* Scheduling of the interpreter thread itself; filled in at startup. */
+static int32_t g_main_prio = -1;
+
 /* Defined below, next to the Guest it reads. */
 static void pc_profile_report(void);
 static void pc_profile_clear(void);
@@ -2194,6 +2197,23 @@ static void frame_profile_report(void) {
                (unsigned)g_div_hits[0], (unsigned)g_div_hits[1],
                (unsigned)g_div_hits[2]);
         g_div_hits[0] = g_div_hits[1] = g_div_hits[2] = 0;
+    }
+    {   /* Which core we are on, and whether we stayed there.
+         *
+         * The guest is single-threaded -- 391 imports and not one thread,
+         * mutex or atomic among them -- so no amount of threading can split
+         * the instruction stream that is 98% of frame time. What CAN cost real
+         * time is this thread sharing a core with system work or being
+         * migrated between cores, and nothing here has ever set an affinity.
+         * Report it before trying to fix it. */
+        static int last_core = -1;
+        static int migrations;
+        int core = (int)svcGetCurrentProcessorNumber();
+        if (last_core >= 0 && core != last_core)
+            migrations++;
+        last_core = core;
+        printf("  [sched] core %d, %d migrations seen, prio %d\n",
+               core, migrations, (int)g_main_prio);
     }
     pc_profile_report();
     i_profile_report();
@@ -3389,6 +3409,18 @@ int main(int argc, char **argv) {
     consoleInit(NULL);
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&g_pad);
+
+    {   /* Record where the scheduler has put us. Nothing sets an affinity or a
+         * priority anywhere in this program, so whatever this reports is the
+         * default we inherited rather than a choice anyone made. */
+        u64 mask = 0;
+        s32 dummy = 0;
+        svcGetThreadPriority(&g_main_prio, CUR_THREAD_HANDLE);
+        svcGetThreadCoreMask(&dummy, &mask, CUR_THREAD_HANDLE);
+        printf("sched: core %d, ideal %d, mask %llx, prio %d\n",
+               (int)svcGetCurrentProcessorNumber(), (int)dummy,
+               (unsigned long long)mask, (int)g_main_prio);
+    }
 
     if (startup_stage_read(previous_stage, sizeof previous_stage)) {
         printf("PREVIOUS RUN LAST REACHED:\n%s\n\nPress A to continue.\n",

@@ -52,11 +52,10 @@ INCLUDES	:=	.. ../../loader
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-# -O3 rather than -O2: the interpreter's cost is dominated by one enormous
-# switch per instruction set, and the extra inlining and jump-threading at
-# -O3 apply directly to it. -ffp-contract stays off below regardless -- that
-# one is correctness, not optimisation.
-CFLAGS	:=	-g -Wall -O3 -ffunction-sections \
+# -O2, not -O3: measured on the device across matched scenes, -O3 was 0.4%
+# faster on one and 1.2% slower on another -- a wash, for a larger binary.
+# -ffp-contract stays off below regardless; that one is correctness.
+CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
 			$(ARCH) $(DEFINES)
 
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__
