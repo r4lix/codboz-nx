@@ -7,12 +7,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <stdint.h>
 
 #include "guest.h"
 #include "s3e_loader.h"
 #include "s3e_files.h"
+#include "s3e_config.h"
 #ifdef __SWITCH__
 #include "gl_thunks.h"
 #endif
@@ -177,65 +179,86 @@ static void hle_devstring(GuestCpu *cpu, GuestMem *mem, void *user) {
     cpu->r[0] = s;
 }
 
-/* The stock [GX] budget (16/0) makes the game abort with "Out of T-Pages". */
+/* NUL-terminated store into guest memory; fails closed on an unmapped byte
+ * rather than reporting a buffer it did not fill. */
+static int gputs(GuestMem *m, uint32_t addr, const char *s) {
+    uint32_t i;
+    for (i = 0;; i++) {
+        if (!guest_st8(m, addr + i, (uint8_t)s[i]))
+            return 0;
+        if (!s[i])
+            return 1;
+    }
+}
+
+/* Each key is logged once, with the answer it got, so the next unhandled one
+ * names itself -- that is how LowMemoryDevice was tracked down. */
+static void cfg_log_once(const char *tag, const char *sect, const char *key,
+                         const char *val) {
+    static char seen[64][56];
+    static int nseen;
+    const char *parked;
+    char id[56];
+    int i;
+    snprintf(id, sizeof id, "%s|%s|%s", tag, sect, key);
+    for (i = 0; i < nseen; i++)
+        if (!strcmp(seen[i], id))
+            return;
+    if (nseen >= 64)
+        return;
+    snprintf(seen[nseen], sizeof seen[0], "%s", id);
+    nseen++;
+    /* A parked key prints the value it would have had. That is the bisection
+     * data: it says which "not set" answers are a decision from r18 and which
+     * are simply keys nobody has looked at. */
+    parked = val ? NULL : s3e_config_parked(sect, key);
+    if (parked)
+        printf("  [%s] [%s] %s -> not set (PARKED, would be %s)\n",
+               tag, sect, key, parked);
+    else
+        printf("  [%s] [%s] %s -> %s\n", tag, sect, key,
+               val ? val : "not set");
+}
+
+/* s3eConfigGetInt(section, key, out). Answers from the shared table in
+ * jit/s3e_config.h; anything not in it stays "not set" so the game keeps its
+ * own defaults. */
 static void hle_configint(GuestCpu *cpu, GuestMem *mem, void *user) {
-    char sect[24], key[40];
+    char sect[32], key[48];
+    const char *val;
     (void)user;
     gstr(mem, cpu->r[0], sect, sizeof sect);
     gstr(mem, cpu->r[1], key, sizeof key);
-    if (!strcmp(sect, "GX") &&
-        (!strcmp(key, "NumTPages") || !strcmp(key, "NumTPagesNoMipMap"))) {
-        guest_st32(mem, cpu->r[2], 512);
-        cpu->r[0] = 0;                        /* S3E_RESULT_SUCCESS */
-        return;
-    }
-    /* The game reads a LowMemoryDevice key (string constant at RVA 0x3bd4bb)
-     * and opens with a "DEVICE IS LOW ON RAM" dialog. Answering
-     * s3eMemoryGetInt generously did NOT clear it, so the decision comes from
-     * config, not from a runtime memory query. Answer 0 so the game treats
-     * this as a normal-memory device. */
-    if (!strcmp(key, "LowMemoryDevice")) {
-        guest_st32(mem, cpu->r[2], 0);
-        cpu->r[0] = 0;
-        printf("  [cfg  ] [%s] %s -> 0 (not a low-memory device)\n", sect, key);
-        return;
-    }
-    {   /* every other key, logged once, so the next one is not a guess */
-        static char seen[32][48];
-        static int nseen;
-        int i;
-        for (i = 0; i < nseen; i++)
-            if (!strcmp(seen[i], key))
-                break;
-        if (i == nseen && nseen < 32) {
-            snprintf(seen[nseen], sizeof seen[0], "%s", key);
-            nseen++;
-            printf("  [cfg  ] [%s] %s -> not set\n", sect, key);
+    val = s3e_config_get(sect, key);
+    if (val) {
+        char *end;
+        long n = strtol(val, &end, 0);
+        if (end != val && !*end && guest_st32(mem, cpu->r[2], (uint32_t)n)) {
+            cfg_log_once("cfg  ", sect, key, val);
+            cpu->r[0] = 0;                    /* S3E_RESULT_SUCCESS */
+            return;
         }
     }
+    cfg_log_once("cfg  ", sect, key, NULL);
     cpu->r[0] = 1;                            /* not set: use game defaults */
 }
 
-/* 0 is S3E_RESULT_SUCCESS: returning it from an unimplemented getter
- * tells the caller a buffer was filled when it was not. */
-/* s3eConfigGetString(section, key, out). Answers "not set" for everything, but
- * logs each key once -- that is how LowMemoryDevice was tracked down. */
-static void hle_notfound(GuestCpu *cpu, GuestMem *mem, void *user) {
-    char sect[24], key[48];
-    static char seen[48][48];
-    static int nseen;
-    int i;
+/* s3eConfigGetString(section, key, out), same table. Returning 0 without
+ * filling the buffer would tell the caller a string is there when it is not,
+ * so every failure path answers 1. */
+static void hle_configstr(GuestCpu *cpu, GuestMem *mem, void *user) {
+    char sect[32], key[48];
+    const char *val;
     (void)user;
     gstr(mem, cpu->r[0], sect, sizeof sect);
     gstr(mem, cpu->r[1], key, sizeof key);
-    for (i = 0; i < nseen; i++)
-        if (!strcmp(seen[i], key))
-            break;
-    if (i == nseen && nseen < 48) {
-        snprintf(seen[nseen], sizeof seen[0], "%s", key);
-        nseen++;
-        printf("  [cfgs ] [%s] %s -> not set\n", sect, key);
+    val = s3e_config_get(sect, key);
+    if (val && gputs(mem, cpu->r[2], val)) {
+        cfg_log_once("cfgs ", sect, key, val);
+        cpu->r[0] = 0;
+        return;
     }
+    cfg_log_once("cfgs ", sect, key, NULL);
     cpu->r[0] = 1;
 }
 
@@ -1185,7 +1208,7 @@ static void bind_slot(uint32_t i, const char *nm) {
     else if (!strcmp(nm, "s3eConfigGetInt"))
         g_slots[i].fn = hle_configint;
     else if (!strcmp(nm, "s3eConfigGetString"))
-        g_slots[i].fn = hle_notfound;
+        g_slots[i].fn = hle_configstr;
     else if (!strcmp(nm, "s3eSoundGetInt"))
         g_slots[i].fn = hle_sound_getint;
     else if (!strcmp(nm, "s3eSoundSetInt"))
@@ -1329,12 +1352,15 @@ int main(int argc, char **argv) {
      * divergence, but only the registers say which one is wrong. */
     uint64_t full_start = argc > 4 ? strtoull(argv[4], NULL, 0) : ~0ull;
     uint64_t full_count = argc > 5 ? strtoull(argv[5], NULL, 0) : 0ull;
+    int bench = 0;                  /* BOZ_BENCH: throughput, not differential */
     /* Windowed differential: with BOZ_TRACE_AT set nothing is recorded until
      * the anchor present, and full_start then counts from the window rather
      * than from the entry point -- the absolute index is not knowable ahead
      * of the run. */
     {
-        const char *e = getenv("BOZ_WATCH");
+        const char *e = getenv("BOZ_BENCH");
+        bench = e && *e && strcmp(e, "0") != 0;
+        e = getenv("BOZ_WATCH");
         g_watch_addr = e ? (uint32_t)strtoul(e, NULL, 0) : 0u;
         e = getenv("BOZ_TRACE_AT");
         g_trace_at = e ? strtoull(e, NULL, 0) : 0ull;
@@ -1380,6 +1406,8 @@ int main(int argc, char **argv) {
             root[1] = 0;
         }
         printf("vfs: %d entries from %s\n", s3e_vfs_init(root), root);
+        s3e_config_set_build_style(s3e_vfs_build_style());
+        printf("cfg: ResBuildStyle=%s\n", s3e_config_build_style());
     }
 
     g_stack = calloc(1, STACK_SIZE);
@@ -1453,7 +1481,30 @@ int main(int argc, char **argv) {
                (unsigned long long)g_trace_count,
                (unsigned long long)g_trace_at);
 
-    for (steps = 0; steps < limit; steps++) {
+    /* BOZ_BENCH: throughput mode. The loop below single-steps and hashes every
+     * instruction -- that is the differential's whole purpose, and it makes it
+     * useless for measuring speed, because the NRO calls guest_run in 5M
+     * chunks and this calls it with a limit of 1. Bench mode reproduces the
+     * NRO's call shape with no tracing, so interpreter changes can be measured
+     * here instead of costing a hardware round trip. Correctness still comes
+     * from the single-step differential; this only answers "how fast". */
+    if (bench) {
+        clock_t t0 = clock();
+        double sec;
+        st = GUEST_STEP_LIMIT;
+        while (g.executed < limit && st == GUEST_STEP_LIMIT) {
+            uint64_t chunk = limit - g.executed;
+            if (chunk > 5000000ull)
+                chunk = 5000000ull;
+            st = guest_run(&g, 0xFFFFFFFFu, chunk);
+        }
+        sec = (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
+        printf("\nbench: %llu instructions in %.2f s = %.3f M instr/sec\n",
+               (unsigned long long)g.executed, sec,
+               sec > 0.0 ? (double)g.executed / sec / 1e6 : 0.0);
+    }
+
+    for (steps = 0; !bench && steps < limit; steps++) {
         uint32_t rec[2];
         uint64_t rel;
         g_steps = steps;
