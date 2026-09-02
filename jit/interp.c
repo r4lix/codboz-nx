@@ -2151,6 +2151,7 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
 
         g->hist[g->hist_pos & 15u] = pc;
         g->hist_pos++;
+        g->mem.current_pc = pc;     /* so the store watch can name the writer */
 
         if (pc - hook_lo <= hook_span) {
             uint32_t hi;

@@ -111,6 +111,18 @@ static inline void *guest_ptr(const GuestMem *m, uint32_t addr, uint32_t len) {
 static inline void *guest_wptr(GuestMem *m, uint32_t addr, uint32_t len) {
     GuestRegion *r = &m->region[m->cache];
     uint32_t off = addr - r->base;
+    /* Store watch. watch_addr is 0 unless something armed it, so this is one
+     * predictable compare; when armed it records the last writer's PC, which
+     * is the only way to find what corrupts a guest word. current_pc is
+     * stamped by guest_run. */
+    /* Any store touching the watched word, not just one aligned exactly on it:
+     * the clobber has appeared as 009f009e, which looks like two halfword
+     * writes, and a store to watch_addr+2 must not slip past. */
+    if (m->watch_addr && addr - m->watch_addr < 4u) {
+        m->watch_last_addr = addr;
+        m->watch_last_pc = m->current_pc;
+        m->watch_changes++;
+    }
     if (r->writable && off < r->size && len <= r->size - off)
         return r->host + off;
     return guest_wptr_slow(m, addr, len);
