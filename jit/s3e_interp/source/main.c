@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include <unistd.h>
 
 #include <switch.h>
@@ -26,7 +27,7 @@
 #define STACK_BASE 0x20000000u
 #define STACK_SIZE (1u << 20)
 #define HEAP_BASE  0x60000000u
-#define BOZ_BUILD_LABEL "perf-r58 " __DATE__ " " __TIME__
+#define BOZ_BUILD_LABEL "perf-r61 " __DATE__ " " __TIME__
 /* The allocator is a pure bump allocator and free() reclaims nothing, so
  * exhaustion is self-inflicted and the game does not NULL-check malloc -- it
  * runs a C++ constructor on the result and faults writing the vtable. The
@@ -551,6 +552,67 @@ static void hook_native_memset(GuestCpu *cpu, GuestMem *mem, void *user) {
     cpu->r[0] = dst;
     g_fast_mem_hits[1]++;
     g_fast_mem_bytes[1] += len;
+}
+
+/* --------------------------------------------------- float guard, natively
+ *
+ * 96 bytes holding 7% of all guest instructions in a menu, which is what made
+ * it worth reading:
+ *
+ *   61128  vmov s15,r1 / vldr s14,<-FLT_MAX> / vcmpe / vmrs / blt <zero>
+ *          vldr s14,<+FLT_MAX> / vcmpe / vldr s14,<0.0> / vmrs
+ *          it hi / vmovhi.f32 s15,s14 / vstr s15,[r0]
+ *   61168  vmov s14,r1 / vldr s15,[r0] / vmul.f32 / bl 61128
+ *
+ * So: *r0 = v, with anything not finite replaced by +0.0, and a wrapper that
+ * multiplies first. An engine sanitising every float it stores.
+ *
+ * The range test is written negated so NaN lands where the guest puts it. NaN
+ * compares unordered against everything, which leaves N=0 V=1, so the guest's
+ * `blt` is taken and NaN becomes zero -- a plain `v < -FLT_MAX || v > FLT_MAX`
+ * would read as if NaN fell through to the store instead.
+ *
+ * In-range values are passed through as the original bit pattern rather than
+ * as a float that happens to compare equal, so -0.0 and denormals survive
+ * exactly. The multiply uses a plain C float, matching what the interpreter's
+ * own VFP path does -- there is no FPSCR emulation here, so this introduces no
+ * new divergence. */
+#define RVA_F32_GUARD     0x61128u
+#define RVA_F32_MUL_GUARD 0x61168u
+
+static uint32_t g_f32_hits[2];
+
+static uint32_t f32_guard(uint32_t bits) {
+    float v;
+    memcpy(&v, &bits, sizeof v);
+    if (!(v >= -FLT_MAX && v <= FLT_MAX))
+        return 0;
+    return bits;
+}
+
+static void hook_f32_guard(GuestCpu *cpu, GuestMem *mem, void *user) {
+    (void)user;
+    if (!guest_st32(mem, cpu->r[0], f32_guard(cpu->r[1])))
+        printf("  [fast ] f32 guard: store faulted at %08x\n",
+               (unsigned)cpu->r[0]);
+    g_f32_hits[0]++;
+}
+
+static void hook_f32_mul_guard(GuestCpu *cpu, GuestMem *mem, void *user) {
+    uint32_t cur, out;
+    float a, b;
+    (void)user;
+    if (!guest_ld32(mem, cpu->r[0], &cur)) {
+        printf("  [fast ] f32 guard: load faulted at %08x\n",
+               (unsigned)cpu->r[0]);
+        return;
+    }
+    memcpy(&a, &cur, sizeof a);
+    memcpy(&b, &cpu->r[1], sizeof b);
+    a = a * b;
+    memcpy(&out, &a, sizeof out);
+    guest_st32(mem, cpu->r[0], f32_guard(out));
+    g_f32_hits[1]++;
 }
 
 /* ------------------------------------------------ integer divide, natively
@@ -2055,6 +2117,8 @@ static void hle_profile(uint32_t slot, int enter) {
 /* Defined below, next to the Guest it reads. */
 static void pc_profile_report(void);
 static void pc_profile_clear(void);
+static void i_profile_report(void);
+static void i_profile_clear(void);
 
 /* Reported every 300 frames rather than every frame: the point is the split,
  * and printing it per frame would itself distort the thing being measured. */
@@ -2077,6 +2141,7 @@ static void frame_profile_report(void) {
          * phase to the first steady-state window, which is how the handler
          * split came to report glClear 12% on its first print. */
         pc_profile_clear();
+        i_profile_clear();
         return;
     }
     total = now - window_start;
@@ -2119,6 +2184,11 @@ static void frame_profile_report(void) {
         ctype_report_callers(g_img.load_base);
         g_ctype_hits[0] = g_ctype_hits[1] = 0;
     }
+    if (g_f32_hits[0] || g_f32_hits[1]) {
+        printf("  [fast ] f32 guard: %u store, %u mul-store\n",
+               (unsigned)g_f32_hits[0], (unsigned)g_f32_hits[1]);
+        g_f32_hits[0] = g_f32_hits[1] = 0;
+    }
     if (g_div_hits[0] || g_div_hits[1] || g_div_hits[2]) {
         printf("  [fast ] divide: %u uidiv, %u uidivmod, %u idiv\n",
                (unsigned)g_div_hits[0], (unsigned)g_div_hits[1],
@@ -2126,6 +2196,7 @@ static void frame_profile_report(void) {
         g_div_hits[0] = g_div_hits[1] = g_div_hits[2] = 0;
     }
     pc_profile_report();
+    i_profile_report();
     window_start = now;
 }
 
@@ -2569,6 +2640,47 @@ static GuestHleSlot g_slots[512];
 static Guest g;
 
 /* ------------------------------------------------------------ PC histogram */
+
+/* Instruction mix. pcprof says which code is hot; this says what it is made
+ * of. The host bench can report the same counters, but its 300M instructions
+ * are the loading phase and come out ~100%% ARM library code -- gameplay is
+ * Thumb, so the number that matters can only be taken here. */
+static uint32_t g_iprof[GUEST_IPROF_N];
+
+static void i_profile_clear(void) {
+    memset(g_iprof, 0, sizeof g_iprof);
+}
+
+static void i_profile_report(void) {
+    uint64_t tot = 0;
+    unsigned i, k;
+    for (i = 0; i < GUEST_IPROF_N; i++)
+        tot += g_iprof[i];
+    if (!tot)
+        return;
+    printf("  [iprof] instruction mix:\n");
+    for (k = 0; k < 10; k++) {
+        unsigned best = 0;
+        uint32_t bv = 0;
+        for (i = 0; i < GUEST_IPROF_N; i++)
+            if (g_iprof[i] > bv) { bv = g_iprof[i]; best = i; }
+        if (!bv)
+            break;
+        printf("  [iprof]   %-3s %02x  %2llu%%  %8lluk\n",
+               best < 256 ? "T16" : best < 512 ? "T32" : "ARM",
+               (unsigned)(best & 0xFFu),
+               (unsigned long long)((uint64_t)bv * 100ull / tot),
+               (unsigned long long)(bv / 1000u));
+        g_iprof[best] = 0;
+    }
+    i_profile_clear();
+    /* One report is all this is for, and the counter is not free: the null
+     * check alone measured 3.9% on the host bench, which is a lot to pay
+     * forever to answer a question once. Disarm it so every window after the
+     * first is timed without it. */
+    g.iprof = NULL;
+    printf("  [iprof] counter disarmed; later windows are untaxed\n");
+}
 
 static void pc_profile_clear(void) {
     if (g.pcprof)
@@ -3058,6 +3170,7 @@ static void run(void) {
      * fails the pointer stays NULL and the loop skips it. */
     g.pcprof_base = g_img.load_base;
     g.pcprof_buckets = (g_img.image_size + 15u) >> 4;
+    g.iprof = g_iprof;
     g.pcprof = (uint32_t *)calloc(g.pcprof_buckets, sizeof(uint32_t));
     if (!g.pcprof)
         g.pcprof_buckets = 0;
@@ -3065,7 +3178,7 @@ static void run(void) {
     g.hle.count = n + 1;
     startup_stage_write("07 imports bound");
 
-    static GuestHook hooks[14];
+    static GuestHook hooks[16];
     hooks[0].addr = g_img.load_base + RVA_MGR_MALLOC;
     hooks[0].fn = hook_malloc;
     hooks[1].addr = g_img.load_base + RVA_MGR_REALLOC;
@@ -3115,7 +3228,11 @@ static void run(void) {
         hooks[d + 1].fn = hook_uidivmod;
         hooks[d + 2].addr = g_img.load_base + RVA_IDIV;
         hooks[d + 2].fn = hook_idiv;
-        g.hook_count = d + 3;
+        hooks[d + 3].addr = g_img.load_base + RVA_F32_GUARD;
+        hooks[d + 3].fn = hook_f32_guard;
+        hooks[d + 4].addr = g_img.load_base + RVA_F32_MUL_GUARD;
+        hooks[d + 4].fn = hook_f32_mul_guard;
+        g.hook_count = d + 5;
     }
 
     g.cpu.r[GUEST_SP] = STACK_BASE + STACK_SIZE - 16;

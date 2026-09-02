@@ -1500,6 +1500,13 @@ int main(int argc, char **argv) {
      * from the single-step differential; this only answers "how fast". */
     if (bench) {
         clock_t t0 = clock();
+        /* Instruction mix, so a decode fast path can be aimed rather than
+         * guessed at. Only in bench mode: the differential single-steps and
+         * would be measuring the counter as much as the interpreter. */
+        static uint32_t iprof[GUEST_IPROF_N];
+        /* Opt-in: the counter is itself per-instruction work, so leaving it on
+         * would fold its cost into every throughput number measured here. */
+        g.iprof = getenv("BOZ_IMIX") ? iprof : NULL;
         double sec;
         st = GUEST_STEP_LIMIT;
         while (g.executed < limit && st == GUEST_STEP_LIMIT) {
@@ -1507,6 +1514,34 @@ int main(int argc, char **argv) {
             if (chunk > 5000000ull)
                 chunk = 5000000ull;
             st = guest_run(&g, 0xFFFFFFFFu, chunk);
+        }
+        {   /* Top classes, as a share of everything executed. */
+            uint64_t tot = 0;
+            unsigned i, k;
+            for (i = 0; i < GUEST_IPROF_N; i++)
+                tot += iprof[i];
+            uint64_t t16 = 0, t32 = 0, arm = 0;
+            for (i = 0; i < 256; i++)   t16 += iprof[i];
+            for (; i < 512; i++)        t32 += iprof[i];
+            for (; i < GUEST_IPROF_N; i++) arm += iprof[i];
+            printf("\ninstruction mix (%llu counted): T16 %llu%%, T32 %llu%%, ARM %llu%%\n",
+                   (unsigned long long)tot,
+                   (unsigned long long)(tot ? t16 * 100 / tot : 0),
+                   (unsigned long long)(tot ? t32 * 100 / tot : 0),
+                   (unsigned long long)(tot ? arm * 100 / tot : 0));
+            for (k = 0; k < 16 && tot; k++) {
+                unsigned best = 0;
+                uint32_t bv = 0;
+                for (i = 0; i < GUEST_IPROF_N; i++)
+                    if (iprof[i] > bv) { bv = iprof[i]; best = i; }
+                if (!bv)
+                    break;
+                printf("  %-3s %02x  %5.2f%%  %u\n",
+                       best < 256 ? "T16" : best < 512 ? "T32" : "ARM",
+                       best & 0xFFu, 100.0 * (double)bv / (double)tot,
+                       (unsigned)bv);
+                iprof[best] = 0;
+            }
         }
         sec = (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
         printf("\nbench: %llu instructions in %.2f s = %.3f M instr/sec\n",

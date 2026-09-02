@@ -196,6 +196,8 @@ GUEST_DEF_STORE(8,  uint8_t)
  * GUEST_STUB_BASE + 4*i, matching the GOT bindings s3e_load() hands back. The
  * CPU checks for this range on branch, dispatches, and returns to LR -- no
  * guest instruction at those addresses is ever executed. */
+#define GUEST_IPROF_N 768u
+
 #define GUEST_STUB_BASE 0xF0000000u
 #define GUEST_STUB_SIZE 0x1000u
 
@@ -276,6 +278,14 @@ typedef struct {
     uint32_t *pcprof;
     uint32_t  pcprof_base;      /* load base; bucket = (pc - base) >> 4 */
     uint32_t  pcprof_buckets;
+    /* Optional instruction-class histogram, GUEST_IPROF_N counters:
+     *   [0..255]    16-bit Thumb, indexed by hw >> 8
+     *   [256..511]  32-bit Thumb, indexed by first halfword >> 8
+     *   [512..767]  ARM, indexed by (insn >> 20) & 0xFF
+     * pcprof says which code is hot; this says what that code is made of,
+     * which is the question a decode fast path has to answer before it is
+     * worth writing. NULL disables it. */
+    uint32_t *iprof;
     void    *jit;           /* private hybrid-JIT context; NULL when disabled */
     uint64_t jit_executed;  /* guest instructions retired by compiled blocks */
     uint32_t jit_blocks;    /* successfully compiled basic blocks */

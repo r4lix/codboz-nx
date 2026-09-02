@@ -160,6 +160,8 @@ static GuestStatus step_arm(Guest *g) {
 
     if (!guest_ifetch32(&g->mem, pc, &insn))
         MEMFAULT(g, pc);
+    if (g->iprof)
+        g->iprof[512u + ((insn >> 20) & 0xFFu)]++;
 
     uint32_t cond = insn >> 28;
     if (cond != 0xF && !cond_ok(c->cpsr, cond)) {
@@ -1722,6 +1724,64 @@ static GuestStatus step_thumb32(Guest *g, uint32_t pc, uint32_t hw, uint32_t hw2
     UNDEF(g, pc, insn);
 }
 
+/* ---------------------------------------------------- Thumb16 classification
+ *
+ * Every top-level test in step_thumb masks only the top eight bits -- the
+ * finest mask used is 0xFF00 -- so hw >> 8 decides the class outright, with no
+ * residual test left over. That turns a chain of up to nineteen sequential
+ * compares into a single indexed load, and it costs the same whichever class
+ * the instruction belongs to, so the rare encodings that used to sit at the
+ * bottom of the chain stop being expensive.
+ *
+ * The table is BUILT by running those predicates rather than transcribed from
+ * them. Hand-writing 256 entries from twenty overlapping masks is precisely
+ * the sort of edit that looks right and is wrong in one place, and the one
+ * place would be some rare encoding that misbehaves much later, a long way
+ * from this code. Generated this way it cannot disagree with the chain it
+ * replaces -- and the order matters, because several of these masks do overlap
+ * and the original chain resolved that by first-match-wins. */
+enum {
+    TK_UNDEF = 0, TK_T32, TK_SHIFT, TK_IMM8, TK_HIREG, TK_LDRLIT, TK_PUSHPOP,
+    TK_CBZ, TK_BCOND, TK_B, TK_ALUREG, TK_LDSTREG, TK_LDSTIMM, TK_LDSTH,
+    TK_LDSTSP, TK_ADR, TK_STM, TK_ADDSP, TK_EXTEND, TK_REV, TK_IT
+};
+
+static uint8_t g_thumb_kind[256];
+
+static void thumb_kind_init(void) {
+    unsigned h;
+    for (h = 0; h < 256; h++) {
+        uint32_t hw = (uint32_t)h << 8;
+        uint8_t k;
+        if      ((hw & 0xF800u) >= 0xE800u) k = TK_T32;
+        else if ((hw & 0xE000u) == 0x0000u) k = TK_SHIFT;
+        else if ((hw & 0xE000u) == 0x2000u) k = TK_IMM8;
+        else if ((hw & 0xFC00u) == 0x4400u) k = TK_HIREG;
+        else if ((hw & 0xF800u) == 0x4800u) k = TK_LDRLIT;
+        else if ((hw & 0xF600u) == 0xB400u) k = TK_PUSHPOP;
+        else if ((hw & 0xF500u) == 0xB100u) k = TK_CBZ;
+        else if ((hw & 0xF000u) == 0xD000u) k = TK_BCOND;
+        else if ((hw & 0xF800u) == 0xE000u) k = TK_B;
+        else if ((hw & 0xFC00u) == 0x4000u) k = TK_ALUREG;
+        else if ((hw & 0xF000u) == 0x5000u) k = TK_LDSTREG;
+        else if ((hw & 0xE000u) == 0x6000u) k = TK_LDSTIMM;
+        else if ((hw & 0xF000u) == 0x8000u) k = TK_LDSTH;
+        else if ((hw & 0xF000u) == 0x9000u) k = TK_LDSTSP;
+        else if ((hw & 0xF000u) == 0xA000u) k = TK_ADR;
+        else if ((hw & 0xF000u) == 0xC000u) k = TK_STM;
+        else if ((hw & 0xFF00u) == 0xB000u) k = TK_ADDSP;
+        else if ((hw & 0xFF00u) == 0xB200u) k = TK_EXTEND;
+        else if ((hw & 0xFF00u) == 0xBA00u) k = TK_REV;
+        else if ((hw & 0xFF00u) == 0xBF00u) k = TK_IT;
+        else                                k = TK_UNDEF;
+        g_thumb_kind[h] = k;
+    }
+}
+
+static inline uint8_t thumb_kind(uint32_t hw) {
+    return g_thumb_kind[(hw >> 8) & 0xFFu];
+}
+
 /* -------------------------------------------------------------- Thumb decode */
 
 static GuestStatus step_thumb(Guest *g) {
@@ -1730,6 +1790,8 @@ static GuestStatus step_thumb(Guest *g) {
 
     if (!guest_ifetch16(&g->mem, pc, &hw))
         MEMFAULT(g, pc);
+    if (g->iprof)
+        g->iprof[((hw & 0xF800u) >= 0xE800u ? 256u : 0u) + (hw >> 8)]++;
 
     const uint32_t read_pc = pc + 4;
     const uint32_t lit_pc = (pc + 4) & ~3u;   /* Align(PC,4) for literal loads */
@@ -1755,15 +1817,17 @@ static GuestStatus step_thumb(Guest *g) {
         }
     }
 
-    if ((hw & 0xF800u) >= 0xE800u) {                    /* 32-bit Thumb-2 */
+    switch (thumb_kind(hw)) {
+    case TK_T32: {                    /* 32-bit Thumb-2 */
         uint32_t hw2;
         if (!guest_ifetch16(&g->mem, pc + 2, &hw2))
             MEMFAULT(g, pc + 2);
 
         return step_thumb32(g, pc, hw, hw2);
     }
+    break;
 
-    if ((hw & 0xE000u) == 0x0000u) {          /* shift imm / add / sub */
+    case TK_SHIFT: {          /* shift imm / add / sub */
         uint32_t op = (hw >> 11) & 3;
         uint32_t rd = hw & 7, rm = (hw >> 3) & 7, imm = (hw >> 6) & 0x1F;
         if (op != 3) {
@@ -1785,8 +1849,9 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xE000u) == 0x2000u) {          /* MOV/CMP/ADD/SUB imm8 */
+    case TK_IMM8: {          /* MOV/CMP/ADD/SUB imm8 */
         uint32_t op = (hw >> 11) & 3, rd = (hw >> 8) & 7, imm = hw & 0xFF;
         switch (op) {
         case 0: c->r[rd] = imm; if (!in_it) set_nz(c, imm); break;
@@ -1797,8 +1862,9 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xFC00u) == 0x4400u) {          /* hi-reg ADD/CMP/MOV, BX/BLX */
+    case TK_HIREG: {          /* hi-reg ADD/CMP/MOV, BX/BLX */
         uint32_t op = (hw >> 8) & 3;
         uint32_t rd = (uint32_t)(((hw >> 4) & 8) | (hw & 7));
         uint32_t rm = (hw >> 3) & 0xF;
@@ -1830,8 +1896,9 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xF800u) == 0x4800u) {          /* LDR literal */
+    case TK_LDRLIT: {          /* LDR literal */
         uint32_t rd = (hw >> 8) & 7, addr = lit_pc + ((hw & 0xFFu) << 2), v;
         if (!guest_ld32(&g->mem, addr, &v))
             MEMFAULT(g, addr);
@@ -1839,8 +1906,9 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xF600u) == 0xB400u) {          /* PUSH / POP */
+    case TK_PUSHPOP: {          /* PUSH / POP */
         int load = (int)((hw >> 11) & 1);
         uint32_t list = hw & 0xFF;
         int extra = (int)((hw >> 8) & 1);
@@ -1885,8 +1953,9 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xF500u) == 0xB100u) {          /* CBZ / CBNZ */
+    case TK_CBZ: {          /* CBZ / CBNZ */
         uint32_t rn = hw & 7;
         uint32_t imm = (uint32_t)((((hw >> 9) & 1) << 6) | (((hw >> 3) & 0x1F) << 1));
         int nonzero = (int)((hw >> 11) & 1);
@@ -1897,8 +1966,9 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xF000u) == 0xD000u) {          /* conditional branch */
+    case TK_BCOND: {          /* conditional branch */
         uint32_t cond = (hw >> 8) & 0xF;
         if (cond >= 0xE)
             UNDEF(g, pc, hw);                  /* UDF / SVC: not needed here */
@@ -1910,14 +1980,16 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xF800u) == 0xE000u) {          /* unconditional branch */
+    case TK_B: {          /* unconditional branch */
         int32_t off = (int32_t)((hw & 0x7FFu) << 21) >> 20;
         c->r[15] = read_pc + (uint32_t)off;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xFC00u) == 0x4000u) {          /* ALU register operations */
+    case TK_ALUREG: {          /* ALU register operations */
         uint32_t op = (hw >> 6) & 0xF, rd = hw & 7, rm = (hw >> 3) & 7;
         uint32_t a = c->r[rd], b = c->r[rm], res;
         int cout = get_c(c), logical = 1, writes = 1;
@@ -1950,8 +2022,9 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xF000u) == 0x5000u) {          /* load/store register offset */
+    case TK_LDSTREG: {          /* load/store register offset */
         uint32_t op = (hw >> 9) & 7, rd = hw & 7;
         uint32_t addr = c->r[(hw >> 3) & 7] + c->r[(hw >> 6) & 7];
         uint32_t v;
@@ -1973,8 +2046,9 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xE000u) == 0x6000u) {          /* load/store word/byte imm5 */
+    case TK_LDSTIMM: {          /* load/store word/byte imm5 */
         int B = (int)((hw >> 12) & 1), L = (int)((hw >> 11) & 1);
         uint32_t imm = (hw >> 6) & 0x1F, rd = hw & 7;
         uint32_t addr = c->r[(hw >> 3) & 7] + (B ? imm : imm * 4u);
@@ -1990,8 +2064,9 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xF000u) == 0x8000u) {          /* load/store halfword imm5 */
+    case TK_LDSTH: {          /* load/store halfword imm5 */
         int L = (int)((hw >> 11) & 1);
         uint32_t addr = c->r[(hw >> 3) & 7] + ((hw >> 6) & 0x1Fu) * 2u;
         uint32_t rd = hw & 7, v;
@@ -2005,8 +2080,9 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xF000u) == 0x9000u) {          /* SP-relative load/store */
+    case TK_LDSTSP: {          /* SP-relative load/store */
         int L = (int)((hw >> 11) & 1);
         uint32_t rd = (hw >> 8) & 7;
         uint32_t addr = c->r[GUEST_SP] + (hw & 0xFFu) * 4u;
@@ -2021,15 +2097,17 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xF000u) == 0xA000u) {          /* ADR / ADD Rd, SP, #imm */
+    case TK_ADR: {          /* ADR / ADD Rd, SP, #imm */
         uint32_t rd = (hw >> 8) & 7, imm = (hw & 0xFFu) * 4u;
         c->r[rd] = (hw & 0x0800u) ? c->r[GUEST_SP] + imm : lit_pc + imm;
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xF000u) == 0xC000u) {          /* STMIA / LDMIA */
+    case TK_STM: {          /* STMIA / LDMIA */
         int L = (int)((hw >> 11) & 1);
         uint32_t rn = (hw >> 8) & 7, list = hw & 0xFF;
         uint32_t addr = c->r[rn];
@@ -2051,15 +2129,17 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xFF00u) == 0xB000u) {          /* ADD / SUB SP, #imm7 */
+    case TK_ADDSP: {          /* ADD / SUB SP, #imm7 */
         uint32_t imm = (hw & 0x7Fu) * 4u;
         c->r[GUEST_SP] += (hw & 0x0080u) ? (uint32_t)-(int32_t)imm : imm;
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xFF00u) == 0xB200u) {          /* SXTH / SXTB / UXTH / UXTB */
+    case TK_EXTEND: {          /* SXTH / SXTB / UXTH / UXTB */
         uint32_t rd = hw & 7, v = c->r[(hw >> 3) & 7];
         switch ((hw >> 6) & 3) {
         case 0: c->r[rd] = (uint32_t)(int32_t)(int16_t)v; break;
@@ -2070,8 +2150,9 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xFF00u) == 0xBA00u) {          /* REV / REV16 / REVSH */
+    case TK_REV: {          /* REV / REV16 / REVSH */
         uint32_t rd = hw & 7, v = c->r[(hw >> 3) & 7];
         switch ((hw >> 6) & 3) {
         case 0:
@@ -2089,13 +2170,16 @@ static GuestStatus step_thumb(Guest *g) {
         c->r[15] = pc + 2;
         return GUEST_OK;
     }
+    break;
 
-    if ((hw & 0xFF00u) == 0xBF00u) {          /* IT and hints */
+    case TK_IT: {          /* IT and hints */
         if (hw & 0x000Fu)
             c->itstate = hw & 0xFFu;          /* IT: cond<7:4>:mask<3:0> */
         /* else NOP / YIELD / WFE / WFI / SEV: nothing to do */
         c->r[15] = pc + 2;
         return GUEST_OK;
+    }
+    break;
     }
 
     UNDEF(g, pc, hw);
@@ -2151,6 +2235,14 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
      * a hundred million times a second was not. */
     uint32_t hp = g->hist_pos;
     uint8_t hook_map[256];
+    /* Once per guest_run, not once per instruction: this is entered every few
+     * million instructions, so the guard costs nothing measurable and no call
+     * site has to remember to initialise the interpreter. */
+    static int kinds_ready;
+    if (!kinds_ready) {
+        thumb_kind_init();
+        kinds_ready = 1;
+    }
     if (g->hook_count) {
         uint32_t i;
         memset(hook_map, 0, sizeof hook_map);
