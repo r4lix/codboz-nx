@@ -196,6 +196,33 @@ static GuestStatus step_arm(Guest *g) {
         UNDEF(g, pc, insn);
     }
 
+    /* Load/store and data-processing are the overwhelming majority of what
+     * this image executes, and they sat at positions 13 and 19 of a 22-test
+     * linear chain -- every one of them paid for eighteen mask compares that
+     * could not match. Test them first.
+     *
+     * Both guards are exact, not approximate, so nothing that an earlier test
+     * used to claim can be stolen here:
+     *
+     *  - load/store already excludes the media space (bit25 && bit4), which is
+     *    every earlier test in its 01xx encoding group (REV, UADD8, SEL, BFI,
+     *    SXT/UXT, SBFX and friends all set both bits).
+     *  - data-processing excludes the miscellaneous space (S==0 with op 10xx,
+     *    i.e. BX/BLX/CLZ/MSR/MRS, and equally MOVW/MOVT) and the multiply and
+     *    extra-load/store space (bit25==0 with bits 7 and 4 set). Those are
+     *    exactly the earlier tests in the 00xx group. Without the exclusions
+     *    the block below would UNDEF a BX or run a MUL as TST.
+     *
+     * Everything else falls through to the chain in its original order, so the
+     * ordering constraints documented there still hold. */
+    if ((insn & 0x0C000000u) == 0x04000000u &&
+        !((insn & 0x02000000u) && (insn & 0x10u)))
+        goto arm_load_store;
+    if ((insn & 0x0C000000u) == 0x00000000u &&
+        (insn & 0x01900000u) != 0x01000000u &&
+        !((insn & 0x02000000u) == 0u && (insn & 0x90u) == 0x90u))
+        goto arm_data_processing;
+
     if ((insn & 0x0FFFFFF0u) == 0x012FFF10u) {              /* BX Rm */
         branch_interworking(c, c->r[insn & 0xF]);
         return GUEST_OK;
@@ -391,6 +418,7 @@ static GuestStatus step_arm(Guest *g) {
         return GUEST_OK;
     }
 
+arm_load_store:
     if ((insn & 0x0C000000u) == 0x04000000u &&
         !((insn & 0x02000000u) && (insn & 0x10u))) {        /* LDR/STR (B) */
         uint32_t rn = (insn >> 16) & 0xF, rt = (insn >> 12) & 0xF;
@@ -625,6 +653,7 @@ static GuestStatus step_arm(Guest *g) {
         return GUEST_OK;
     }
 
+arm_data_processing:
     if ((insn & 0x0C000000u) == 0x00000000u) {              /* data processing */
         uint32_t op = (insn >> 21) & 0xF, S = (insn >> 20) & 1;
         uint32_t rn = (insn >> 16) & 0xF, rd = (insn >> 12) & 0xF;
