@@ -45,6 +45,16 @@ void *guest_ptr_slow(const GuestMem *m, uint32_t addr, uint32_t len) {
     return m->region[i].host + (addr - m->region[i].base);
 }
 
+/* Refreshes the fetch cache rather than the data one, so an instruction fetch
+ * can never evict the region a load is about to use, or vice versa. */
+void *guest_ifetch_slow(const GuestMem *m, uint32_t addr, uint32_t len) {
+    int i = find_index(m, addr, len);
+    if (i < 0)
+        return NULL;
+    ((GuestMem *)m)->icache = i;
+    return m->region[i].host + (addr - m->region[i].base);
+}
+
 void *guest_wptr_slow(GuestMem *m, uint32_t addr, uint32_t len) {
     int i = find_index(m, addr, len);
     if (i < 0 || !m->region[i].writable)

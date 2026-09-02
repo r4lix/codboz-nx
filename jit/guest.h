@@ -71,6 +71,17 @@ typedef struct {
      * bounds are re-checked on every access, so a stale value costs one slow
      * lookup and can never produce a wrong answer. */
     int         cache;
+    /* The same, for instruction fetch, which needs its own.
+     *
+     * One shared entry looked sufficient -- refreshed by whoever used it last,
+     * and code is executed far more often than any single data region is
+     * touched. It is not: code and data live in different regions, so every
+     * guest load or store retargeted the entry and the NEXT instruction fetch
+     * missed. Loads and stores are roughly a third of the stream, so a third
+     * of all fetches were taking an out-of-line call and a linear region scan,
+     * on the one path every single guest instruction runs. Splitting them
+     * costs four bytes: code stays resolved here while data churns above. */
+    int         icache;
     /* Optional four-byte data watch used during bring-up. The interpreter
      * stamps current_pc before every instruction; stores record the first
      * transition from non-zero to zero without changing normal semantics. */
@@ -91,6 +102,7 @@ int   guest_mem_add(GuestMem *m, uint32_t base, uint32_t size, uint8_t *host, in
  * below instead; these are only reached on a cache miss. */
 void *guest_ptr_slow(const GuestMem *m, uint32_t addr, uint32_t len);
 void *guest_wptr_slow(GuestMem *m, uint32_t addr, uint32_t len);
+void *guest_ifetch_slow(const GuestMem *m, uint32_t addr, uint32_t len);
 
 /* Returns NULL when the address is unmapped or the span crosses a region end;
  * callers must treat NULL as a guest fault, never as "skip".
@@ -127,6 +139,22 @@ static inline void *guest_wptr(GuestMem *m, uint32_t addr, uint32_t len) {
         return r->host + off;
     return guest_wptr_slow(m, addr, len);
 }
+
+/* Instruction fetch. Identical to guest_ptr but keyed on the fetch-only cache
+ * entry; see the comment on GuestMem::icache for why that separation matters. */
+static inline const void *guest_ifetch_ptr(const GuestMem *m, uint32_t addr,
+                                           uint32_t len) {
+    const GuestRegion *r = &m->region[m->icache];
+    uint32_t off = addr - r->base;
+    if (off < r->size && len <= r->size - off)
+        return r->host + off;
+    return guest_ifetch_slow(m, addr, len);
+}
+
+#define GUEST_DEF_FETCH(bits, type)                                                static inline int guest_ifetch##bits(const GuestMem *m, uint32_t addr,                                              uint32_t *out) {                              const void *p = guest_ifetch_ptr(m, addr, (uint32_t)sizeof(type));             type v;                                                                        if (!p)                                                                            return 0;                                                                  memcpy(&v, p, sizeof v);                                                       *out = (uint32_t)v;                                                            return 1;                                                                  }
+GUEST_DEF_FETCH(32, uint32_t)
+GUEST_DEF_FETCH(16, uint16_t)
+#undef GUEST_DEF_FETCH
 
 /* All accessors report success rather than returning a value, so an unmapped
  * guest address can never be mistaken for a legitimate zero. memcpy rather
@@ -235,6 +263,19 @@ typedef struct {
      * millions. Frame time splits into "interpreting guest code" and "inside a
      * handler", and only this boundary can tell them apart. */
     void   (*prof)(uint32_t slot, int enter);
+    /* Optional guest-PC histogram: one counter per 16-byte bucket of the
+     * loaded image, so a hot function shows up as a run of adjacent buckets.
+     * 16 and not 64 because at 64 the first report put three separate library
+     * functions in one span and there was no way to tell which of them was
+     * hot -- resolution finer than a function is the whole point.
+     * The HLE profiler above can only say "99% is not in a handler"; this says
+     * which guest code that is, which is what decides whether the answer is a
+     * native replacement for one routine or a faster interpreter for all of
+     * them. Counts instructions rather than sampling time, which is the right
+     * metric for "what would a native handler remove". NULL disables it. */
+    uint32_t *pcprof;
+    uint32_t  pcprof_base;      /* load base; bucket = (pc - base) >> 4 */
+    uint32_t  pcprof_buckets;
     void    *jit;           /* private hybrid-JIT context; NULL when disabled */
     uint64_t jit_executed;  /* guest instructions retired by compiled blocks */
     uint32_t jit_blocks;    /* successfully compiled basic blocks */

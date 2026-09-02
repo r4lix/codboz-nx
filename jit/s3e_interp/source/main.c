@@ -26,7 +26,7 @@
 #define STACK_BASE 0x20000000u
 #define STACK_SIZE (1u << 20)
 #define HEAP_BASE  0x60000000u
-#define BOZ_BUILD_LABEL "ptrfix2-r53 " __DATE__ " " __TIME__
+#define BOZ_BUILD_LABEL "perf-r58 " __DATE__ " " __TIME__
 /* The allocator is a pure bump allocator and free() reclaims nothing, so
  * exhaustion is self-inflicted and the game does not NULL-check malloc -- it
  * runs a C++ constructor on the result and faults writing the vtable. The
@@ -551,6 +551,167 @@ static void hook_native_memset(GuestCpu *cpu, GuestMem *mem, void *user) {
     cpu->r[0] = dst;
     g_fast_mem_hits[1]++;
     g_fast_mem_bytes[1] += len;
+}
+
+/* ------------------------------------------------ integer divide, natively
+ *
+ * This image has no hardware divide, so every division is a call into a
+ * clz-driven shift-and-subtract routine that computes one quotient bit per
+ * three instructions. It is 4-5% of guest instructions in EVERY profile window
+ * -- menus, loading and gameplay alike -- which is what makes it worth more
+ * than its headline share: nothing else is uniformly hot.
+ *
+ * Three entry points, read off the disassembly:
+ *
+ *   378d48  __aeabi_uidiv     subs r2,r1,#1 / bxeq lr / bcc <div0> / ...
+ *                             returns quotient in r0, r1 untouched
+ *   378f34  __aeabi_uidivmod  cmp r1,#0 / beq <div0> / push {r0,r1,lr}
+ *                             bl 378d48 / mul r3,r2,r0 / sub r1,r1,r3
+ *                             returns quotient r0, remainder r1
+ *   378f54  __aeabi_idiv      cmp r1,#0 / beq <div0> / eor ip,r0,r1 / ...
+ *                             signed, truncating toward zero
+ *
+ * Each hook is placed AFTER that routine's divide-by-zero test, not at its
+ * entry. That is deliberate: a replacing hook always returns through LR, so it
+ * cannot reproduce the zero case, which branches to __aeabi_idiv0 rather than
+ * returning. Hooking past the test leaves the zero path running the game's own
+ * code, exactly as before, and guarantees a non-zero divisor here. The skipped
+ * instructions are a compare and a branch; the loop they guard is the cost.
+ *
+ * Nothing is pushed before these offsets, so LR still holds the caller's
+ * return address, and r2/r3/ip are caller-saved -- leaving them untouched
+ * where the real routine would clobber them cannot be observed. */
+#define RVA_UIDIV    0x378d54u    /* past `bxeq lr` / `bcc div0`: r1 >= 2 */
+#define RVA_UIDIVMOD 0x378f3cu    /* past `beq div0`: r1 != 0 */
+#define RVA_IDIV     0x378f5cu    /* past `beq div0`: r1 != 0 */
+
+static uint32_t g_div_hits[3];
+
+static void hook_uidiv(GuestCpu *cpu, GuestMem *mem, void *user) {
+    (void)mem; (void)user;
+    cpu->r[0] = cpu->r[0] / cpu->r[1];
+    g_div_hits[0]++;
+}
+
+static void hook_uidivmod(GuestCpu *cpu, GuestMem *mem, void *user) {
+    uint32_t n = cpu->r[0], d = cpu->r[1], q = n / d;
+    (void)mem; (void)user;
+    cpu->r[0] = q;
+    cpu->r[1] = n - q * d;
+    g_div_hits[1]++;
+}
+
+static void hook_idiv(GuestCpu *cpu, GuestMem *mem, void *user) {
+    int32_t n = (int32_t)cpu->r[0], d = (int32_t)cpu->r[1];
+    (void)mem; (void)user;
+    /* INT_MIN / -1 is undefined in C and would trap, but the guest routine
+     * defines it: it negates the magnitude and wraps, yielding 0x80000000.
+     * Match that rather than let the host decide. */
+    if (n == (int32_t)0x80000000 && d == -1)
+        cpu->r[0] = 0x80000000u;
+    else
+        cpu->r[0] = (uint32_t)(n / d);
+    g_div_hits[2]++;
+}
+
+/* ------------------------------------------------------- ctype, natively
+ *
+ * The 16-byte profile put two ARM leaf functions in the library range among
+ * the busiest code in the menus. They are tolower and toupper:
+ *
+ *   ldr r3,[pc,#36] / ldr r2,[pc,#36] / add r3,pc,r3 / ldr r3,[r3,r2]
+ *   ldr r3,[r3] / add r3,r3,r0 / ldrb r3,[r3,#1] / and r3,r3,#3
+ *   cmp r3,#1 / addeq r0,r0,#32 / bx lr          <- tolower  (#2/sub = toupper)
+ *
+ * Ten interpreted ARM instructions, called per character, is what a
+ * case-insensitive string compare costs -- and the game keys its resource maps
+ * on strings, which is also why an std::map node walk sits nearby in the same
+ * profile.
+ *
+ * The replacement performs the identical table lookup rather than assuming C
+ * locale: same __ctype_ptr__ table, same class bits, same 32-bit wraparound on
+ * table+c. Anything else would be a behaviour change hiding inside an
+ * optimisation, and the Unicorn differential would be right to call it.
+ *
+ * The GOT slot address is not hardcoded. It is recomputed at install time from
+ * the two literals the guest itself loads, so if this image is not laid out the
+ * way it was read here the hooks simply do not install. */
+#define RVA_TOLOWER 0x36f16cu
+#define RVA_TOUPPER 0x36f1a0u
+#define RVA_CTYPE_LIT_PC 0x36f17cu    /* pc at `add r3,pc,r3`, i.e. insn+8 */
+#define RVA_CTYPE_LIT_A  0x36f198u
+#define RVA_CTYPE_LIT_B  0x36f19cu
+
+static uint32_t g_ctype_got;          /* guest address of the __ctype_ptr__ slot */
+static uint32_t g_ctype_hits[2];
+
+/* Who calls tolower. 11,284 calls a frame in a menu is not tolower's fault --
+ * it is one caller doing case-insensitive work far too often, and replacing
+ * that caller removes the loop around the conversion as well as the
+ * conversions. LR at hook entry is the return address, so a census of it names
+ * the caller directly. Small open-addressed table; a caller that cannot get a
+ * slot is simply not counted, which is fine for finding the top one. */
+#define CTYPE_CALLERS 64
+static uint32_t g_ctype_lr[CTYPE_CALLERS];
+static uint32_t g_ctype_lr_n[CTYPE_CALLERS];
+
+static void ctype_note_caller(uint32_t lr) {
+    uint32_t h = (lr >> 2) & (CTYPE_CALLERS - 1), i;
+    for (i = 0; i < CTYPE_CALLERS; i++) {
+        uint32_t k = (h + i) & (CTYPE_CALLERS - 1);
+        if (g_ctype_lr[k] == lr) { g_ctype_lr_n[k]++; return; }
+        if (!g_ctype_lr[k]) { g_ctype_lr[k] = lr; g_ctype_lr_n[k] = 1; return; }
+    }
+}
+
+static void ctype_report_callers(uint32_t base) {
+    int k, b;
+    for (b = 0; b < 4; b++) {
+        uint32_t bestv = 0;
+        int best = -1;
+        for (k = 0; k < CTYPE_CALLERS; k++)
+            if (g_ctype_lr_n[k] > bestv) { bestv = g_ctype_lr_n[k]; best = k; }
+        if (best < 0 || !bestv)
+            break;
+        printf("  [fast ]   called from %06x  %u\n",
+               (unsigned)(g_ctype_lr[best] - base), (unsigned)bestv);
+        g_ctype_lr_n[best] = 0;
+    }
+    memset(g_ctype_lr, 0, sizeof g_ctype_lr);
+    memset(g_ctype_lr_n, 0, sizeof g_ctype_lr_n);
+}
+
+/* Resolve the table slot the way the guest does. Returns 0 -- and so disables
+ * the hooks -- if anything about the sequence fails to read. */
+static uint32_t ctype_resolve_got(GuestMem *mem, uint32_t base) {
+    uint32_t a, b;
+    if (!guest_ld32(mem, base + RVA_CTYPE_LIT_A, &a) ||
+        !guest_ld32(mem, base + RVA_CTYPE_LIT_B, &b))
+        return 0;
+    return base + RVA_CTYPE_LIT_PC + a + b;
+}
+
+static void ctype_convert(GuestCpu *cpu, GuestMem *mem, uint32_t want,
+                          int32_t delta, int which) {
+    uint32_t p, tbl, cls, c = cpu->r[0];
+    if (guest_ld32(mem, g_ctype_got, &p) && guest_ld32(mem, p, &tbl) &&
+        guest_ld8(mem, tbl + c + 1u, &cls) && (cls & 3u) == want)
+        cpu->r[0] = c + (uint32_t)delta;
+    /* Otherwise r0 is already the answer: a character of any other class is
+     * returned unchanged, which is also the safe result if the table read
+     * fails on an out-of-range argument. */
+    g_ctype_hits[which]++;
+    ctype_note_caller(cpu->r[GUEST_LR]);
+}
+
+static void hook_tolower(GuestCpu *cpu, GuestMem *mem, void *user) {
+    (void)user;
+    ctype_convert(cpu, mem, 1u, 32, 0);
+}
+
+static void hook_toupper(GuestCpu *cpu, GuestMem *mem, void *user) {
+    (void)user;
+    ctype_convert(cpu, mem, 2u, -32, 1);
 }
 
 /* r25 died at RVA 0x23f234 dereferencing 0x033d0080 -- a heap pointer with its
@@ -1891,6 +2052,10 @@ static void hle_profile(uint32_t slot, int enter) {
     }
 }
 
+/* Defined below, next to the Guest it reads. */
+static void pc_profile_report(void);
+static void pc_profile_clear(void);
+
 /* Reported every 300 frames rather than every frame: the point is the split,
  * and printing it per frame would itself distort the thing being measured. */
 static void frame_profile_report(void) {
@@ -1908,6 +2073,10 @@ static void frame_profile_report(void) {
         g_prof_hle_ticks = 0;
         memset(g_prof_slot_ticks, 0, sizeof g_prof_slot_ticks);
         memset(g_prof_slot_calls, 0, sizeof g_prof_slot_calls);
+        /* The PC histogram too. Leaving it would charge the whole loading
+         * phase to the first steady-state window, which is how the handler
+         * split came to report glClear 12% on its first print. */
+        pc_profile_clear();
         return;
     }
     total = now - window_start;
@@ -1944,6 +2113,19 @@ static void frame_profile_report(void) {
     memset(g_prof_slot_ticks, 0, sizeof g_prof_slot_ticks);
     memset(g_prof_slot_calls, 0, sizeof g_prof_slot_calls);
     g_prof_hle_ticks = 0;
+    if (g_ctype_hits[0] || g_ctype_hits[1]) {
+        printf("  [fast ] ctype: %u tolower, %u toupper\n",
+               (unsigned)g_ctype_hits[0], (unsigned)g_ctype_hits[1]);
+        ctype_report_callers(g_img.load_base);
+        g_ctype_hits[0] = g_ctype_hits[1] = 0;
+    }
+    if (g_div_hits[0] || g_div_hits[1] || g_div_hits[2]) {
+        printf("  [fast ] divide: %u uidiv, %u uidivmod, %u idiv\n",
+               (unsigned)g_div_hits[0], (unsigned)g_div_hits[1],
+               (unsigned)g_div_hits[2]);
+        g_div_hits[0] = g_div_hits[1] = g_div_hits[2] = 0;
+    }
+    pc_profile_report();
     window_start = now;
 }
 
@@ -2385,6 +2567,77 @@ static unsigned char *slurp(const char *path, size_t *out) {
 
 static GuestHleSlot g_slots[512];
 static Guest g;
+
+/* ------------------------------------------------------------ PC histogram */
+
+static void pc_profile_clear(void) {
+    if (g.pcprof)
+        memset(g.pcprof, 0, (size_t)g.pcprof_buckets * sizeof(uint32_t));
+}
+
+/* Coalesce runs of executed buckets back into functions and print the busiest.
+ * Adjacency is what does the work here: a hot routine is a contiguous span of
+ * 64-byte buckets, so printing raw buckets would split one function across a
+ * dozen lines and hide it under something flatter. Gaps of up to four empty
+ * buckets -- 64 bytes -- stay inside a span, since a cold error path in the
+ * middle of a hot function is normal and breaking there would report its two
+ * halves separately. */
+static void pc_profile_report(void) {
+    struct span { uint32_t lo, hi; uint64_t hits; } top[12], cur;
+    uint32_t i, n = g.pcprof_buckets;
+    uint64_t total = 0;
+    int ntop = 0, k, j;
+
+    if (!g.pcprof || !n)
+        return;
+    for (i = 0; i < n; i++)
+        total += g.pcprof[i];
+    if (!total)
+        return;
+
+    printf("  [pcprof] %lluM guest instructions, busiest code:\n",
+           (unsigned long long)(total / 1000000ull));
+
+    for (i = 0; i < n; ) {
+        uint32_t gap = 0;
+        if (!g.pcprof[i]) { i++; continue; }
+        cur.lo = cur.hi = i;
+        cur.hits = 0;
+        while (i < n && gap <= 4) {
+            if (g.pcprof[i]) {
+                cur.hits += g.pcprof[i];
+                cur.hi = i;
+                gap = 0;
+            } else {
+                gap++;
+            }
+            i++;
+        }
+        for (k = 0; k < ntop; k++)
+            if (cur.hits > top[k].hits)
+                break;
+        if (k < (int)(sizeof top / sizeof top[0])) {
+            for (j = (ntop < (int)(sizeof top / sizeof top[0])
+                      ? ntop : (int)(sizeof top / sizeof top[0]) - 1); j > k; j--)
+                top[j] = top[j - 1];
+            top[k] = cur;
+            if (ntop < (int)(sizeof top / sizeof top[0]))
+                ntop++;
+        }
+    }
+
+    /* RVAs, because that is what the disassembler and every logged address in
+     * this file are in -- the load base is added back only inside the guest. */
+    for (k = 0; k < ntop; k++)
+        printf("  [pcprof]   %06x..%06x %6u B %3llu%% %8lluk\n",
+               (unsigned)(top[k].lo << 4),
+               (unsigned)((top[k].hi << 4) + 15u),
+               (unsigned)((top[k].hi - top[k].lo + 1) << 4),
+               (unsigned long long)(top[k].hits * 100ull / total),
+               (unsigned long long)(top[k].hits / 1000ull));
+
+    pc_profile_clear();
+}
 volatile uint32_t g_native_stage;
 
 /* libnx userland exception capture.  This turns an otherwise opaque Atmosphere
@@ -2722,10 +2975,22 @@ static void run(void) {
     }
     {   /* The BSS global holding the object read at RVA 0x23f228, resolved
          * from the GOT statically. Fixed in every run, so it can be watched
-         * from the start rather than discovered. */
-        g.mem.watch_addr = g_img.load_base + RVA_OBJ_GLOBAL;
-        printf("watch: object global at %08x (RVA %06x)\n",
-               (unsigned)g.mem.watch_addr, (unsigned)RVA_OBJ_GLOBAL);
+         * from the start rather than discovered.
+         *
+         * Disarmed now that the crash it was chasing is fixed. It is not free:
+         * the interpreter only stamps mem.current_pc while a watch is armed,
+         * and guest_wptr tests every store against the watched word, so
+         * leaving it on costs about 3% for a diagnostic nothing is reading.
+         * Re-arm by dropping watch.txt next to the NRO. */
+        FILE *wf = fopen("sdmc:/switch/boz/watch.txt", "rb");
+        if (!wf)
+            wf = fopen("sdmc:/watch.txt", "rb");
+        if (wf) {
+            fclose(wf);
+            g.mem.watch_addr = g_img.load_base + RVA_OBJ_GLOBAL;
+            printf("watch: object global at %08x (RVA %06x)\n",
+                   (unsigned)g.mem.watch_addr, (unsigned)RVA_OBJ_GLOBAL);
+        }
     }
     {   /* Allocator recycling is off unless the card asks for it back, so the
          * two behaviours can be compared without a rebuild. */
@@ -2787,11 +3052,20 @@ static void run(void) {
     g_slots[n].fn = hle_zero;
     g_ext_stub = GUEST_STUB_BASE + 4 * n;
     g.prof = hle_profile;       /* frame-time split; see frame_profile_report */
+    /* Guest-PC histogram. Sized to the loaded image, so a PC outside it (stub
+     * page, callback trampolines) falls out on the bounds test rather than
+     * needing its own range. ~440 KB for a 7 MB image; if the allocation
+     * fails the pointer stays NULL and the loop skips it. */
+    g.pcprof_base = g_img.load_base;
+    g.pcprof_buckets = (g_img.image_size + 15u) >> 4;
+    g.pcprof = (uint32_t *)calloc(g.pcprof_buckets, sizeof(uint32_t));
+    if (!g.pcprof)
+        g.pcprof_buckets = 0;
     g.hle.slot = g_slots;
     g.hle.count = n + 1;
     startup_stage_write("07 imports bound");
 
-    static GuestHook hooks[9];
+    static GuestHook hooks[14];
     hooks[0].addr = g_img.load_base + RVA_MGR_MALLOC;
     hooks[0].fn = hook_malloc;
     hooks[1].addr = g_img.load_base + RVA_MGR_REALLOC;
@@ -2816,6 +3090,33 @@ static void run(void) {
     hooks[8].fn = watch_struct_copy;
     hooks[8].observe = 1;
     g.hook_count = 9;
+
+    /* ctype last, because it installs only if the image really is laid out the
+     * way the disassembly said. Silence here means the game keeps running its
+     * own tolower, which is slower but never wrong. */
+    g_ctype_got = ctype_resolve_got(&g.mem, g_img.load_base);
+    if (g_ctype_got) {
+        hooks[9].addr = g_img.load_base + RVA_TOLOWER;
+        hooks[9].fn = hook_tolower;
+        hooks[10].addr = g_img.load_base + RVA_TOUPPER;
+        hooks[10].fn = hook_toupper;
+        g.hook_count = 11;
+        printf("  [fast ] ctype table slot at %08x\n", (unsigned)g_ctype_got);
+    } else {
+        printf("  [fast ] ctype hooks not installed (literals did not read)\n");
+    }
+
+    {   /* Divide. Indices follow whatever the ctype block left hook_count at,
+         * so the two blocks stay independent. */
+        uint32_t d = g.hook_count;
+        hooks[d + 0].addr = g_img.load_base + RVA_UIDIV;
+        hooks[d + 0].fn = hook_uidiv;
+        hooks[d + 1].addr = g_img.load_base + RVA_UIDIVMOD;
+        hooks[d + 1].fn = hook_uidivmod;
+        hooks[d + 2].addr = g_img.load_base + RVA_IDIV;
+        hooks[d + 2].fn = hook_idiv;
+        g.hook_count = d + 3;
+    }
 
     g.cpu.r[GUEST_SP] = STACK_BASE + STACK_SIZE - 16;
     g.cpu.cpsr = CPSR_Z;   /* Unicorn's reset state; flags are undefined

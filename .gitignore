@@ -54,3 +54,5 @@ loader/out/
 *.bak
 *.prediff
 nxlink_out.txt
+jit/hostdiff/bb_tmp.bat
+jit/hostdiff/build_log.txt

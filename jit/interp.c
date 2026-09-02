@@ -158,7 +158,7 @@ static GuestStatus step_arm(Guest *g) {
     GuestCpu *c = &g->cpu;
     uint32_t pc = c->r[15], insn;
 
-    if (!guest_ld32(&g->mem, pc, &insn))
+    if (!guest_ifetch32(&g->mem, pc, &insn))
         MEMFAULT(g, pc);
 
     uint32_t cond = insn >> 28;
@@ -1728,7 +1728,7 @@ static GuestStatus step_thumb(Guest *g) {
     GuestCpu *c = &g->cpu;
     uint32_t pc = c->r[15], hw;
 
-    if (!guest_ld16(&g->mem, pc, &hw))
+    if (!guest_ifetch16(&g->mem, pc, &hw))
         MEMFAULT(g, pc);
 
     const uint32_t read_pc = pc + 4;
@@ -1757,7 +1757,7 @@ static GuestStatus step_thumb(Guest *g) {
 
     if ((hw & 0xF800u) >= 0xE800u) {                    /* 32-bit Thumb-2 */
         uint32_t hw2;
-        if (!guest_ld16(&g->mem, pc + 2, &hw2))
+        if (!guest_ifetch16(&g->mem, pc + 2, &hw2))
             MEMFAULT(g, pc + 2);
 
         return step_thumb32(g, pc, hw, hw2);
@@ -2124,36 +2124,63 @@ static GuestStatus dispatch_stub(Guest *g) {
 
 GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
     uint64_t start = g->executed;
-    /* The hook table was scanned linearly on every guest instruction -- seven
-     * loads and compares each time, to match a handful of addresses. Bound it
-     * once per call instead: hooks are far apart in the address space, so a
-     * single unsigned span test rejects almost every PC before the loop runs.
-     * Computed here rather than cached in Guest so that adding or moving a
-     * hook can never leave a stale bound behind; guest_run is entered once per
-     * 5M instructions on the device, so the cost is nil. */
-    uint32_t hook_lo = 0xFFFFFFFFu, hook_span = 0;
+    /* Reject non-hook PCs with one table lookup.
+     *
+     * This was a span test -- lowest hook address to highest -- on the theory
+     * that hooks sit far apart and almost every PC falls outside. That held
+     * while the hooks were a handful of game functions. It stopped holding as
+     * soon as library routines were hooked: the span grew to 2.4 MB of a 7 MB
+     * image, and the profiler showed a third of the hot code sitting inside it,
+     * paying an eleven-iteration linear scan on every single instruction.
+     *
+     * A direct-mapped byte table has no such failure mode. A PC whose bucket is
+     * clear cannot be a hook, whatever the addresses are, so the cost per
+     * instruction stays one AND, one load and one branch no matter how many
+     * hooks are installed or where they are. Buckets are keyed on pc>>1 since
+     * Thumb entry points are 2-byte aligned. Collisions only cost a scan that
+     * finds nothing, and 11 hooks in 256 buckets make even that rare.
+     *
+     * Built per guest_run call rather than cached in Guest so adding or moving
+     * a hook cannot leave a stale table behind; guest_run is entered once per
+     * 5M instructions on the device, so 256 bytes of memset is free. */
+    /* The ring index lives in a register for the duration of the run and is
+     * written back on the way out. It used to be re-loaded from and stored to
+     * g->hist_pos on every guest instruction, which measured 6.4% of
+     * interpreter time on the host bench -- for a 16-entry crash-forensics
+     * buffer. The ring itself is worth keeping; reading its index from memory
+     * a hundred million times a second was not. */
+    uint32_t hp = g->hist_pos;
+    uint8_t hook_map[256];
     if (g->hook_count) {
-        uint32_t i, hi_addr = 0;
-        for (i = 0; i < g->hook_count; i++) {
-            uint32_t a = g->hook[i].addr & ~1u;
-            if (a < hook_lo) hook_lo = a;
-            if (a > hi_addr) hi_addr = a;
-        }
-        hook_span = hi_addr - hook_lo;
+        uint32_t i;
+        memset(hook_map, 0, sizeof hook_map);
+        for (i = 0; i < g->hook_count; i++)
+            hook_map[((g->hook[i].addr & ~1u) >> 1) & 0xFFu] = 1;
     }
 
     while (g->executed - start < limit) {
         uint32_t pc = g->cpu.r[15];
         GuestStatus st;
 
-        if ((pc & ~1u) == (until & ~1u))
+        if ((pc & ~1u) == (until & ~1u)) {
+            g->hist_pos = hp;
             return GUEST_HALTED;
+        }
 
-        g->hist[g->hist_pos & 15u] = pc;
-        g->hist_pos++;
-        g->mem.current_pc = pc;     /* so the store watch can name the writer */
+        g->hist[hp++ & 15u] = pc;
+        /* Only stamp the PC when something is actually watching for it. The
+         * watch is a bring-up tool for finding what corrupts a guest word;
+         * paying a store per instruction to keep it ready cost 2.8%. */
+        if (g->mem.watch_addr)
+            g->mem.current_pc = pc;
 
-        if (pc - hook_lo <= hook_span) {
+        if (g->pcprof) {
+            uint32_t off = ((pc & ~1u) - g->pcprof_base) >> 4;
+            if (off < g->pcprof_buckets)
+                g->pcprof[off]++;
+        }
+
+        if (g->hook_count && hook_map[(pc >> 1) & 0xFFu]) {
             uint32_t hi;
             for (hi = 0; hi < g->hook_count; hi++) {
                 if ((g->hook[hi].addr & ~1u) != pc)
@@ -2175,10 +2202,13 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
             st = guest_is_thumb(&g->cpu) ? step_thumb(g) : step_arm(g);
         }
 
-        if (st != GUEST_OK)
+        if (st != GUEST_OK) {
+            g->hist_pos = hp;
             return st;
+        }
         g->executed++;
     }
+    g->hist_pos = hp;
     return GUEST_STEP_LIMIT;
 }
 

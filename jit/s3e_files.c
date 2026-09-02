@@ -40,6 +40,14 @@ typedef struct {
     uint32_t handle;        /* never reused -- see slot_new() */
     FILE    *fh;
     uint32_t base, size, pos;
+    /* Where the FILE* itself is, which is not the same thing as pos: pos is the
+     * guest's cursor inside its slice of the archive. Tracking it lets read and
+     * write skip the fseek when the stream is already in the right place, and
+     * that matters more than it looks -- fseek discards the stdio buffer, so
+     * seeking before every read turned a million sequential s3eFileReads into a
+     * million SD-card round trips. -1 means "unknown, seek before touching". */
+    long     fpos;
+    int      last_write;    /* direction of the last transfer; see seek_to() */
     int      writable;
     char     name[128];
 } Slot;
@@ -333,6 +341,8 @@ static uint32_t slot_new(FILE *fh, uint32_t base, uint32_t size,
         g_slot[i].base = base;
         g_slot[i].size = size;
         g_slot[i].pos = 0;
+        g_slot[i].fpos = -1;
+        g_slot[i].last_write = 0;
         g_slot[i].writable = writable;
         snprintf(g_slot[i].name, sizeof g_slot[i].name, "%s", name);
         g_slot[i].handle = g_next_handle;
@@ -342,6 +352,35 @@ static uint32_t slot_new(FILE *fh, uint32_t base, uint32_t size,
     }
     fclose(fh);
     return 0;
+}
+
+/* SD access is much slower per call than per byte, and the game reads and
+ * writes in small pieces -- so give every stream a buffer large enough that
+ * those pieces coalesce. Must run before the first operation on the stream,
+ * hence right after fopen. A failure here is not worth reporting: the stream
+ * still works, just with the default buffer. */
+static void set_buffer(FILE *fh) {
+    setvbuf(fh, NULL, _IOFBF, 64u * 1024u);
+}
+
+/* Seek only when the stream is not already there. The game reads its archives
+ * strictly forwards in small pieces, so in the common case this does nothing
+ * and stdio serves the read from its buffer.
+ *
+ * `writing` is not a detail: on an update stream ("r+b"/"w+b") C requires a
+ * seek or flush between a write and a following read, and vice versa. Skipping
+ * the seek because the position already matched would breach exactly that
+ * rule, so a change of direction forces one through. */
+static int seek_to(Slot *s, long want, int writing) {
+    if (s->fpos == want && s->last_write == writing)
+        return 1;
+    if (fseek(s->fh, want, SEEK_SET) != 0) {
+        s->fpos = -1;           /* stream position is now anyone's guess */
+        return 0;
+    }
+    s->fpos = want;
+    s->last_write = writing;
+    return 1;
 }
 
 uint32_t s3e_vfs_open(const char *name, const char *mode) {
@@ -360,6 +399,7 @@ uint32_t s3e_vfs_open(const char *name, const char *mode) {
             g_err = S3E_FILE_ERR_NOT_FOUND;
             return 0;
         }
+        set_buffer(fh);
         if (strchr(mode, 'a'))
             fseek(fh, 0, SEEK_END);
         fs = file_size(real);
@@ -375,6 +415,7 @@ uint32_t s3e_vfs_open(const char *name, const char *mode) {
         g_err = S3E_FILE_ERR_NOT_FOUND;
         return 0;
     }
+    set_buffer(fh);
     return slot_new(fh, off, size, name, 0);
 }
 
@@ -387,10 +428,11 @@ uint32_t s3e_vfs_read(uint32_t h, void *dst, uint32_t n) {
         return 0;
     if (n > s->size - s->pos)
         n = s->size - s->pos;
-    if (fseek(s->fh, (long)(s->base + s->pos), SEEK_SET) != 0)
+    if (!seek_to(s, (long)(s->base + s->pos), 0))
         return 0;
     got = fread(dst, 1, n, s->fh);
     s->pos += (uint32_t)got;
+    s->fpos += (long)got;
     return (uint32_t)got;
 }
 
@@ -399,10 +441,11 @@ uint32_t s3e_vfs_write(uint32_t h, const void *src, uint32_t n) {
     size_t put;
     if (!s || !s->writable || !n)
         return 0;
-    if (fseek(s->fh, (long)(s->base + s->pos), SEEK_SET) != 0)
+    if (!seek_to(s, (long)(s->base + s->pos), 1))
         return 0;
     put = fwrite(src, 1, n, s->fh);
     s->pos += (uint32_t)put;
+    s->fpos += (long)put;
     if (s->pos > s->size)
         s->size = s->pos;
     return (uint32_t)put;
