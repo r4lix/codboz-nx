@@ -56,6 +56,7 @@
  * and the second one gets LibnxError_AlreadyInitialized. So the window has to
  * be taken away from its current owner before eglCreateWindowSurface. */
 extern void *egl_take_window(void);
+extern volatile uint32_t g_native_stage;
 
 /* Counts a GL frame so the input state machine still advances -- see main.c. */
 extern void egl_frame_presented(void);
@@ -386,10 +387,18 @@ static void te_CreateWindowSurface(GuestCpu *c, GuestMem *m, void *u) {
      * has to happen before the call, not after. */
     ELOG("  [egl  ] CreateWindowSurface: guest window %08x ignored\n",
          (unsigned)ga(c, m, 2));
+    g_native_stage = 110;
     win = egl_take_window();
+    if (!win) {
+        ELOG("  [egl  ] CreateWindowSurface: no default NWindow\n");
+        c->r[0] = 0;
+        return;
+    }
+    g_native_stage = 140;
     s = eglCreateWindowSurface((EGLDisplay)dpy, (EGLConfig)cfg,
                                (EGLNativeWindowType)win,
                                (const EGLint *)gp(m, ga(c, m, 3)));
+    g_native_stage = 150;
     c->r[0] = tok_out(s, dpy, K_SFC);
     ELOG("  [egl  ] CreateWindowSurface -> host %p token %08x\n", s,
          (unsigned)c->r[0]);
@@ -458,12 +467,97 @@ static void te_MakeCurrent(GuestCpu *c, GuestMem *m, void *u) {
     }
 }
 
+/* Tiny state-preserving 3x5 bitmap overlay. Drawing with scissored clears keeps
+ * this GLES1-compatible and avoids shaders, textures, or vertex state owned by
+ * the guest. */
+static const char *fps_glyph(char ch) {
+    switch (ch) {
+    case 'F': return "111100110100100";
+    case 'P': return "110101110100100";
+    case 'S': return "111100111001111";
+    case '0': return "111101101101111";
+    case '1': return "010110010010111";
+    case '2': return "111001111100111";
+    case '3': return "111001111001111";
+    case '4': return "101101111001001";
+    case '5': return "111100111001111";
+    case '6': return "111100111101111";
+    case '7': return "111001001001001";
+    case '8': return "111101111101111";
+    case '9': return "111101111001111";
+    default:  return "000000000000000";
+    }
+}
+
+static void fps_overlay(EGLDisplay dpy, EGLSurface surface) {
+    static uint64_t last_tick;
+    static uint32_t frame_count, shown_fps;
+    static EGLint surface_w, surface_h;
+    uint64_t now = armGetSystemTick(), freq = armGetSystemTickFreq();
+    uint64_t elapsed;
+    GLboolean scissor_was, color_mask[4];
+    GLint old_scissor[4];
+    GLfloat old_clear[4];
+    char text[16];
+    int scale = 3, x0 = 10, y0, ci, row, col;
+
+    if (!last_tick)
+        last_tick = now;
+    frame_count++;
+    elapsed = now - last_tick;
+    if (elapsed >= freq) {
+        shown_fps = (uint32_t)(((uint64_t)frame_count * freq + elapsed / 2u) /
+                               elapsed);
+        printf("  [fps  ] %u\n", (unsigned)shown_fps);
+        frame_count = 0;
+        last_tick = now;
+    }
+    if (!surface_w || !surface_h) {
+        eglQuerySurface(dpy, surface, EGL_WIDTH, &surface_w);
+        eglQuerySurface(dpy, surface, EGL_HEIGHT, &surface_h);
+    }
+    if (surface_w <= 0 || surface_h <= 0)
+        return;
+
+    snprintf(text, sizeof text, "FPS %u", (unsigned)shown_fps);
+    y0 = surface_h - 10 - 5 * scale;
+    scissor_was = glIsEnabled(GL_SCISSOR_TEST);
+    glGetIntegerv(GL_SCISSOR_BOX, old_scissor);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, old_clear);
+    glGetBooleanv(GL_COLOR_WRITEMASK, color_mask);
+    glEnable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glScissor(x0 - 4, y0 - 4, (GLsizei)(strlen(text) * 4 * scale + 5),
+              5 * scale + 8);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glClearColor(0.2f, 1.0f, 0.2f, 1.0f);
+    for (ci = 0; text[ci]; ci++) {
+        const char *bits = fps_glyph(text[ci]);
+        for (row = 0; row < 5; row++)
+            for (col = 0; col < 3; col++)
+                if (bits[row * 3 + col] == '1') {
+                    glScissor(x0 + ci * 4 * scale + col * scale,
+                              y0 + (4 - row) * scale, scale, scale);
+                    glClear(GL_COLOR_BUFFER_BIT);
+                }
+    }
+
+    glClearColor(old_clear[0], old_clear[1], old_clear[2], old_clear[3]);
+    glColorMask(color_mask[0], color_mask[1], color_mask[2], color_mask[3]);
+    glScissor(old_scissor[0], old_scissor[1], old_scissor[2], old_scissor[3]);
+    if (!scissor_was)
+        glDisable(GL_SCISSOR_TEST);
+}
+
 static void te_SwapBuffers(GuestCpu *c, GuestMem *m, void *u) {
     void *dpy, *s;
     static int shown;
     (void)u;
     if (!tok_in(ga(c, m, 0), &dpy, K_DPY) || !tok_in(ga(c, m, 1), &s, K_SFC))
         BAD_HANDLE("SwapBuffers");
+    fps_overlay((EGLDisplay)dpy, (EGLSurface)s);
     c->r[0] = (uint32_t)eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)s);
     if (c->r[0])
         egl_frame_presented();

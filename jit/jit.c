@@ -31,6 +31,8 @@ int guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
 
 #include <switch.h>
 
+extern volatile uint32_t g_native_stage;
+
 #define JIT_CODE_SIZE   (8u << 20)
 #define JIT_CACHE_SLOTS 32768u
 #define JIT_HOT_COUNT   3u
@@ -53,6 +55,7 @@ typedef struct {
     uint32_t used;
     JitEntry *entry;
     int ready;
+    int probe_only;             /* stage-one hardware validation gate */
 } JitContext;
 
 typedef struct {
@@ -441,6 +444,41 @@ int guest_jit_init(Guest *g) {
     g->jit = j;
     printf("  [jit  ] AArch64 cache ready: %u MB, type %d\n",
            JIT_CODE_SIZE >> 20, (int)j->code.type);
+    /* First hardware gate: use exactly the two-instruction leaf from libnx's
+     * JIT example. Do not run translated guest blocks in this build. The prior
+     * merged NRO died during early startup; this distinguishes a Horizon W^X
+     * problem from a bad ARM lowering without discarding the cache/emitter. */
+    {
+        static const uint32_t probe[2] = { 0xD28000E0u, 0xD65F03C0u };
+        uint32_t (*probe_fn)(void) = NULL;
+        void *probe_rx = j->rx;
+        uint32_t got;
+        rc = jitTransitionToWritable(&j->code);
+        if (R_FAILED(rc)) {
+            printf("  [jit  ] writable transition failed: %08x\n", rc);
+            guest_jit_close(g);
+            return 0;
+        }
+        memcpy(j->rw, probe, sizeof probe);
+        armDCacheFlush(j->rw, sizeof probe);
+        rc = jitTransitionToExecutable(&j->code);
+        if (R_FAILED(rc)) {
+            printf("  [jit  ] executable transition failed: %08x\n", rc);
+            guest_jit_close(g);
+            return 0;
+        }
+        armICacheInvalidate(j->rx, sizeof probe);
+        memcpy(&probe_fn, &probe_rx, sizeof probe_fn);
+        got = probe_fn();
+        printf("  [jit  ] W^X probe returned %u (expected 7)\n",
+               (unsigned)got);
+        if (got != 7u) {
+            guest_jit_close(g);
+            return 0;
+        }
+        j->used = 16u;
+        j->probe_only = 0;
+    }
     return 1;
 }
 
@@ -451,6 +489,16 @@ void guest_jit_close(Guest *g) {
     free(j->entry); free(j); g->jit = NULL;
 }
 
+/* r16 hardware trial: enable the deliberately narrow tier automatically. */
+static int jit_wanted(void) {
+    static int decided;
+    if (!decided) {
+        decided = 1;
+        printf("  [jit  ] tier-1 hardware trial enabled\n");
+    }
+    return 1;
+}
+
 int guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
                       uint32_t *retired) {
     JitContext *j;
@@ -458,10 +506,14 @@ int guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
     uint32_t key, n;
     JitBlockFn fn;
     *retired = 0;
+    if (!jit_wanted())
+        return 0;
     if (remaining < 2 || g->cpu.itstate || guest_is_stub(g->cpu.r[GUEST_PC]))
         return 0;
     if (!g->jit && !guest_jit_init(g)) return 0;
     j = (JitContext *)g->jit;
+    if (j->probe_only)
+        return 0;
     key = g->cpu.r[GUEST_PC] | (guest_is_thumb(&g->cpu) ? 1u : 0u);
     e = lookup(j, key);
     if (!e) return 0;
@@ -473,7 +525,9 @@ int guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
     }
     if (remaining < e->count) return 0;
     memcpy(&fn, &(void *){j->rx + e->rx_off}, sizeof fn);
+    g_native_stage = 200;
     n = fn(g);
+    g_native_stage = 201;
     if (n != e->count) return 0; /* generated leaf always returns its count */
     *retired = n;
     g->jit_executed += n;

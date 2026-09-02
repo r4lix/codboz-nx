@@ -18,6 +18,7 @@
 #include "guest.h"
 #include "s3e_loader.h"
 #include "s3e_files.h"
+#include "s3e_config.h"
 #ifdef __SWITCH__
 #include "gl_thunks.h"
 #endif
@@ -25,7 +26,7 @@
 #define STACK_BASE 0x20000000u
 #define STACK_SIZE (1u << 20)
 #define HEAP_BASE  0x60000000u
-#define BOZ_BUILD_LABEL "hybrid-jit-stage1-r6 " __DATE__ " " __TIME__
+#define BOZ_BUILD_LABEL "interp-fast-r21 " __DATE__ " " __TIME__
 /* The allocator is a pure bump allocator and free() reclaims nothing, so
  * exhaustion is self-inflicted and the game does not NULL-check malloc -- it
  * runs a C++ constructor on the result and faults writing the vtable. The
@@ -291,71 +292,86 @@ static void hle_device_getint(GuestCpu *cpu, GuestMem *mem, void *user) {
     cpu->r[0] = value;
 }
 
-/* The stock [GX] budget (16/0) makes the game abort with "Out of T-Pages". */
+/* NUL-terminated store into guest memory; fails closed on an unmapped byte
+ * rather than reporting a buffer it did not fill. */
+static int gputs(GuestMem *m, uint32_t addr, const char *s) {
+    uint32_t i;
+    for (i = 0;; i++) {
+        if (!guest_st8(m, addr + i, (uint8_t)s[i]))
+            return 0;
+        if (!s[i])
+            return 1;
+    }
+}
+
+/* Each key is logged once, with the answer it got, so the next unhandled one
+ * names itself -- that is how LowMemoryDevice was tracked down. */
+static void cfg_log_once(const char *tag, const char *sect, const char *key,
+                         const char *val) {
+    static char seen[64][56];
+    static int nseen;
+    const char *parked;
+    char id[56];
+    int i;
+    snprintf(id, sizeof id, "%s|%s|%s", tag, sect, key);
+    for (i = 0; i < nseen; i++)
+        if (!strcmp(seen[i], id))
+            return;
+    if (nseen >= 64)
+        return;
+    snprintf(seen[nseen], sizeof seen[0], "%s", id);
+    nseen++;
+    /* A parked key prints the value it would have had. That is the bisection
+     * data: it says which "not set" answers are a decision from r18 and which
+     * are simply keys nobody has looked at. */
+    parked = val ? NULL : s3e_config_parked(sect, key);
+    if (parked)
+        printf("  [%s] [%s] %s -> not set (PARKED, would be %s)\n",
+               tag, sect, key, parked);
+    else
+        printf("  [%s] [%s] %s -> %s\n", tag, sect, key,
+               val ? val : "not set");
+}
+
+/* s3eConfigGetInt(section, key, out). Answers from the shared table in
+ * jit/s3e_config.h; anything not in it stays "not set" so the game keeps its
+ * own defaults. */
 static void hle_configint(GuestCpu *cpu, GuestMem *mem, void *user) {
-    char sect[24], key[40];
+    char sect[32], key[48];
+    const char *val;
     (void)user;
     gstr(mem, cpu->r[0], sect, sizeof sect);
     gstr(mem, cpu->r[1], key, sizeof key);
-    if (!strcmp(sect, "GX") &&
-        (!strcmp(key, "NumTPages") || !strcmp(key, "NumTPagesNoMipMap"))) {
-        guest_st32(mem, cpu->r[2], 512);
-        cpu->r[0] = 0;                        /* S3E_RESULT_SUCCESS */
-        return;
-    }
-    /* The game reads a LowMemoryDevice key (string constant at RVA 0x3bd4bb)
-     * and opens with a "DEVICE IS LOW ON RAM" dialog. Answering
-     * s3eMemoryGetInt generously did NOT clear it, so the decision comes from
-     * config, not from a runtime memory query. Answer 0 so the game treats
-     * this as a normal-memory device. */
-    if (!strcmp(key, "LowMemoryDevice")) {
-        uint32_t check = 0xFFFFFFFFu;
-        int wrote;
-        wrote = guest_st32(mem, cpu->r[2], 0);
-        guest_ld32(mem, cpu->r[2], &check);
-        cpu->r[0] = 0;
-        printf("  [cfg  ] [%s] %s -> 0, out=%08x wrote=%d readback=%u "
-               "lr=%06x\n", sect, key, (unsigned)cpu->r[2], wrote,
-               (unsigned)check,
-               (unsigned)(cpu->r[GUEST_LR] - g_img.load_base));
-        return;
-    }
-    {   /* every other key, logged once, so the next one is not a guess */
-        static char seen[32][48];
-        static int nseen;
-        int i;
-        for (i = 0; i < nseen; i++)
-            if (!strcmp(seen[i], key))
-                break;
-        if (i == nseen && nseen < 32) {
-            snprintf(seen[nseen], sizeof seen[0], "%s", key);
-            nseen++;
-            printf("  [cfg  ] [%s] %s -> not set\n", sect, key);
+    val = s3e_config_get(sect, key);
+    if (val) {
+        char *end;
+        long n = strtol(val, &end, 0);
+        if (end != val && !*end && guest_st32(mem, cpu->r[2], (uint32_t)n)) {
+            cfg_log_once("cfg  ", sect, key, val);
+            cpu->r[0] = 0;                    /* S3E_RESULT_SUCCESS */
+            return;
         }
     }
+    cfg_log_once("cfg  ", sect, key, NULL);
     cpu->r[0] = 1;                            /* not set: use game defaults */
 }
 
-/* 0 is S3E_RESULT_SUCCESS: returning it from an unimplemented getter
- * tells the caller a buffer was filled when it was not. */
-/* s3eConfigGetString(section, key, out). Answers "not set" for everything, but
- * logs each key once -- that is how LowMemoryDevice was tracked down. */
-static void hle_notfound(GuestCpu *cpu, GuestMem *mem, void *user) {
-    char sect[24], key[48];
-    static char seen[48][48];
-    static int nseen;
-    int i;
+/* s3eConfigGetString(section, key, out), same table. Returning 0 without
+ * filling the buffer would tell the caller a string is there when it is not,
+ * so every failure path answers 1. */
+static void hle_configstr(GuestCpu *cpu, GuestMem *mem, void *user) {
+    char sect[32], key[48];
+    const char *val;
     (void)user;
     gstr(mem, cpu->r[0], sect, sizeof sect);
     gstr(mem, cpu->r[1], key, sizeof key);
-    for (i = 0; i < nseen; i++)
-        if (!strcmp(seen[i], key))
-            break;
-    if (i == nseen && nseen < 48) {
-        snprintf(seen[nseen], sizeof seen[0], "%s", key);
-        nseen++;
-        printf("  [cfgs ] [%s] %s -> not set\n", sect, key);
+    val = s3e_config_get(sect, key);
+    if (val && gputs(mem, cpu->r[2], val)) {
+        cfg_log_once("cfgs ", sect, key, val);
+        cpu->r[0] = 0;
+        return;
     }
+    cfg_log_once("cfgs ", sect, key, NULL);
     cpu->r[0] = 1;
 }
 
@@ -385,6 +401,77 @@ static void hook_free(GuestCpu *cpu, GuestMem *mem, void *user) {
     g_hook_hits[2]++;
     gfree(cpu->r[0]);
     cpu->r[0] = 0;
+}
+
+/* Verified ARM EABI memory primitives in this exact image. These two routines
+ * dominate interpreted startup and frame time; executing their byte/word loops
+ * as guest instructions is pure overhead. The normal non-observe hook return
+ * preserves ARM/Thumb interworking through LR. */
+#define RVA_NATIVE_MEMCPY 0x365dc0u
+#define RVA_NATIVE_MEMSET 0x3664f4u
+static uint64_t g_fast_mem_bytes[2];
+static uint32_t g_fast_mem_hits[2];
+
+/* A non-observe hook never runs the routine it replaces: interp.c branches
+ * through LR the moment the handler returns. So bailing out on a rejected
+ * range would leave the destination untouched and the guest running on --
+ * trading a clean GUEST_FAULT for silent corruption. Fall back to the checked
+ * byte accessors instead: they copy whatever really is mapped and name the
+ * first address that is not. */
+static void slow_copy(GuestMem *mem, uint32_t dst, uint32_t src, uint32_t len) {
+    uint32_t i, byte;
+    for (i = 0; i < len; i++)
+        if (!guest_ld8(mem, src + i, &byte) ||
+            !guest_st8(mem, dst + i, byte)) {
+            printf("  [fast ] memcpy unmapped at +%u (dst=%08x src=%08x "
+                   "len=%u)\n", (unsigned)i, (unsigned)dst, (unsigned)src,
+                   (unsigned)len);
+            return;
+        }
+}
+
+static void slow_fill(GuestMem *mem, uint32_t dst, uint32_t byte, uint32_t len) {
+    uint32_t i;
+    for (i = 0; i < len; i++)
+        if (!guest_st8(mem, dst + i, byte)) {
+            printf("  [fast ] memset unmapped at +%u (dst=%08x len=%u)\n",
+                   (unsigned)i, (unsigned)dst, (unsigned)len);
+            return;
+        }
+}
+
+static void hook_native_memcpy(GuestCpu *cpu, GuestMem *mem, void *user) {
+    uint32_t dst = cpu->r[0], src = cpu->r[1], len = cpu->r[2];
+    void *d;
+    const void *s;
+    (void)user;
+    if (len) {
+        d = guest_ptr(mem, dst, len);
+        s = guest_ptr(mem, src, len);
+        if (!d || !s)
+            slow_copy(mem, dst, src, len);
+        else
+            memmove(d, s, len);
+    }
+    cpu->r[0] = dst;
+    g_fast_mem_hits[0]++;
+    g_fast_mem_bytes[0] += len;
+}
+
+static void hook_native_memset(GuestCpu *cpu, GuestMem *mem, void *user) {
+    uint32_t dst = cpu->r[0], value = cpu->r[1], len = cpu->r[2];
+    void *d;
+    (void)user;
+    if (len) {
+        d = guest_ptr(mem, dst, len);
+        if (!d)
+            slow_fill(mem, dst, value & 0xffu, len);
+        else
+            memset(d, (int)(value & 0xffu), len);
+    }
+    cpu->r[0] = dst;
+    g_fast_mem_hits[1]++;
+    g_fast_mem_bytes[1] += len;
 }
 
 /* The image-conversion registry is built by RVA 0x2720d4. It owns four tiny
@@ -1103,10 +1190,15 @@ static int g_fb_up, g_fb_fail;
  * and only eglCreateWindowSurface -- or the first software present -- takes it. */
 typedef enum { WIN_NONE, WIN_CONSOLE, WIN_FB, WIN_EGL } WinOwner;
 static WinOwner g_win = WIN_CONSOLE;    /* consoleInit(NULL) runs in main() */
+extern volatile uint32_t g_native_stage;
 
 static void win_release(void) {
     switch (g_win) {
-    case WIN_CONSOLE: consoleExit(NULL);        break;
+    case WIN_CONSOLE:
+        g_native_stage = 121;
+        consoleExit(NULL);
+        g_native_stage = 122;
+        break;
     case WIN_FB:      framebufferClose(&g_fb);  break;
     case WIN_EGL:     break;   /* only EGL's own teardown releases its buffers */
     default:          break;
@@ -1128,10 +1220,15 @@ void egl_frame_presented(void) {
 /* Called from the eglCreateWindowSurface thunk in jit/gl_egl.c. The guest's
  * native-window argument is meaningless here; this is the real one. */
 void *egl_take_window(void) {
+    void *win;
+    g_native_stage = 120;
     win_release();
+    g_native_stage = 123;
     g_win = WIN_EGL;
     printf("  [win  ] NWindow handed to EGL\n");
-    return nwindowGetDefault();
+    win = nwindowGetDefault();
+    g_native_stage = win ? 130 : 131;
+    return win;
 }
 static uint32_t g_xmap[1080];
 
@@ -1549,6 +1646,72 @@ static unsigned char *slurp(const char *path, size_t *out) {
 
 static GuestHleSlot g_slots[512];
 static Guest g;
+volatile uint32_t g_native_stage;
+
+/* libnx userland exception capture.  This turns an otherwise opaque Atmosphere
+ * process termination into a persistent native+guest crash record. */
+u8 __nx_exception_stack[0x10000] __attribute__((aligned(16)));
+u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
+
+void __libnx_exception_handler(ThreadExceptionDump *ctx) {
+    static const char *stage_paths[] = {
+        "sdmc:/switch/boz/startup_stage.txt", "sdmc:/startup_stage.txt"
+    };
+    char summary[192];
+    unsigned i;
+    {
+        const char *hle = "-";
+        uint32_t guest_pc = g.cpu.r[GUEST_PC];
+        if (guest_is_stub(guest_pc))
+            hle = slot_name(guest_stub_index(guest_pc));
+        snprintf(summary, sizeof summary,
+                 "NATIVE EXCEPTION desc=%x native_pc=%llx far=%llx esr=%x "
+                 "guest_n=%llu guest_pc=%08x hle=%s native_stage=%u",
+                 (unsigned)ctx->error_desc,
+                 (unsigned long long)ctx->pc.x,
+                 (unsigned long long)ctx->far.x, (unsigned)ctx->esr,
+                 (unsigned long long)g.executed, (unsigned)guest_pc, hle,
+                 (unsigned)g_native_stage);
+    }
+
+    for (i = 0; i < sizeof(stage_paths) / sizeof(stage_paths[0]); i++) {
+        FILE *f = fopen(stage_paths[i], "wb");
+        if (!f)
+            continue;
+        fprintf(f, "%s\n", summary);
+        fclose(f);
+    }
+
+    {
+        FILE *f = fopen("sdmc:/switch/boz/exception_dump.txt", "wb");
+        if (!f)
+            f = fopen("sdmc:/exception_dump.txt", "wb");
+        if (f) {
+            fprintf(f, "%s\npstate=%08x afsr0=%08x afsr1=%08x\n",
+                    summary, (unsigned)ctx->pstate, (unsigned)ctx->afsr0,
+                    (unsigned)ctx->afsr1);
+            for (i = 0; i < 29; i++)
+                fprintf(f, "x%-2u=%016llx%s", i,
+                        (unsigned long long)ctx->cpu_gprs[i].x,
+                        (i & 3u) == 3u ? "\n" : " ");
+            fprintf(f, "\nfp=%016llx lr=%016llx sp=%016llx\n",
+                    (unsigned long long)ctx->fp.x,
+                    (unsigned long long)ctx->lr.x,
+                    (unsigned long long)ctx->sp.x);
+            for (i = 0; i < 16; i++)
+                fprintf(f, "r%-2u=%08x%s", i, (unsigned)g.cpu.r[i],
+                        (i & 3u) == 3u ? "\n" : " ");
+            fprintf(f, "guest_cpsr=%08x it=%02x\nrecent guest pc:",
+                    (unsigned)g.cpu.cpsr, (unsigned)g.cpu.itstate);
+            for (i = 0; i < 16; i++) {
+                uint32_t idx = (g.hist_pos + i) & 15u;
+                fprintf(f, " %08x", (unsigned)g.hist[idx]);
+            }
+            fprintf(f, "\n");
+            fclose(f);
+        }
+    }
+}
 
 /* Deliver everything queued. A callback may queue more, so the queue is
  * drained before dispatching rather than during. */
@@ -1603,7 +1766,7 @@ static void bind_slot(uint32_t i, const char *nm) {
     else if (!strcmp(nm, "s3eConfigGetInt"))
         g_slots[i].fn = hle_configint;
     else if (!strcmp(nm, "s3eConfigGetString"))
-        g_slots[i].fn = hle_notfound;
+        g_slots[i].fn = hle_configstr;
     else if (!strcmp(nm, "s3eSoundGetInt"))
         g_slots[i].fn = hle_sound_getint;
     else if (!strcmp(nm, "s3eSoundSetInt"))
@@ -1693,6 +1856,63 @@ static void bind_slot(uint32_t i, const char *nm) {
         g_slots[i].fn = hle_file_flush;
 }
 
+/* Offline crash breadcrumb.  Each stage is committed with fclose(), so an
+ * abrupt process termination still leaves the last completed stage on SD.
+ * The next launch displays it before doing any guest work. */
+static const char *g_stage_paths[] = {
+    "sdmc:/switch/boz/startup_stage.txt",
+    "sdmc:/startup_stage.txt"
+};
+
+static void startup_stage_write(const char *stage) {
+    unsigned i;
+    for (i = 0; i < sizeof(g_stage_paths) / sizeof(g_stage_paths[0]); i++) {
+        FILE *f = fopen(g_stage_paths[i], "wb");
+        if (!f)
+            continue;
+        fwrite(stage, 1, strlen(stage), f);
+        fwrite("\n", 1, 1, f);
+        fflush(f);
+        fclose(f);
+    }
+    printf("STARTUP STAGE: %s\n", stage);
+    /* The staged probes run through the first 5M instructions, and EGL comes
+     * up inside that window -- eglGetDisplay and eglInitialize both land under
+     * 5M. Once anything takes the NWindow, win_release() has already called
+     * consoleExit(), and refreshing a torn-down console from here would be a
+     * use-after-free on the way to the very crash this is trying to record. */
+    if (g_win == WIN_CONSOLE)
+        consoleUpdate(NULL);
+}
+
+static int startup_stage_read(char *out, size_t cap) {
+    unsigned i;
+    for (i = 0; i < sizeof(g_stage_paths) / sizeof(g_stage_paths[0]); i++) {
+        FILE *f = fopen(g_stage_paths[i], "rb");
+        size_t n;
+        if (!f)
+            continue;
+        n = fread(out, 1, cap - 1, f);
+        fclose(f);
+        out[n] = 0;
+        while (n && (unsigned char)out[n - 1] <= ' ')
+            out[--n] = 0;
+        if (n)
+            return 1;
+    }
+    return 0;
+}
+
+static uint32_t fnv1a32(const unsigned char *p, size_t n) {
+    uint32_t h = 2166136261u;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
 static void run(void) {
     static const char *paths[] = {"sdmc:/switch/boz/boz.s3e.unpacked",
                                   "sdmc:/boz.s3e.unpacked"};
@@ -1701,16 +1921,32 @@ static void run(void) {
     uint32_t n, i;
     GuestStatus st;
 
+    startup_stage_write("01 run entered");
+
     for (i = 0; i < 2 && !file; i++)
         file = slurp(paths[i], &size);
     if (!file) {
         printf("boz.s3e.unpacked not found on SD\n");
         return;
     }
+    {
+        uint32_t image_hash = fnv1a32(file, size);
+        char image_stage[96];
+        snprintf(image_stage, sizeof image_stage,
+                 "02 image size=%u fnv=%08x", (unsigned)size,
+                 (unsigned)image_hash);
+        startup_stage_write(image_stage);
+        if (size != 4550559u || image_hash != 0x7BB8168Cu) {
+            startup_stage_write("IMAGE MISMATCH - wrong or damaged boz.s3e.unpacked");
+            printf("Expected size=4550559 fnv=7bb8168c\n");
+            return;
+        }
+    }
     if (s3e_load(file, size, 0, &g_img) != 0) {
         printf("s3e_load failed: %s\n", s3e_error());
         return;
     }
+    startup_stage_write("03 s3e image loaded");
 
     {   /* the archives and boz_files.idx sit beside the image; the loop above
          * leaves i one past the path that worked */
@@ -1724,7 +1960,10 @@ static void run(void) {
             printf("vfs: no boz_files.idx in %s (loose files only)\n", root);
         else
             printf("vfs: %d entries from %s\n", nidx, root);
+        s3e_config_set_build_style(s3e_vfs_build_style());
+        printf("cfg: ResBuildStyle=%s\n", s3e_config_build_style());
     }
+    startup_stage_write("04 VFS and GL allocator ready");
 
     g_stack = calloc(1, STACK_SIZE);
     g_heap = calloc(1, HEAP_SIZE);
@@ -1733,10 +1972,12 @@ static void run(void) {
         printf("out of memory\n");
         return;
     }
+    startup_stage_write("05 guest buffers allocated");
     guest_mem_add(&g.mem, g_img.load_base, g_img.image_alloc, g_img.image, 1);
     guest_mem_add(&g.mem, STACK_BASE, STACK_SIZE, g_stack, 1);
     guest_mem_add(&g.mem, HEAP_BASE, HEAP_SIZE, g_heap, 1);
     guest_mem_add(&g.mem, SURF_BASE, SURF_BYTES, g_surf, 1);
+    startup_stage_write("06 guest memory mapped");
 
     n = g_img.got_count < 511 ? g_img.got_count : 511;
     for (i = 0; i < n; i++) {
@@ -1750,8 +1991,9 @@ static void run(void) {
     g_ext_stub = GUEST_STUB_BASE + 4 * n;
     g.hle.slot = g_slots;
     g.hle.count = n + 1;
+    startup_stage_write("07 imports bound");
 
-    static GuestHook hooks[5];
+    static GuestHook hooks[7];
     hooks[0].addr = g_img.load_base + RVA_MGR_MALLOC;
     hooks[0].fn = hook_malloc;
     hooks[1].addr = g_img.load_base + RVA_MGR_REALLOC;
@@ -1765,13 +2007,18 @@ static void run(void) {
     hooks[4].addr = g_img.load_base + RVA_FAST_ANGLE_NORMALIZE;
     hooks[4].fn = fast_angle_normalize;
     hooks[4].observe = 1;
-    g.hook_count = 5;
+    hooks[5].addr = g_img.load_base + RVA_NATIVE_MEMCPY;
+    hooks[5].fn = hook_native_memcpy;
+    hooks[6].addr = g_img.load_base + RVA_NATIVE_MEMSET;
+    hooks[6].fn = hook_native_memset;
+    g.hook_count = 7;
 
     g.cpu.r[GUEST_SP] = STACK_BASE + STACK_SIZE - 16;
     g.cpu.cpsr = CPSR_Z;   /* Unicorn's reset state; flags are undefined
                             * at entry, so match the oracle rather than
                             * leave the differential misaligned. */
     g.cpu.r[15] = g_img.entry;        /* RVA 0, ARM mode: CPSR.T stays clear */
+    startup_stage_write("08 CPU and hooks ready");
 
     printf("image %u KB, %u slots\n\n", g_img.image_size >> 10, (unsigned)n);
 
@@ -1782,7 +2029,42 @@ static void run(void) {
      * could never reach a single frame. It runs until it faults or + is
      * pressed, and the chunk boundary is where the applet gets its turn. */
     st = GUEST_STEP_LIMIT;
-    while (!g_quit) {
+    startup_stage_write("09 entering guest interpreter");
+    {
+        static const uint64_t delta[] = {
+            1, 9, 90, 900, 9000, 90000, 900000
+        };
+        static const char *done[] = {
+            "10 guest 1 instruction",
+            "11 guest 10 instructions",
+            "12 guest 100 instructions",
+            "13 guest 1000 instructions",
+            "14 guest 10000 instructions",
+            "15 guest 100000 instructions",
+            "16 guest 1M instructions"
+        };
+        unsigned probe;
+        for (probe = 0; probe < sizeof(delta) / sizeof(delta[0]); probe++) {
+            st = guest_run(&g, 0xFFFFFFFFu, delta[probe]);
+            if (st != GUEST_STEP_LIMIT)
+                break;
+            startup_stage_write(done[probe]);
+        }
+        if (st == GUEST_STEP_LIMIT) {
+            for (probe = 0; probe < 40; probe++) {
+                char detail[96];
+                st = guest_run(&g, 0xFFFFFFFFu, 100000);
+                if (st != GUEST_STEP_LIMIT)
+                    break;
+                snprintf(detail, sizeof detail,
+                         "17 guest_n=%llu guest_pc=%08x",
+                         (unsigned long long)g.executed,
+                         (unsigned)g.cpu.r[GUEST_PC]);
+                startup_stage_write(detail);
+            }
+        }
+    }
+    while (!g_quit && st == GUEST_STEP_LIMIT) {
         st = guest_run(&g, 0xFFFFFFFFu, 5000000ull);
         if (st != GUEST_STEP_LIMIT)
             break;
@@ -1834,6 +2116,11 @@ static void run(void) {
            (unsigned)g.jit_blocks, (unsigned long long)g.jit_executed,
            (unsigned long long)g.executed,
            g.executed ? 100.0 * (double)g.jit_executed / (double)g.executed : 0.0);
+    printf("fastmem: memcpy %u calls/%llu bytes, memset %u calls/%llu bytes\n",
+           (unsigned)g_fast_mem_hits[0],
+           (unsigned long long)g_fast_mem_bytes[0],
+           (unsigned)g_fast_mem_hits[1],
+           (unsigned long long)g_fast_mem_bytes[1]);
 }
 
 /* Launched from hbmenu rather than by nxlink, __nxlink_host is zero and
@@ -1873,19 +2160,32 @@ static int nxlink_host_from_file(void) {
 
 int main(int argc, char **argv) {
     int nxfd = -1;
+    int sockets_up = 0;
+    char previous_stage[128];
     (void)argc;
     (void)argv;
     consoleInit(NULL);
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&g_pad);
 
-    /* Send the log to the `nxlink -s` host instead of the screen: the diagnostic
-     * output is far past what fits in a console, let alone a screenshot. Only
-     * the lines above the redirect land on the TV. */
+    if (startup_stage_read(previous_stage, sizeof previous_stage)) {
+        printf("PREVIOUS RUN LAST REACHED:\n%s\n\nPress A to continue.\n",
+               previous_stage);
+        consoleUpdate(NULL);
+        while (appletMainLoop()) {
+            padUpdate(&g_pad);
+            if (padGetButtonsDown(&g_pad) & HidNpadButton_A)
+                break;
+            consoleUpdate(NULL);
+            svcSleepThread(10000000ull);
+        }
+    }
+
     printf("s3e interpreter test - %s\n\nconnecting to nxlink host...\n",
            BOZ_BUILD_LABEL);
     consoleUpdate(NULL);
     if (R_SUCCEEDED(socketInitializeDefault())) {
+        sockets_up = 1;
         nxfd = nxlinkStdio();
         if (nxfd < 0) {                 /* not netloaded: try the card */
             consoleUpdate(NULL);
@@ -1913,7 +2213,8 @@ int main(int argc, char **argv) {
     }
     if (nxfd >= 0)
         close(nxfd);
-    socketExit();
+    if (sockets_up)
+        socketExit();
     consoleExit(NULL);
     return 0;
 }
