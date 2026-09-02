@@ -82,6 +82,18 @@ typedef struct {
      * on the one path every single guest instruction runs. Splitting them
      * costs four bytes: code stays resolved here while data churns above. */
     int         icache;
+    /* The resolved data region, denormalised out of region[cache].
+     *
+     * The interpreter can afford to index region[cache] because it is already
+     * holding that pointer; JIT-generated code cannot -- computing &region[i]
+     * costs a multiply and two adds before the bounds test even starts, on
+     * every single guest load. Keeping the three fields it actually needs in
+     * fixed slots turns the emitted sequence into two loads, a subtract, a
+     * compare and the access itself. They are written wherever `cache` is,
+     * which is only ever the slow paths in guest.c. */
+    uint32_t    cache_base;
+    uint32_t    cache_size;
+    uint8_t    *cache_host;
     /* Optional four-byte data watch used during bring-up. The interpreter
      * stamps current_pc before every instruction; stores record the first
      * transition from non-zero to zero without changing normal semantics. */
@@ -289,6 +301,29 @@ typedef struct {
     void    *jit;           /* private hybrid-JIT context; NULL when disabled */
     uint64_t jit_executed;  /* guest instructions retired by compiled blocks */
     uint32_t jit_blocks;    /* successfully compiled basic blocks */
+    /* Self-verification. The differential oracle in loader/run_boz.py cannot
+     * test a JIT: it single-steps this interpreter against Unicorn, while a
+     * JIT executes whole blocks, so the one method that has kept the CPU
+     * honest so far simply does not apply. And the JIT only exists on AArch64,
+     * so the host harness cannot run it either.
+     *
+     * So the device becomes the oracle. With this set, every block executed by
+     * the JIT is re-run through the interpreter from the same starting state
+     * and the resulting register files are compared. Slow -- it does the work
+     * twice -- but it turns an ordinary play session into a correctness test,
+     * and a JIT bug that survives to a save file three hours in is much worse
+     * than a slow build.
+     *
+     * Safe only while compiled blocks contain no stores: re-running a block
+     * that writes memory would apply its writes twice, and a block that reads
+     * back what it wrote would diverge for that reason rather than a real bug.
+     * Tier one lowers no memory operations at all, so the condition holds by
+     * construction today; adding store lowering means adding an undo log
+     * before this stays valid. jit_verify_blocks counts what has been checked,
+     * so "no divergences" can be distinguished from "nothing was tested". */
+    int      jit_verify;
+    uint64_t jit_verify_blocks;
+    uint32_t jit_diverged;
 } Guest;
 
 /* Hybrid A32/T32 -> AArch64 block cache. On non-AArch64 hosts these are

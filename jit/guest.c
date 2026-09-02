@@ -17,6 +17,19 @@ int guest_mem_add(GuestMem *m, uint32_t base, uint32_t size, uint8_t *host,
     r->size = size;
     r->host = host;
     r->writable = writable;
+    /* Point the denormalised copy at something real from the moment a region
+     * exists. It is otherwise written only by the slow paths, and the inline
+     * guest_ptr never reaches them while it keeps hitting region[cache] -- so
+     * a run where every access happened to land in region 0 would leave these
+     * at zero. The interpreter would not care, since it reads region[cache]
+     * itself, but JIT code reads these: cache_host NULL would make it load
+     * through a null base, and cache_size zero would make the bounds test
+     * underflow and admit the access rather than reject it. */
+    if (m->count == 1) {
+        m->cache_base = base;
+        m->cache_size = size;
+        m->cache_host = host;
+    }
     return 0;
 }
 
@@ -37,11 +50,20 @@ static int find_index(const GuestMem *m, uint32_t addr, uint32_t len) {
  * mapping the caller is observing, and every read of it is bounds-checked at
  * the use site. Keeping the loads const lets the interpreter pass a const
  * GuestMem around without giving up the cache. */
+/* Set the data cache index and the denormalised copy together, so JIT code
+ * reading the copy can never see a region the interpreter is not using. */
+static void set_data_cache(GuestMem *m, int i) {
+    m->cache = i;
+    m->cache_base = m->region[i].base;
+    m->cache_size = m->region[i].size;
+    m->cache_host = m->region[i].host;
+}
+
 void *guest_ptr_slow(const GuestMem *m, uint32_t addr, uint32_t len) {
     int i = find_index(m, addr, len);
     if (i < 0)
         return NULL;
-    ((GuestMem *)m)->cache = i;
+    set_data_cache((GuestMem *)m, i);
     return m->region[i].host + (addr - m->region[i].base);
 }
 
@@ -59,7 +81,7 @@ void *guest_wptr_slow(GuestMem *m, uint32_t addr, uint32_t len) {
     int i = find_index(m, addr, len);
     if (i < 0 || !m->region[i].writable)
         return NULL;
-    m->cache = i;
+    set_data_cache(m, i);
     return m->region[i].host + (addr - m->region[i].base);
 }
 

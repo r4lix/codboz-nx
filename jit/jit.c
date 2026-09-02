@@ -119,6 +119,53 @@ static void e_return(A64 *a, uint32_t retired) {
     emit(a, 0xD65F03C0u);                          /* RET */
 }
 
+/* Leave the block at `pc`, having retired `n` instructions. Exactly five
+ * instructions, always, so the branch that skips it can be a fixed distance
+ * and nothing needs patching afterwards. MOVK is emitted even when the top
+ * halfword is zero for that reason -- guest PCs are 0x4axxxxxx so it is never
+ * actually redundant, but the size must not depend on the value. */
+static void e_bail(A64 *a, uint32_t pc, uint32_t n) {
+    emit(a, 0x52800000u | ((pc & 0xFFFFu) << 5) | 9u);          /* MOVZ w9 */
+    emit(a, 0x72A00000u | (((pc >> 16) & 0xFFFFu) << 5) | 9u);  /* MOVK lsl16 */
+    e_store_r(a, 9, GUEST_PC);
+    emit(a, 0x52800000u | ((n & 0xFFFFu) << 5) | 0u);           /* MOVZ w0,#n */
+    emit(a, 0xD65F03C0u);                                       /* RET */
+}
+
+/* Guest load, address in w9, result into w9.
+ *
+ * The bounds test is against the region the interpreter last resolved, and a
+ * miss simply ends the block at this instruction. That is what keeps this
+ * lowering honest without modelling anything difficult: an unmapped address,
+ * an access crossing a region end, and an access to a region other than the
+ * cached one all take the same exit, and the interpreter then handles the
+ * instruction exactly as it would have anyway -- faulting properly if it must,
+ * and refreshing the cache if it can, so the next pass through the block
+ * succeeds. No fault path, no helper call, no frame; the block stays a leaf.
+ *
+ * `bytes` is 4 or 1. Halfword and signed forms are deliberately absent rather
+ * than guessed at; they can be added the same way once these are proven. */
+static void e_load_mem(A64 *a, int bytes, uint32_t pc, uint32_t n) {
+    unsigned mem = (unsigned)offsetof(Guest, mem);
+    e_ldr_w(a, 12, mem + (unsigned)offsetof(GuestMem, cache_base));
+    e_rr(a, 0x4B000000u, 9, 9, 12);              /* SUB w9,w9,w12 -> offset */
+    e_ldr_w(a, 12, mem + (unsigned)offsetof(GuestMem, cache_size));
+    /* An access of `bytes` starting at off is in range when
+     * off <= size - bytes; comparing off against size alone would admit the
+     * last few bytes of a region as the start of an access running past it. */
+    emit(a, 0x51000000u | ((uint32_t)bytes << 10) | (12u << 5) | 12u); /* SUB w12,w12,#bytes */
+    e_rr(a, 0x6B000000u, 31, 9, 12);             /* CMP w9,w12 */
+    emit(a, 0x54000000u | (6u << 5) | 9u);       /* B.LS +6 (skip the bail) */
+    e_bail(a, pc, n);
+    emit(a, 0xF9400000u |
+            (((mem + (unsigned)offsetof(GuestMem, cache_host)) >> 3) << 10) |
+            (0u << 5) | 12u);                    /* LDR x12,[x0,#host] */
+    if (bytes == 4)
+        emit(a, 0xB8604800u | (9u << 16) | (12u << 5) | 9u);  /* LDR w9,[x12,w9,uxtw] */
+    else
+        emit(a, 0x38604800u | (9u << 16) | (12u << 5) | 9u);  /* LDRB w9,[x12,w9,uxtw] */
+}
+
 static uint32_t arm_rotimm(uint32_t insn) {
     uint32_t v = insn & 0xFFu, rot = ((insn >> 8) & 0xFu) * 2u;
     return rot ? ((v >> rot) | (v << (32u - rot))) : v;
@@ -193,6 +240,38 @@ static int compile_arm(Guest *g, A64 *a, uint32_t start, uint32_t until,
             if (rd == GUEST_PC) break;
             e_load_r(a, 9, rd);
             emit(a, 0x72A00000u | (imm << 5) | 9u);      /* MOVK w9,#imm,lsl16 */
+            e_store_r(a, 9, rd);
+            pc += 4; n++;
+            continue;
+        }
+
+        /* LDR / LDRB, immediate offset, no writeback. The single most common
+         * shape, and the one that was ending every block: bits 26-27 select
+         * the whole load/store space, so the test below used to reject it
+         * outright and blocks averaged 1.5 instructions as a result.
+         *
+         * Restricted deliberately to P=1 W=0 (offset addressing, no base
+         * update), I=0 (immediate), L=1 (load). Stores are left out until the
+         * verification undo log exists, since re-running a block that writes
+         * memory would apply its writes twice. Register-offset and writeback
+         * forms are simply not lowered yet -- they break the block as before,
+         * which costs coverage and nothing else. */
+        if ((insn & 0x0C000000u) == 0x04000000u) {
+            uint32_t P = (insn >> 24) & 1u, U = (insn >> 23) & 1u;
+            uint32_t B = (insn >> 22) & 1u, W = (insn >> 21) & 1u;
+            uint32_t L = (insn >> 20) & 1u, I = (insn >> 25) & 1u;
+            uint32_t imm = insn & 0xFFFu;
+            rn = (insn >> 16) & 0xFu;
+            rd = (insn >> 12) & 0xFu;
+            if (!L || I || !P || W || rn == GUEST_PC || rd == GUEST_PC)
+                break;
+            e_load_r(a, 9, rn);
+            if (imm) {
+                /* ADD/SUB immediate: 12 bits, exactly the ARM field width. */
+                emit(a, (U ? 0x11000000u : 0x51000000u) |
+                        (imm << 10) | (9u << 5) | 9u);
+            }
+            e_load_mem(a, B ? 1 : 4, pc, n);
             e_store_r(a, 9, rd);
             pc += 4; n++;
             continue;

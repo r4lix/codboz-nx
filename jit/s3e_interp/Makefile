@@ -59,6 +59,13 @@ CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
 			$(ARCH) $(DEFINES)
 
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__
+# The JIT dispatch in guest_run is compiled out unless this is defined, so a
+# build without it pays nothing at all rather than relying on a branch being
+# predicted. Whether that branch actually costs anything could not be
+# resolved on the host bench -- the difference was inside its noise -- which
+# is reason to remove the question rather than answer it. The JIT itself is
+# still opt-in at runtime via jit.txt on the card.
+CFLAGS	+=	-DBOZ_JIT
 # VFP VMLA/VMLS are not fused: the interpreter rounds the product separately,
 # and GCC's default -ffp-contract=fast would merge it back into an FMA and
 # reintroduce the last-bit difference against real hardware.

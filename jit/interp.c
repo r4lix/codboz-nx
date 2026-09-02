@@ -11,6 +11,7 @@
  */
 
 #include <math.h>
+#include <stdio.h>      /* the JIT self-check reports divergences */
 #include <string.h>
 
 #include "guest.h"
@@ -2206,6 +2207,61 @@ static GuestStatus dispatch_stub(Guest *g) {
     return GUEST_OK;
 }
 
+/* Re-run a block the JIT just executed, through the interpreter, and report
+ * whether the two agree. `before` is the register state the block started
+ * from; g->cpu currently holds the JIT's result. See Guest::jit_verify for why
+ * the device has to be the oracle here, and for the standing precondition that
+ * compiled blocks contain no stores.
+ *
+ * Registers only, plus CPSR. That is what a block's lowering can get wrong in
+ * a way this can catch: a shifter carry not merged into C, an IT block advanced
+ * wrongly, a writeback register not updated. Memory is not compared because
+ * nothing compiled writes it yet -- when that changes this needs an undo log,
+ * not a wider comparison. */
+static int jit_verify_block(Guest *g, const GuestCpu *before, uint32_t retired) {
+    GuestCpu jitted = g->cpu;
+    uint32_t i;
+    int bad = -1;
+
+    g->cpu = *before;
+    for (i = 0; i < retired; i++) {
+        GuestStatus st = guest_is_thumb(&g->cpu) ? step_thumb(g) : step_arm(g);
+        if (st != GUEST_OK) {
+            printf("  [jitv ] block %08x: interpreter faulted at step %u\n",
+                   (unsigned)before->r[15], (unsigned)i);
+            g->cpu = jitted;
+            return 0;
+        }
+    }
+    for (i = 0; i < 16; i++)
+        if (g->cpu.r[i] != jitted.r[i]) { bad = (int)i; break; }
+    if (bad < 0 && (g->cpu.cpsr & 0xF8000000u) != (jitted.cpsr & 0xF8000000u))
+        bad = 16;
+
+    if (bad >= 0) {
+        g->jit_diverged++;
+        if (g->jit_diverged <= 20) {
+            if (bad == 16)
+                printf("  [jitv ] block %08x (%u insns): cpsr jit=%08x interp=%08x\n",
+                       (unsigned)before->r[15], (unsigned)retired,
+                       (unsigned)(jitted.cpsr & 0xF8000000u),
+                       (unsigned)(g->cpu.cpsr & 0xF8000000u));
+            else
+                printf("  [jitv ] block %08x (%u insns): r%d jit=%08x interp=%08x\n",
+                       (unsigned)before->r[15], (unsigned)retired, bad,
+                       (unsigned)jitted.r[bad], (unsigned)g->cpu.r[bad]);
+        }
+        /* Keep the INTERPRETER's state, not the JIT's. A divergence means the
+         * compiled block is wrong, so continuing from its answer would carry
+         * the fault forward into everything after it -- and the point of a
+         * verification run is to survive long enough to find more than one. */
+        return 0;
+    }
+    g->cpu = jitted;
+    g->jit_verify_blocks++;
+    return 1;
+}
+
 GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
     uint64_t start = g->executed;
     /* Reject non-hook PCs with one table lookup.
@@ -2234,6 +2290,17 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
      * buffer. The ring itself is worth keeping; reading its index from memory
      * a hundred million times a second was not. */
     uint32_t hp = g->hist_pos;
+    /* Hoisted so the hot loop tests a register rather than reloading a field.
+     * The compiler cannot do this itself: handlers called from inside the loop
+     * are opaque to it, so it must assume any of them could set g->jit. The
+     * JIT is enabled once at startup, before the first guest_run, so a local
+     * copy cannot go stale within a call -- and if it ever could, the worst
+     * outcome is that the JIT starts one guest_run later than it might have.
+     * Left as a plain load-and-branch this measured 2.6% on the host bench,
+     * paid by every build whether the JIT was on or not. */
+#ifdef BOZ_JIT
+    void *jitctx = g->jit;
+#endif
     uint8_t hook_map[256];
     /* Once per guest_run, not once per instruction: this is entered every few
      * million instructions, so the guard costs nothing measurable and no call
@@ -2287,6 +2354,29 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
                 continue;
             }
         }
+
+#ifdef BOZ_JIT
+        /* The JIT gets first refusal on every PC. It declines whenever the
+         * block is not compiled, not hot yet, or contains anything without an
+         * exact lowering, and declining is free of consequence: execution
+         * simply continues here at the same PC. */
+        if (jitctx) {
+            uint32_t retired = 0;
+            GuestCpu before = g->cpu;
+            if (guest_jit_try_run(g, until, limit - (g->executed - start),
+                                  &retired) && retired) {
+                if (!g->jit_verify || jit_verify_block(g, &before, retired)) {
+                    g->executed += retired;
+                    continue;
+                }
+                /* Verification failed: the interpreter has already re-executed
+                 * the block and its state stands, so the instructions still
+                 * retired and must be counted. */
+                g->executed += retired;
+                continue;
+            }
+        }
+#endif
 
         if (guest_is_stub(pc))
             st = dispatch_stub(g);

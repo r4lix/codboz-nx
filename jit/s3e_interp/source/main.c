@@ -27,7 +27,7 @@
 #define STACK_BASE 0x20000000u
 #define STACK_SIZE (1u << 20)
 #define HEAP_BASE  0x60000000u
-#define BOZ_BUILD_LABEL "sched-r63 " __DATE__ " " __TIME__
+#define BOZ_BUILD_LABEL "jit-r65 " __DATE__ " " __TIME__
 /* The allocator is a pure bump allocator and free() reclaims nothing, so
  * exhaustion is self-inflicted and the game does not NULL-check malloc -- it
  * runs a C++ constructor on the result and faults writing the vtable. The
@@ -2122,6 +2122,7 @@ static void pc_profile_report(void);
 static void pc_profile_clear(void);
 static void i_profile_report(void);
 static void i_profile_clear(void);
+static void jit_report(void);
 
 /* Reported every 300 frames rather than every frame: the point is the split,
  * and printing it per frame would itself distort the thing being measured. */
@@ -2215,6 +2216,7 @@ static void frame_profile_report(void) {
         printf("  [sched] core %d, %d migrations seen, prio %d\n",
                core, migrations, (int)g_main_prio);
     }
+    jit_report();
     pc_profile_report();
     i_profile_report();
     window_start = now;
@@ -2666,6 +2668,16 @@ static Guest g;
  * are the loading phase and come out ~100%% ARM library code -- gameplay is
  * Thumb, so the number that matters can only be taken here. */
 static uint32_t g_iprof[GUEST_IPROF_N];
+
+static void jit_report(void) {
+    if (!g.jit && !g.jit_blocks)
+        return;
+    printf("  [jit  ] %u blocks, %lluM insns via JIT, %llu verified, %u diverged\n",
+           (unsigned)g.jit_blocks,
+           (unsigned long long)(g.jit_executed / 1000000ull),
+           (unsigned long long)g.jit_verify_blocks,
+           (unsigned)g.jit_diverged);
+}
 
 static void i_profile_clear(void) {
     memset(g_iprof, 0, sizeof g_iprof);
@@ -3124,6 +3136,45 @@ static void run(void) {
                    (unsigned)g.mem.watch_addr, (unsigned)RVA_OBJ_GLOBAL);
         }
     }
+    {   /* The JIT is opt-in, and its self-check is opt-in on top of that.
+         *
+         * Off by default because it is the one component with no offline
+         * oracle: run_boz.py single-steps the interpreter against Unicorn and
+         * cannot follow a block-at-a-time execution, and the JIT only exists
+         * on AArch64 so the host harness cannot run it at all. Until coverage
+         * is broad enough to have been exercised for a long time, a file on
+         * the card is the right switch.
+         *
+         *   jit.txt        compile and run hot blocks
+         *   jitverify.txt  re-run every compiled block through the interpreter
+         *                  and compare -- much slower, and the only way this
+         *                  gets trustworthy
+         *
+         * Verification implies the JIT; asking for the check without the thing
+         * being checked is a mistake worth silently fixing rather than
+         * obeying. */
+        static const char *jit_paths[] = {
+            "sdmc:/switch/boz/jit.txt", "sdmc:/jit.txt" };
+        static const char *ver_paths[] = {
+            "sdmc:/switch/boz/jitverify.txt", "sdmc:/jitverify.txt" };
+        int want_jit = 0, want_ver = 0, k;
+        for (k = 0; k < 2; k++) {
+            FILE *f = fopen(jit_paths[k], "rb");
+            if (f) { fclose(f); want_jit = 1; }
+            f = fopen(ver_paths[k], "rb");
+            if (f) { fclose(f); want_ver = 1; }
+        }
+        if (want_ver)
+            want_jit = 1;
+        if (want_jit && guest_jit_init(&g)) {
+            g.jit_verify = want_ver;
+            printf("jit: enabled%s\n",
+                   want_ver ? ", self-verifying (slow)" : "");
+        } else if (want_jit) {
+            printf("jit: requested but guest_jit_init failed\n");
+        }
+    }
+
     {   /* Allocator recycling is off unless the card asks for it back, so the
          * two behaviours can be compared without a rebuild. */
         static const char *paths[] = {"sdmc:/switch/boz/recycle.txt",
