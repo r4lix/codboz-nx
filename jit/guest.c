@@ -1,4 +1,8 @@
-/* guest.c -- guest memory regions and status reporting. */
+/* guest.c -- guest memory regions and status reporting.
+ *
+ * The accessors themselves are inline in guest.h; what is left here is the
+ * cache-miss path. See the comment on guest_ptr() for why.
+ */
 
 #include <string.h>
 
@@ -16,66 +20,38 @@ int guest_mem_add(GuestMem *m, uint32_t base, uint32_t size, uint8_t *host,
     return 0;
 }
 
-void *guest_ptr(const GuestMem *m, uint32_t addr, uint32_t len) {
+/* Regions never overlap, so the first containing region is the only one. A
+ * span that starts inside a region but runs off its end is rejected rather
+ * than silently clamped, and the scan simply finds nothing else. */
+static int find_index(const GuestMem *m, uint32_t addr, uint32_t len) {
     for (int i = 0; i < m->count; i++) {
         const GuestRegion *r = &m->region[i];
         uint32_t off = addr - r->base;
-        if (addr >= r->base && off < r->size) {
-            /* reject spans that run off the end rather than silently clamping */
-            if ((uint64_t)off + len > (uint64_t)r->size)
-                return NULL;
-            return r->host + off;
-        }
+        if (off < r->size && len <= r->size - off)
+            return i;
     }
-    return NULL;
+    return -1;
 }
 
-static const GuestRegion *find(const GuestMem *m, uint32_t addr) {
-    for (int i = 0; i < m->count; i++) {
-        const GuestRegion *r = &m->region[i];
-        if (addr >= r->base && addr - r->base < r->size)
-            return r;
-    }
-    return NULL;
+/* The const cast is deliberate: `cache` is advisory metadata, not part of the
+ * mapping the caller is observing, and every read of it is bounds-checked at
+ * the use site. Keeping the loads const lets the interpreter pass a const
+ * GuestMem around without giving up the cache. */
+void *guest_ptr_slow(const GuestMem *m, uint32_t addr, uint32_t len) {
+    int i = find_index(m, addr, len);
+    if (i < 0)
+        return NULL;
+    ((GuestMem *)m)->cache = i;
+    return m->region[i].host + (addr - m->region[i].base);
 }
 
-/* Guest loads must never become host pointer casts: the image is mapped from an
- * odd file offset, so every access is potentially unaligned. memcpy keeps that
- * correct and lets the compiler pick the right instruction. */
-#define LOAD(bits, type)                                                       \
-    int guest_ld##bits(const GuestMem *m, uint32_t addr, uint32_t *out) {      \
-        const void *p = guest_ptr(m, addr, sizeof(type));                      \
-        type v;                                                                \
-        if (!p)                                                                \
-            return 0;                                                          \
-        memcpy(&v, p, sizeof v);                                               \
-        *out = (uint32_t)v;                                                    \
-        return 1;                                                              \
-    }
-
-LOAD(32, uint32_t)
-LOAD(16, uint16_t)
-LOAD(8, uint8_t)
-
-#define STORE(bits, type)                                                      \
-    int guest_st##bits(GuestMem *m, uint32_t addr, uint32_t v) {               \
-        const GuestRegion *r = find(m, addr);                                  \
-        type t = (type)v;                                                      \
-        uint32_t off;                                                          \
-        void *p;                                                               \
-        if (!r || !r->writable)                                                \
-            return 0;                                                          \
-        off = addr - r->base;                                                  \
-        if (sizeof(type) > r->size - off)                                      \
-            return 0;                                                          \
-        p = r->host + off;                                                     \
-        memcpy(p, &t, sizeof t);                                               \
-        return 1;                                                              \
-    }
-
-STORE(32, uint32_t)
-STORE(16, uint16_t)
-STORE(8, uint8_t)
+void *guest_wptr_slow(GuestMem *m, uint32_t addr, uint32_t len) {
+    int i = find_index(m, addr, len);
+    if (i < 0 || !m->region[i].writable)
+        return NULL;
+    m->cache = i;
+    return m->region[i].host + (addr - m->region[i].base);
+}
 
 const char *guest_status_str(GuestStatus s) {
     switch (s) {

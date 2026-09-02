@@ -8,6 +8,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>     /* the inline accessors below use memcpy */
 
 /* ---------------------------------------------------------------- registers */
 
@@ -66,6 +67,10 @@ typedef struct {
 typedef struct {
     GuestRegion region[GUEST_MAX_REGIONS];
     int         count;
+    /* Index of the region the last lookup resolved to. Purely advisory: the
+     * bounds are re-checked on every access, so a stale value costs one slow
+     * lookup and can never produce a wrong answer. */
+    int         cache;
     /* Optional four-byte data watch used during bring-up. The interpreter
      * stamps current_pc before every instruction; stores record the first
      * transition from non-zero to zero without changing normal semantics. */
@@ -81,18 +86,69 @@ typedef struct {
 } GuestMem;
 
 int   guest_mem_add(GuestMem *m, uint32_t base, uint32_t size, uint8_t *host, int writable);
+
+/* Full-scan fallbacks, which also refresh the cache. Call the inline wrappers
+ * below instead; these are only reached on a cache miss. */
+void *guest_ptr_slow(const GuestMem *m, uint32_t addr, uint32_t len);
+void *guest_wptr_slow(GuestMem *m, uint32_t addr, uint32_t len);
+
 /* Returns NULL when the address is unmapped or the span crosses a region end;
- * callers must treat NULL as a guest fault, never as "skip". */
-void *guest_ptr(const GuestMem *m, uint32_t addr, uint32_t len);
+ * callers must treat NULL as a guest fault, never as "skip".
+ *
+ * Inline with a one-entry cache because this is the interpreter's hottest
+ * path: every instruction fetch and every guest load or store went through an
+ * out-of-line call into another translation unit, and with no LTO that is a
+ * real call plus a scan from region 0 -- to reach, nearly every time, the same
+ * region as the access before it. */
+static inline void *guest_ptr(const GuestMem *m, uint32_t addr, uint32_t len) {
+    const GuestRegion *r = &m->region[m->cache];
+    uint32_t off = addr - r->base;
+    if (off < r->size && len <= r->size - off)
+        return r->host + off;
+    return guest_ptr_slow(m, addr, len);
+}
+
+static inline void *guest_wptr(GuestMem *m, uint32_t addr, uint32_t len) {
+    GuestRegion *r = &m->region[m->cache];
+    uint32_t off = addr - r->base;
+    if (r->writable && off < r->size && len <= r->size - off)
+        return r->host + off;
+    return guest_wptr_slow(m, addr, len);
+}
 
 /* All accessors report success rather than returning a value, so an unmapped
- * guest address can never be mistaken for a legitimate zero. */
-int guest_ld32(const GuestMem *m, uint32_t addr, uint32_t *out);
-int guest_ld16(const GuestMem *m, uint32_t addr, uint32_t *out);
-int guest_ld8 (const GuestMem *m, uint32_t addr, uint32_t *out);
-int guest_st32(GuestMem *m, uint32_t addr, uint32_t v);
-int guest_st16(GuestMem *m, uint32_t addr, uint32_t v);
-int guest_st8 (GuestMem *m, uint32_t addr, uint32_t v);
+ * guest address can never be mistaken for a legitimate zero. memcpy rather
+ * than a pointer cast: the image is mapped from an odd file offset, so every
+ * access is potentially unaligned. */
+#define GUEST_DEF_LOAD(bits, type)                                             \
+    static inline int guest_ld##bits(const GuestMem *m, uint32_t addr,         \
+                                     uint32_t *out) {                          \
+        const void *p = guest_ptr(m, addr, (uint32_t)sizeof(type));            \
+        type v;                                                                \
+        if (!p)                                                                \
+            return 0;                                                          \
+        memcpy(&v, p, sizeof v);                                               \
+        *out = (uint32_t)v;                                                    \
+        return 1;                                                              \
+    }
+GUEST_DEF_LOAD(32, uint32_t)
+GUEST_DEF_LOAD(16, uint16_t)
+GUEST_DEF_LOAD(8,  uint8_t)
+#undef GUEST_DEF_LOAD
+
+#define GUEST_DEF_STORE(bits, type)                                            \
+    static inline int guest_st##bits(GuestMem *m, uint32_t addr, uint32_t v) { \
+        void *p = guest_wptr(m, addr, (uint32_t)sizeof(type));                 \
+        type t = (type)v;                                                      \
+        if (!p)                                                                \
+            return 0;                                                          \
+        memcpy(p, &t, sizeof t);                                               \
+        return 1;                                                              \
+    }
+GUEST_DEF_STORE(32, uint32_t)
+GUEST_DEF_STORE(16, uint16_t)
+GUEST_DEF_STORE(8,  uint8_t)
+#undef GUEST_DEF_STORE
 
 /* --------------------------------------------------------------------- HLE */
 

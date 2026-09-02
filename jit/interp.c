@@ -2091,6 +2091,24 @@ static GuestStatus dispatch_stub(Guest *g) {
 
 GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
     uint64_t start = g->executed;
+    /* The hook table was scanned linearly on every guest instruction -- seven
+     * loads and compares each time, to match a handful of addresses. Bound it
+     * once per call instead: hooks are far apart in the address space, so a
+     * single unsigned span test rejects almost every PC before the loop runs.
+     * Computed here rather than cached in Guest so that adding or moving a
+     * hook can never leave a stale bound behind; guest_run is entered once per
+     * 5M instructions on the device, so the cost is nil. */
+    uint32_t hook_lo = 0xFFFFFFFFu, hook_span = 0;
+    if (g->hook_count) {
+        uint32_t i, hi_addr = 0;
+        for (i = 0; i < g->hook_count; i++) {
+            uint32_t a = g->hook[i].addr & ~1u;
+            if (a < hook_lo) hook_lo = a;
+            if (a > hi_addr) hi_addr = a;
+        }
+        hook_span = hi_addr - hook_lo;
+    }
+
     while (g->executed - start < limit) {
         uint32_t pc = g->cpu.r[15];
         GuestStatus st;
@@ -2101,7 +2119,7 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
         g->hist[g->hist_pos & 15u] = pc;
         g->hist_pos++;
 
-        {
+        if (pc - hook_lo <= hook_span) {
             uint32_t hi;
             for (hi = 0; hi < g->hook_count; hi++) {
                 if ((g->hook[hi].addr & ~1u) != pc)
@@ -2120,12 +2138,6 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
         if (guest_is_stub(pc))
             st = dispatch_stub(g);
         else {
-            uint32_t retired = 0;
-            if (guest_jit_try_run(g, until,
-                                  limit - (g->executed - start), &retired)) {
-                g->executed += retired;
-                continue;
-            }
             st = guest_is_thumb(&g->cpu) ? step_thumb(g) : step_arm(g);
         }
 
