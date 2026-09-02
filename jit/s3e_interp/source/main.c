@@ -26,7 +26,7 @@
 #define STACK_BASE 0x20000000u
 #define STACK_SIZE (1u << 20)
 #define HEAP_BASE  0x60000000u
-#define BOZ_BUILD_LABEL "img-repair-r25 " __DATE__ " " __TIME__
+#define BOZ_BUILD_LABEL "global-watch-r34 " __DATE__ " " __TIME__
 /* The allocator is a pure bump allocator and free() reclaims nothing, so
  * exhaustion is self-inflicted and the game does not NULL-check malloc -- it
  * runs a C++ constructor on the result and faults writing the vtable. The
@@ -71,6 +71,11 @@ static GuestAlloc *g_allocs;
 static uint32_t g_alloc_n, g_alloc_cap;
 static uint32_t g_free_head[4096];  /* exact-size reuse, hash collisions chained */
 static uint32_t g_live_bytes, g_peak_bytes;
+/* On by default. Disabling it was tried in r29 on the theory that the game
+ * reads through freed pointers; it fixed neither known fault (r27 died at
+ * 3.44B and r29 at 3.5B, same site) and only costs memory, so recycling stays.
+ * Put a 0 in sdmc:/switch/boz/recycle.txt to disable it and compare. */
+static int g_recycle_freed = 1;
 
 static void galloc_record(uint32_t addr, uint32_t size) {
     if (g_alloc_n == g_alloc_cap) {
@@ -86,6 +91,26 @@ static void galloc_record(uint32_t addr, uint32_t size) {
     g_allocs[g_alloc_n].next_free = 0;
     g_allocs[g_alloc_n].in_use = 1;
     g_alloc_n++;
+}
+
+/* The allocation containing `addr`, rather than the one starting at it. Only
+ * fresh bump allocations are recorded, so g_allocs stays sorted by address and
+ * this can binary-search for the last block starting at or below the target.
+ * Returns -1 when the address falls in no live block -- which for a field the
+ * game is reading means the read is out of bounds. */
+static int32_t galloc_containing(uint32_t addr) {
+    uint32_t lo = 0, hi = g_alloc_n;
+    int32_t best = -1;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2u;
+        if (g_allocs[mid].addr <= addr) {
+            best = (int32_t)mid;
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    return best;
 }
 
 static int32_t galloc_index(uint32_t addr) {
@@ -170,9 +195,26 @@ static void gfree(uint32_t addr) {
     g_allocs[i].in_use = 0;
     if (g_live_bytes >= g_allocs[i].size)
         g_live_bytes -= g_allocs[i].size;
-    bucket = (g_allocs[i].size >> 4) & 4095u;
-    g_allocs[i].next_free = g_free_head[bucket];
-    g_free_head[bucket] = i + 1u;
+    /* Do not recycle. The game holds pointers to blocks it has freed -- at
+     * least two of them: the image-conversion registry keeps a handler that
+     * the string assignment at RVA 0x27e6d8 then reuses and writes 98 times,
+     * and the object read at RVA 0x23f228 has the same shape. Handing a freed
+     * block straight back out turns each of those into a different object's
+     * data appearing where a pointer or vtable is expected.
+     *
+     * The host oracle has always done exactly this -- gfree is a no-op there,
+     * "to preserve oracle address ordering" -- which is the whole reason 2.5B
+     * host instructions never reproduced any of it while hardware died every
+     * run. Matching that behaviour removes the class rather than the instance.
+     *
+     * The cost is memory. Recycling held the high-water mark at 27 MB against
+     * a 1 GB heap, and the OOM path already reports if that stops being true,
+     * so the ceiling is visible rather than silent. */
+    if (g_recycle_freed) {
+        bucket = (g_allocs[i].size >> 4) & 4095u;
+        g_allocs[i].next_free = g_free_head[bucket];
+        g_free_head[bucket] = i + 1u;
+    }
 #else
     (void)addr;                         /* preserve oracle address ordering */
 #endif
@@ -380,6 +422,9 @@ static void hle_configstr(GuestCpu *cpu, GuestMem *mem, void *user) {
  * branch through NULL. A port replaces the guest allocator regardless, so
  * intercept the wrappers directly. RVAs from the Unicorn bring-up.
  */
+/* Up here because hook_free consults the registry; the handler-repair code
+ * below uses the same constant. */
+#define RVA_IMAGE_HANDLER_SLOTS 0x49fd88u
 #define RVA_MGR_MALLOC  0x34c1a8u
 #define RVA_MGR_FREE    0x34c1c4u
 #define RVA_MGR_REALLOC 0x34c1e0u
@@ -396,9 +441,43 @@ static void hook_realloc(GuestCpu *cpu, GuestMem *mem, void *user) {
     cpu->r[0] = grealloc(mem, cpu->r[0], cpu->r[1]);
 }
 
+/* The image-conversion registry holds raw pointers to four handler objects for
+ * the life of the process, and the game frees one of them. The allocator then
+ * reissues the block: RVA 0x27e6d8 is a string assignment (free the old buffer,
+ * NULL it when the source is empty, else malloc 0xa0 and copy), and it wrote
+ * 0x600564d0 ninety-eight times while the registry still pointed there. The
+ * dispatcher at 0x2710bc then read that string's char* as a vtable -- NULL,
+ * or 0x01980118, or 0x009f009e, depending on what the string held.
+ *
+ * Refusing these four frees leaks at most four small objects. The slots are
+ * read fresh rather than cached because an earlier attempt cached them from
+ * watch_image_handler, which only runs on the first dispatcher call -- by then
+ * the free had already happened, the guard never fired, and it looked like
+ * evidence against a use-after-free when it was only evidence of arming late. */
+static int is_registry_handler(GuestMem *mem, uint32_t addr) {
+    uint32_t slot, i;
+    if (!addr || !g_img.load_base)
+        return 0;
+    for (i = 0; i < 4; i++)
+        if (guest_ld32(mem, g_img.load_base + RVA_IMAGE_HANDLER_SLOTS + 4u * i,
+                       &slot) && slot == addr)
+            return 1;
+    return 0;
+}
+
 static void hook_free(GuestCpu *cpu, GuestMem *mem, void *user) {
-    (void)mem; (void)user;
+    (void)user;
     g_hook_hits[2]++;
+    if (is_registry_handler(mem, cpu->r[0])) {
+        static int refused;
+        if (refused < 8) {
+            refused++;
+            printf("  [img  ] refused free of registered handler %08x\n",
+                   (unsigned)cpu->r[0]);
+        }
+        cpu->r[0] = 0;
+        return;
+    }
     gfree(cpu->r[0]);
     cpu->r[0] = 0;
 }
@@ -474,6 +553,124 @@ static void hook_native_memset(GuestCpu *cpu, GuestMem *mem, void *user) {
     g_fast_mem_bytes[1] += len;
 }
 
+/* r25 died at RVA 0x23f234 dereferencing 0x033d0080 -- a heap pointer with its
+ * top nibble cleared, since 0x633d0080 & 0x0FFFFFFF is exactly that, and r11
+ * held a healthy 0x633d90f4 nearby. Z was clear at the fault, so the preceding
+ * `addeq` did not run and the value came from `ldr r3,[r3,#0x84]` two
+ * instructions earlier: it was already wrong in memory.
+ *
+ * This observe hook fires just before that load and names the guest word the
+ * bad pointer lives in, which is the address to watch next. It only speaks
+ * when the value actually looks truncated, so it stays silent otherwise.
+ *
+ * It has to run on hardware: hostrun reached 2.5B instructions with 97 imports
+ * against the device's 5688 at the same point, so the host never gets here. */
+#define RVA_IMG_PTR_LOAD 0x23f228u
+
+/* The struct-copy loop that writes the field. r31 established the field is
+ * inside the object's own 288-byte block, so this is not an out-of-bounds
+ * read -- one subsystem fills the block with 20-byte vertex structs while
+ * another reads +0x84 as a pointer.
+ *
+ * The remaining question is whether the loop is writing inside its own buffer
+ * (two owners for one block, as with the image handler) or has walked past the
+ * end of a different buffer into this one. Comparing the block containing the
+ * loop's cursor against the block containing the object answers it. Reported
+ * only when the cursor actually lands on the watched word, so the hot loop
+ * pays a compare and nothing else. */
+#define RVA_STRUCT_COPY_STORE 0x2431ecu
+
+/* object = *(*(GOT + 0x17f4)); the GOT slot at RVA 0x412808 holds 0x4a492f74,
+ * so this BSS global is the one storing the object pointer. Same address every
+ * run, which is what makes it watchable from startup. */
+#define RVA_OBJ_GLOBAL 0x492f74u
+
+static void watch_struct_copy(GuestCpu *cpu, GuestMem *mem, void *user) {
+    static int logged;
+    uint32_t dst = cpu->r[3] - 2u;
+    int32_t bi;
+    (void)user;
+    /* Any store landing in the watched word, matching the store watch's own
+     * 4-byte window. This is a halfword store and it lands on watch_addr+2 --
+     * testing for an exact match rejected the one write it exists to catch. */
+    if (logged >= 6 || !mem->watch_addr || (dst - mem->watch_addr) >= 4u)
+        return;
+    logged++;
+    bi = galloc_containing(cpu->r[3]);
+    if (bi >= 0)
+        printf("  [copy ] cursor %08x is in block %08x+%u (offset %u)\n",
+               (unsigned)cpu->r[3], (unsigned)g_allocs[bi].addr,
+               (unsigned)g_allocs[bi].size,
+               (unsigned)(cpu->r[3] - g_allocs[bi].addr));
+    else
+        printf("  [copy ] cursor %08x is in no recorded block\n",
+               (unsigned)cpu->r[3]);
+}
+
+/* The watch is armed here now, not on the image handler: that fault is handled
+ * by the vtable repair, and this is the site still killing every run.
+ *
+ * The field is not a corrupted pointer. Across four runs it has held
+ * 033d0080, 02f20080, 06210080 and 06da0080 -- low halfword always 0x0080,
+ * high halfword varying -- so it is a two-u16 structure being read where the
+ * game expects a pointer or NULL. r29 ran with allocator recycling disabled,
+ * which makes fresh blocks strictly contiguous and zero-filled, and the value
+ * appeared anyway. Nothing aliased it; something wrote it. With allocations
+ * contiguous, an overflow out of the neighbouring block is the likeliest
+ * writer, and the watch will name it. */
+static void watch_truncated_ptr(GuestCpu *cpu, GuestMem *mem, void *user) {
+    static int logged;
+    uint32_t src = cpu->r[3] + 0x84u, val = 0;
+    (void)user;
+    if (!guest_ld32(mem, src, &val))
+        return;
+
+    /* No longer arms the watch. r33 settled what this fault is: the copy
+     * loop's cursor and the object live in the *same* 288-byte block (cursor
+     * at offset 136, the read field at 132), so nothing is out of bounds --
+     * one subsystem fills the block with 20-byte vertex structs while this
+     * code reads offset 132 as a pointer. The block is not the object this
+     * code wants.
+     *
+     * The object comes from *(*(GOT+0x17f4)), which resolves statically to the
+     * BSS global at RVA 0x492f74 -- a fixed address in every run, unlike the
+     * heap addresses. RVA_OBJ_GLOBAL is watched from startup instead, so the
+     * writer that stores a vertex block into that global names itself. */
+
+    if (logged < 12 && val >= 0x01000000u && val < 0x10000000u) {
+        uint32_t g = 0;
+        int32_t bi;
+        guest_ld32(mem, g_img.load_base + RVA_OBJ_GLOBAL, &g);
+        printf("  [glob ] global %08x -> obj %08x | %llu writes, "
+               "last from RVA %06x\n",
+               (unsigned)(g_img.load_base + RVA_OBJ_GLOBAL), (unsigned)g,
+               (unsigned long long)mem->watch_changes,
+               (unsigned)(mem->watch_last_pc - g_img.load_base));
+        bi = galloc_containing(cpu->r[3]);
+        if (bi >= 0) {
+            uint32_t base = g_allocs[bi].addr, size = g_allocs[bi].size;
+            uint32_t off = cpu->r[3] - base;
+            printf("  [trunc] obj %08x lives in block %08x+%u (offset %u); "
+                   "field +0x84 is %s\n", (unsigned)cpu->r[3], (unsigned)base,
+                   (unsigned)size, (unsigned)off,
+                   (off + 0x88u <= size) ? "INSIDE" : "PAST THE END");
+        } else {
+            printf("  [trunc] obj %08x is in no recorded block\n",
+                   (unsigned)cpu->r[3]);
+        }
+    }
+    if (logged < 12 && val >= 0x01000000u && val < 0x10000000u) {
+        logged++;
+        printf("  [trunc] %08x at %08x obj=%08x lr=%06x | watch %08x: "
+               "%llu writes, last from RVA %06x\n",
+               (unsigned)val, (unsigned)src, (unsigned)cpu->r[3],
+               (unsigned)(cpu->r[GUEST_LR] - g_img.load_base),
+               (unsigned)mem->watch_addr,
+               (unsigned long long)mem->watch_changes,
+               (unsigned)(mem->watch_last_pc - g_img.load_base));
+    }
+}
+
 /* The image-conversion registry is built by RVA 0x2720d4. It owns four tiny
  * format handlers, then the dispatcher at RVA 0x27109c looks one up and
  * immediately calls vtable[5].
@@ -486,7 +683,6 @@ static void hook_native_memset(GuestCpu *cpu, GuestMem *mem, void *user) {
  * broken object must still fault and identify itself.
  */
 #define RVA_IMAGE_HANDLER_READY 0x2710a0u
-#define RVA_IMAGE_HANDLER_SLOTS 0x49fd88u
 
 /* r24 ruled out a use-after-free: the free guard tried here never fired once,
  * in a run that reached the fault. These objects are never freed -- their
@@ -534,10 +730,23 @@ static void watch_image_handler(GuestCpu *cpu, GuestMem *mem, void *user) {
      *
      * So complain rather than repair. Writing the vtable back would scribble
      * on whatever owns the block now; hook_free refuses the free instead. */
+    /* Arm the store watch on the object itself the first time it is seen
+     * healthy. This address has been 600564d0 in every run since r20, and it
+     * is the object that gets clobbered -- with 00000000, then 01980118, then
+     * 009f009e, i.e. different garbage each time and again after a repair. So
+     * this is not a zeroing memset, not a use-after-free and not truncation:
+     * something writes over a live object, repeatedly. The watch names it. */
+    /* No longer arms the watch: this fault is handled by the repair below, and
+     * the single watch slot is needed for the RVA 0x23f228 site, which still
+     * kills every run. Whichever site armed first would starve the other. */
     if (slot >= 0 && vtable != g_img.load_base + vtable_rva[slot]) {
         static int warned;
         if (warned < 8) {
             warned++;
+            printf("  [trunc] watch %08x: %llu writes, last from RVA %06x\n",
+                   (unsigned)mem->watch_addr,
+                   (unsigned long long)mem->watch_changes,
+                   (unsigned)(mem->watch_last_pc - g_img.load_base));
             printf("  [img  ] slot%d object %08x has vtable %08x, expected "
                    "%08x (fmt 0x%x, lr %06x)\n", slot, (unsigned)cpu->r[0],
                    (unsigned)vtable,
@@ -2091,6 +2300,30 @@ static void run(void) {
         s3e_config_set_build_style(s3e_vfs_build_style());
         printf("cfg: ResBuildStyle=%s\n", s3e_config_build_style());
     }
+    {   /* The BSS global holding the object read at RVA 0x23f228, resolved
+         * from the GOT statically. Fixed in every run, so it can be watched
+         * from the start rather than discovered. */
+        g.mem.watch_addr = g_img.load_base + RVA_OBJ_GLOBAL;
+        printf("watch: object global at %08x (RVA %06x)\n",
+               (unsigned)g.mem.watch_addr, (unsigned)RVA_OBJ_GLOBAL);
+    }
+    {   /* Allocator recycling is off unless the card asks for it back, so the
+         * two behaviours can be compared without a rebuild. */
+        static const char *paths[] = {"sdmc:/switch/boz/recycle.txt",
+                                      "sdmc:/recycle.txt"};
+        unsigned k;
+        for (k = 0; k < 2; k++) {
+            FILE *f = fopen(paths[k], "rb");
+            char c = 0;
+            if (!f)
+                continue;
+            if (fread(&c, 1, 1, f) == 1 && c == '0')
+                g_recycle_freed = 0;
+            fclose(f);
+            break;
+        }
+        printf("heap: recycle freed blocks = %d\n", g_recycle_freed);
+    }
     startup_stage_write("04 VFS and GL allocator ready");
 
     g_stack = calloc(1, STACK_SIZE);
@@ -2122,7 +2355,7 @@ static void run(void) {
     g.hle.count = n + 1;
     startup_stage_write("07 imports bound");
 
-    static GuestHook hooks[7];
+    static GuestHook hooks[9];
     hooks[0].addr = g_img.load_base + RVA_MGR_MALLOC;
     hooks[0].fn = hook_malloc;
     hooks[1].addr = g_img.load_base + RVA_MGR_REALLOC;
@@ -2140,7 +2373,13 @@ static void run(void) {
     hooks[5].fn = hook_native_memcpy;
     hooks[6].addr = g_img.load_base + RVA_NATIVE_MEMSET;
     hooks[6].fn = hook_native_memset;
-    g.hook_count = 7;
+    hooks[7].addr = g_img.load_base + RVA_IMG_PTR_LOAD;
+    hooks[7].fn = watch_truncated_ptr;
+    hooks[7].observe = 1;
+    hooks[8].addr = g_img.load_base + RVA_STRUCT_COPY_STORE;
+    hooks[8].fn = watch_struct_copy;
+    hooks[8].observe = 1;
+    g.hook_count = 9;
 
     g.cpu.r[GUEST_SP] = STACK_BASE + STACK_SIZE - 16;
     g.cpu.cpsr = CPSR_Z;   /* Unicorn's reset state; flags are undefined
