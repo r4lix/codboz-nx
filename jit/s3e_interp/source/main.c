@@ -26,7 +26,7 @@
 #define STACK_BASE 0x20000000u
 #define STACK_SIZE (1u << 20)
 #define HEAP_BASE  0x60000000u
-#define BOZ_BUILD_LABEL "icf-r35 " __DATE__ " " __TIME__
+#define BOZ_BUILD_LABEL "ptrfix2-r53 " __DATE__ " " __TIME__
 /* The allocator is a pure bump allocator and free() reclaims nothing, so
  * exhaustion is self-inflicted and the game does not NULL-check malloc -- it
  * runs a C++ constructor on the result and faults writing the vtable. The
@@ -974,10 +974,16 @@ static void cb_kind(const char *nm, char *out, size_t n) {
     out[len] = 0;
 }
 
-static int cb_find(const char *kind, uint32_t id) {
+/* An exact match including the handler, so re-registering the same function is
+ * idempotent while a second, different handler for the same event is kept.
+ * There is deliberately no find-by-event-alone any more: every previous use of
+ * it picked an arbitrary listener out of several, which is how registrations
+ * got overwritten and unregistrations unhooked the wrong subsystem. */
+static int cb_find_fn(const char *kind, uint32_t id, uint32_t fn) {
     int i;
     for (i = 0; i < g_cb_n; i++)
-        if (g_cbs[i].used && g_cbs[i].id == id && !strcmp(g_cbs[i].kind, kind))
+        if (g_cbs[i].used && g_cbs[i].id == id && g_cbs[i].fn == fn &&
+            !strcmp(g_cbs[i].kind, kind))
             return i;
     return -1;
 }
@@ -988,7 +994,12 @@ static void hle_register(GuestCpu *cpu, GuestMem *mem, void *user) {
     int i;
     (void)mem;
     cb_kind(slot_name(idx), kind, sizeof kind);
-    i = cb_find(kind, cpu->r[0]);
+    /* Registrations accumulate. Only an identical (kind, id, fn) is treated as
+     * a repeat -- re-registering the same handler must not stack it up -- but a
+     * different function for the same event is an additional listener, not a
+     * replacement. Overwriting here is what silently unhooked the engine's
+     * pointer handler when the UI layer registered its own. */
+    i = cb_find_fn(kind, cpu->r[0], cpu->r[1]);
     if (i < 0 && g_cb_n < MAX_CBS)
         i = g_cb_n++;
     if (i >= 0) {
@@ -1009,23 +1020,43 @@ static void hle_unregister(GuestCpu *cpu, GuestMem *mem, void *user) {
     int i;
     (void)mem;
     cb_kind(slot_name(idx), kind, sizeof kind);
-    i = cb_find(kind, cpu->r[0]);
-    if (i >= 0)
+    /* Only ever remove the exact handler named. Falling back to "the first
+     * registration for this event" is how input dies mid-session: the game
+     * tears down a UI listener and we unhook the engine's instead, after which
+     * events are still generated and delivered to nothing. */
+    i = cb_find_fn(kind, cpu->r[0], cpu->r[1]);
+    if (i >= 0) {
         g_cbs[i].used = 0;
+        printf("  [cb   ] -%-17s id=%-3u fn=%08x\n", kind,
+               (unsigned)cpu->r[0], (unsigned)cpu->r[1]);
+    } else {
+        printf("  [cb   ] -%-17s id=%-3u fn=%08x NOT FOUND, keeping all\n",
+               kind, (unsigned)cpu->r[0], (unsigned)cpu->r[1]);
+    }
     cpu->r[0] = 0;
 }
 
 /* Queue one for the next yield rather than calling straight away: a callback
  * fired from the middle of an unrelated import would re-enter the guest at a
  * point it does not expect. */
+/* Queue every callback registered for the event, not just one. s3eRegister
+ * appends -- the game registers a pointer handler in the engine and another in
+ * the UI layer, and both are meant to run. Delivering only one is why the
+ * menus responded (the UI handler, registered second) while gameplay did not
+ * (the engine handler, evicted by it). */
 static int cb_queue(const char *kind, uint32_t id, uint32_t sysdata) {
-    int i = cb_find(kind, id);
-    if (i < 0 || g_cb_queue_n >= (int)(sizeof g_cb_queue / sizeof *g_cb_queue))
-        return 0;
-    g_cb_queue[g_cb_queue_n].slot = i;
-    g_cb_queue[g_cb_queue_n].sysdata = sysdata;
-    g_cb_queue_n++;
-    return 1;
+    int i, queued = 0;
+    for (i = 0; i < g_cb_n; i++) {
+        if (!g_cbs[i].used || g_cbs[i].id != id || strcmp(g_cbs[i].kind, kind))
+            continue;
+        if (g_cb_queue_n >= (int)(sizeof g_cb_queue / sizeof *g_cb_queue))
+            break;
+        g_cb_queue[g_cb_queue_n].slot = i;
+        g_cb_queue[g_cb_queue_n].sysdata = sysdata;
+        g_cb_queue_n++;
+        queued++;
+    }
+    return queued;
 }
 
 static void cb_pump(void);      /* defined after `g`, which it re-enters */
@@ -1117,8 +1148,16 @@ static void tap_fire(GuestMem *mem, uint32_t *buf, int pressed) {
                    pressed, g_tap_x, g_tap_y);
         }
     }
-    if (!cb_queue("s3ePointer", 0, *buf))
-        printf("  [tap  ] no s3ePointer id=0 callback registered\n");
+    {   /* A change in listener count is the thing to catch: input that worked
+         * and then stopped means handlers went away while events kept flowing. */
+        static int last_n = -1;
+        int n = cb_queue("s3ePointer", 0, *buf);
+        if (n != last_n) {
+            last_n = n;
+            printf("  [tap  ] s3ePointer id=0 now has %d listener%s\n", n,
+                   n == 1 ? "" : "s");
+        }
+    }
 }
 
 static void motion_fire(GuestMem *mem, int x, int y) {
@@ -1134,6 +1173,82 @@ static void motion_fire(GuestMem *mem, int x, int y) {
         printf("  [move ] pointer motion callback at (%d,%d)\n", x, y);
         shown++;
     }
+}
+
+/* ---- multi-touch ------------------------------------------------------
+ *
+ * This is a dual-virtual-stick shooter: move with the left thumb, look and
+ * fire with the right, at the same time. Reporting
+ * S3E_POINTER_MULTI_TOUCH_AVAILABLE as 0 made the game register only the
+ * single-touch callbacks (s3ePointer id 0 and 1, which is exactly what the
+ * callback log shows) and left it with no usable in-game control scheme --
+ * menus worked because a menu never needs a second finger.
+ *
+ * Both paths are driven, as a real device does: the primary contact still
+ * produces button and motion events so menus keep working, and every contact
+ * additionally produces touch events.
+ *
+ *   id 2  S3E_POINTER_TOUCH_EVENT        { x, y, touchID, pressed }
+ *   id 3  S3E_POINTER_TOUCH_MOTION_EVENT { x, y, touchID }
+ */
+#define MAX_TOUCH 4
+
+typedef struct {
+    int      active;
+    int      x, y;
+    int      raw_x, raw_y;           /* panel coordinate, kept for the log */
+    uint32_t fid;                    /* Switch finger id, to track identity */
+} Touch;
+
+static Touch g_touch[MAX_TOUCH];
+static uint32_t g_ev_touch[MAX_TOUCH], g_ev_touch_motion[MAX_TOUCH];
+
+/* One event buffer per slot. cb_queue stores the guest pointer and the queue is
+ * not drained until s3eDeviceYield, so a single shared buffer lets a second
+ * finger's coordinates overwrite the first's before either is delivered --
+ * exactly the case multi-touch exists to support. */
+static void touch_fire(GuestMem *mem, int slot, int pressed) {
+    uint32_t *buf = &g_ev_touch[slot];
+    int n;
+    if (!*buf)
+        *buf = galloc(16);
+    if (!*buf)
+        return;
+    /* { m_TouchID, m_Pressed, m_x, m_y } -- read off the game's own handler at
+     * RVA 0xdda20, which does `ldm r1,{r0,r1,r2,r3}`, tests word[1] with cbz
+     * as a boolean, uses word[0] to index its table of live touches, and
+     * passes &word[2] and &word[3] to the coordinate routine. Same shape as
+     * s3ePointerEvent {Button, Pressed, x, y}, which tap_fire already used.
+     * Putting x and y first made the game read touch ID 231 at (0,1). */
+    guest_st32(mem, *buf + 0, (uint32_t)slot);
+    guest_st32(mem, *buf + 4, (uint32_t)pressed);
+    guest_st32(mem, *buf + 8, (uint32_t)g_touch[slot].x);
+    guest_st32(mem, *buf + 12, (uint32_t)g_touch[slot].y);
+    n = cb_queue("s3ePointer", 2, *buf);
+    /* Uncapped, and carrying the panel coordinate that produced it: correlating
+     * "I touched here and the game did that" needs both halves on every event,
+     * and a per-session cap silently stops answering exactly when a long play
+     * session starts producing the interesting cases. Volume is one line per
+     * press or release, not per frame. */
+    printf("  [touch] id=%d %s panel (%d,%d) -> guest (%d,%d) -> %d listener%s\n",
+           slot, pressed ? "DOWN" : "up  ", g_touch[slot].raw_x,
+           g_touch[slot].raw_y, g_touch[slot].x, g_touch[slot].y, n,
+           n == 1 ? "" : "s");
+}
+
+static void touch_motion_fire(GuestMem *mem, int slot) {
+    uint32_t *buf = &g_ev_touch_motion[slot];
+    if (!*buf)
+        *buf = galloc(12);
+    if (!*buf)
+        return;
+    /* { m_TouchID, m_x, m_y } -- the handler at RVA 0xddb2c does
+     * `ldm r1,{r0,r1,r2}` and passes words 1 and 2 to the same coordinate
+     * routine the touch event uses, leaving word[0] as the id. */
+    guest_st32(mem, *buf + 0, (uint32_t)slot);
+    guest_st32(mem, *buf + 4, (uint32_t)g_touch[slot].x);
+    guest_st32(mem, *buf + 8, (uint32_t)g_touch[slot].y);
+    cb_queue("s3ePointer", 3, *buf);
 }
 
 /* Arm on a frame count so the tap lands after output has stabilised; the
@@ -1166,6 +1281,34 @@ static void tap_arm(int frame) {
  * touch at screen (sx, sy) is game ((sx - 100) * 480/1080, sy * 320/720).
  * Both spaces have their origin at the top left, so no flip is involved --
  * unlike the GL viewport, which measures from the bottom. */
+/* Touch Y origin. The panel reports top-left, but the guest viewport goes to
+ * glViewport unflipped and GL's origin is bottom-left, so guest y=0 is the
+ * BOTTOM of the screen. Confirmed on hardware: a press near panel y=690 -- the
+ * bottom edge, on the Back button -- mapped to guest y=308 and activated
+ * something at the top of the screen instead.
+ *
+ * The rendering is self-consistent either way, which is why this could not be
+ * read off a screenshot. Put 0 in sdmc:/switch/boz/flipy.txt to go back. */
+/* Bitmask, because the two delivery paths may not agree:
+ *   bit 0 (1) - single-touch: s3ePointer id 0/1 and the polling getters,
+ *               which the game's UI layer handles
+ *   bit 1 (2) - multi-touch: s3ePointer id 2/3, which the engine handles
+ * "Sometimes the right spot, sometimes the opposite" is what a disagreement
+ * between them looks like, and menus worked before the flip while gameplay
+ * needed it. Put 0-3 in flipy.txt; 3 flips both, 2 flips only the engine. */
+/* Default 1: UI layer flipped, engine not.
+ *
+ * Both halves are observed, not reasoned. In the menus, Back at the bottom of
+ * the screen activated something at the top when unflipped -- the UI handler
+ * (s3ePointer id 0/1) needs the flip. In game, with the flip on, the knife
+ * drawn at the bottom responded to a touch at the top, pause drawn top-left
+ * responded at the bottom, and character movement was inverted vertically but
+ * correct horizontally -- the engine handler (id 2/3) needs no flip. That last
+ * detail is decisive: the virtual stick works on deltas, so a wrong Y inverts
+ * one axis and leaves the other alone, which is exactly what it did. */
+static int g_flip_y = 1;
+#define FLIP_SINGLE (g_flip_y & 1)
+#define FLIP_MULTI  (g_flip_y & 2)
 static int g_touch_ready;
 static int g_real_down;              /* contact state on the previous update */
 static int g_cur_x = (int)(SCREEN_W / 2), g_cur_y = (int)(SCREEN_H / 2);
@@ -1182,11 +1325,15 @@ static int input_poll(int *px, int *py) {
         hidInitializeTouchScreen();
         g_touch_ready = 1;
     }
-    if (hidGetTouchScreenStates(&ts, 1) && ts.count > 0) {
+    if (hidGetTouchScreenStates(&ts, 1) && ts.count > 0 &&
+        (int)ts.touches[0].x >= (int)VIEW_X &&
+        (int)ts.touches[0].x < (int)(VIEW_X + VIEW_W)) {
         *px = clampi(((int)ts.touches[0].x - (int)VIEW_X) * (int)SCREEN_W
                      / (int)VIEW_W, 0, (int)SCREEN_W - 1);
         *py = clampi((int)ts.touches[0].y * (int)SCREEN_H / (int)FB_H,
                      0, (int)SCREEN_H - 1);
+        if (FLIP_SINGLE)
+            *py = (int)SCREEN_H - 1 - *py;
         g_cur_x = *px;
         g_cur_y = *py;
         return 1;
@@ -1200,7 +1347,10 @@ static int input_poll(int *px, int *py) {
         if (st.x > 6000 || st.x < -6000)
             g_cur_x = clampi(g_cur_x + st.x / 4000, 0, (int)SCREEN_W - 1);
         if (st.y > 6000 || st.y < -6000)
-            g_cur_y = clampi(g_cur_y - st.y / 4000, 0, (int)SCREEN_H - 1);
+            /* Guest y grows upward when g_flip_y is set, so pushing the stick
+             * up has to increase it or the docked cursor moves the wrong way. */
+            g_cur_y = clampi(g_cur_y + (g_flip_y ? st.y : -st.y) / 4000, 0,
+                             (int)SCREEN_H - 1);
     }
     held = padGetButtons(&g_pad);
     *px = g_cur_x;
@@ -1208,15 +1358,228 @@ static int input_poll(int *px, int *py) {
     return (held & HidNpadButton_A) ? 1 : 0;
 }
 
+/* ---- keyboard ---------------------------------------------------------
+ *
+ * s3eKeyboardGetState was never implemented -- it fell through to the generic
+ * stub and returned 0, which is why no physical button does anything even
+ * though the game polls it thousands of times a session and registers two
+ * s3eKeyboard callbacks.
+ *
+ * Mapping Switch buttons onto it needs the s3eKey codes this build actually
+ * uses, and guessing them wrong is indistinguishable from no mapping at all.
+ * So this reports which codes the game asks for; the mapping follows once the
+ * list is known. The state answered stays 0 meanwhile, exactly as before, so
+ * nothing changes behaviourally. */
+static uint32_t g_key_state[512];
+
+/* The codes this build polls, found by census: 5, 6, 99, 102. Rather than
+ * guess which s3eKey constants they are, each is driven by a face button so
+ * pressing one reveals what it does. Adjust once the semantics are known. */
+static const struct { u64 button; uint32_t key; const char *name; }
+g_key_map[] = {
+    /* The game is touch-driven -- the Vita port works from its front
+     * touchscreen alone -- so these are a convenience, not the main path.
+     * 5 proceeds and 126 goes back, observed; the rest are unidentified. */
+    { HidNpadButton_A,      5,   "A(confirm?)" },
+    { HidNpadButton_B,      126, "B(back?)"    },
+    { HidNpadButton_Up,     6,   "Up->6"       },
+    { HidNpadButton_Down,   99,  "Down->99"    },
+    { HidNpadButton_Left,   102, "Left->102"   },
+    { HidNpadButton_Right,  24,  "Right->24"   },
+};
+
+/* s3eKeyState: 0 up, 1 pressed this frame, 2 down, 3 released this frame --
+ * the same shape as the pointer states, which is the SDK's convention. */
+static void key_update(GuestMem *mem) {
+    static u64 prev;
+    u64 held;
+    unsigned i;
+    padUpdate(&g_pad);
+    held = padGetButtons(&g_pad);
+
+    /* ZL+ZR cycles the touch Y convention live. Four combinations, and which
+     * one is right is an empirical question about the game's two input layers
+     * -- far quicker to feel than to reason about, and this avoids a reflash
+     * or editing a file on the card for each try. ZL/ZR are deliberately not
+     * mapped to any s3eKey, so the combo cannot collide with game input. */
+    {
+        static u64 prev_combo;
+        u64 combo = held & (HidNpadButton_ZL | HidNpadButton_ZR);
+        int both = combo == (HidNpadButton_ZL | HidNpadButton_ZR);
+        int was_both = prev_combo == (HidNpadButton_ZL | HidNpadButton_ZR);
+        if (both && !was_both) {
+            g_flip_y = (g_flip_y + 1) & 3;
+            printf("  [key  ] flip mode -> %d (single=%d multi=%d)\n",
+                   g_flip_y, FLIP_SINGLE ? 1 : 0, FLIP_MULTI ? 1 : 0);
+        }
+        prev_combo = combo;
+    }
+
+    for (i = 0; i < sizeof g_key_map / sizeof g_key_map[0]; i++) {
+        uint32_t k = g_key_map[i].key;
+        int now = (held & g_key_map[i].button) != 0;
+        int was = (prev & g_key_map[i].button) != 0;
+        if (k >= 512)
+            continue;
+        g_key_state[k] = now ? (was ? 2u : 1u) : (was ? 3u : 0u);
+        if (now != was) {
+            /* s3eKeyboardEvent { m_Key, m_Pressed }, passed by address. The
+             * first version handed the callback the key code itself as its
+             * sysdata, so the game dereferenced address 5 and faulted. One
+             * buffer per mapped button, because the queue is not drained until
+             * s3eDeviceYield and two buttons can change in the same frame. */
+            static uint32_t ev[sizeof g_key_map / sizeof g_key_map[0]];
+            if (!ev[i])
+                ev[i] = galloc(8);
+            printf("  [key  ] %s %s -> s3eKey %u state %u\n",
+                   g_key_map[i].name, now ? "down" : "up", (unsigned)k,
+                   (unsigned)g_key_state[k]);
+            if (ev[i]) {
+                guest_st32(mem, ev[i] + 0, k);
+                guest_st32(mem, ev[i] + 4, (uint32_t)now);
+                cb_queue("s3eKeyboard", 0, ev[i]);
+            }
+        }
+    }
+    prev = held;
+    (void)mem;
+}
+
+/* The game calls this once a frame, which is the natural place to sample the
+ * pad -- the same contract s3ePointerUpdate has. */
+static void hle_key_update(GuestCpu *cpu, GuestMem *mem, void *user) {
+    (void)user;
+    key_update(mem);
+    cpu->r[0] = 0;
+}
+
+static void hle_key_getstate(GuestCpu *cpu, GuestMem *mem, void *user) {
+    uint32_t key = cpu->r[0];
+    (void)mem; (void)user;
+    {   /* Distinct codes only, and the first 40 of them. */
+        static uint16_t seen[40];
+        static int nseen;
+        int i;
+        for (i = 0; i < nseen; i++)
+            if (seen[i] == (uint16_t)key)
+                break;
+        if (i == nseen && nseen < 40 && key < 512) {
+            seen[nseen++] = (uint16_t)key;
+            printf("  [key  ] game polls s3eKey %u (0x%x)\n", (unsigned)key,
+                   (unsigned)key);
+        }
+    }
+    cpu->r[0] = (key < 512) ? g_key_state[key] : 0u;
+}
+
 /* void s3ePointerUpdate(void) -- verified: at its only call site (RVA
  * 0x0c6506) r0 is overwritten by `ldr r0,[r3]` immediately after, so the
  * return value is discarded. */
+/* Reconcile the touchscreen against the previous frame and emit the touch
+ * events the difference implies. Slots are held by finger id so a contact
+ * keeps its touchID for its whole life, which is what the game tracks a stick
+ * by -- reindexing them each frame would look like every finger lifting and
+ * new ones landing elsewhere. */
+static void touch_update(GuestMem *mem) {
+    HidTouchScreenState ts;
+    Touch now[MAX_TOUCH];
+    int i, j, n = 0;
+
+    memset(now, 0, sizeof now);
+    if (g_touch_ready && hidGetTouchScreenStates(&ts, 1)) {
+        for (i = 0; i < (int)ts.count && n < MAX_TOUCH; i++) {
+            /* Ignore anything outside the rendered viewport. Clamping instead
+             * turned a palm resting on the left letterbox into a permanent
+             * contact pinned to x=0 -- it took slot 0 and never lifted, so the
+             * game saw a virtual stick held at full deflection and every real
+             * finger afterwards came in as id=1. That reads as jammed
+             * controls, which is what "seems like a crash" was. */
+            if ((int)ts.touches[i].x < (int)VIEW_X ||
+                (int)ts.touches[i].x >= (int)(VIEW_X + VIEW_W))
+                continue;
+            now[n].active = 1;
+            now[n].fid = ts.touches[i].finger_id;
+            now[n].x = clampi(((int)ts.touches[i].x - (int)VIEW_X) *
+                              (int)SCREEN_W / (int)VIEW_W, 0,
+                              (int)SCREEN_W - 1);
+            now[n].y = clampi((int)ts.touches[i].y * (int)SCREEN_H / (int)FB_H,
+                              0, (int)SCREEN_H - 1);
+            if (FLIP_MULTI)
+                now[n].y = (int)SCREEN_H - 1 - now[n].y;
+            now[n].raw_x = (int)ts.touches[i].x;
+            now[n].raw_y = (int)ts.touches[i].y;
+            /* Drive the polled getters straight from the first in-viewport
+             * contact. Deriving them further downstream left them pinned at
+             * the startup centre -- the game polls s3ePointerGetX from RVA
+             * 08f567 and read a constant 240 for an entire session. Set them
+             * here, where the coordinate is known good, rather than behind a
+             * condition that has to hold. */
+            if (n == 0) {
+                g_tap_x = now[0].x;
+                g_tap_y = FLIP_SINGLE ? (int)SCREEN_H - 1 - now[0].y
+                                      : now[0].y;
+            }
+            n++;
+        }
+    }
+
+    /* Releases first: a slot whose finger id is no longer present. */
+    for (i = 0; i < MAX_TOUCH; i++) {
+        int still = 0;
+        if (!g_touch[i].active)
+            continue;
+        for (j = 0; j < n; j++)
+            if (now[j].fid == g_touch[i].fid)
+                still = 1;
+        if (!still) {
+            touch_fire(mem, i, 0);
+            g_touch[i].active = 0;
+        }
+    }
+
+    /* Then moves and presses, each finger keeping or claiming a slot. */
+    for (j = 0; j < n; j++) {
+        int slot = -1;
+        for (i = 0; i < MAX_TOUCH; i++)
+            if (g_touch[i].active && g_touch[i].fid == now[j].fid)
+                slot = i;
+        if (slot >= 0) {
+            if (now[j].x != g_touch[slot].x || now[j].y != g_touch[slot].y) {
+                g_touch[slot].x = now[j].x;
+                g_touch[slot].y = now[j].y;
+                touch_motion_fire(mem, slot);
+            }
+            continue;
+        }
+        for (i = 0; i < MAX_TOUCH && slot < 0; i++)
+            if (!g_touch[i].active)
+                slot = i;
+        if (slot < 0)
+            continue;                   /* more fingers than slots; ignore */
+        g_touch[slot] = now[j];
+        touch_fire(mem, slot, 1);
+    }
+}
+
 static void hle_ptr_update(GuestCpu *cpu, GuestMem *mem, void *user) {
     static int last_motion_x = -1, last_motion_y = -1;
     int x = 0, y = 0, down;
     (void)user;
 
     down = input_poll(&x, &y);
+    touch_update(mem);
+    /* The polled getters must agree with the tracked contacts. input_poll only
+     * looks at ts.touches[0] and gives up if that contact is outside the
+     * viewport, so a palm on the bezel taking that index left g_tap_x/y frozen
+     * at the startup centre -- and the game polls s3ePointerGetX from RVA
+     * 08f567 for its hit-testing, so every menu tap was tested against (240,
+     * 160) no matter where the finger was. touch_update scans every contact
+     * and already filters the letterbox, so prefer what it tracked. */
+    if (g_touch[0].active) {
+        x = g_touch[0].x;
+        y = g_touch[0].y;
+        down = 1;
+    }
     if (down || g_real_down) {
         g_tap_x = x;
         g_tap_y = y;
@@ -1277,9 +1640,45 @@ static void hle_ptr_getstate(GuestCpu *cpu, GuestMem *mem, void *user) {
     cpu->r[0] = (cpu->r[0] == 0) ? (uint32_t)g_ptr_state : (uint32_t)S3E_PTR_UP;
 }
 
+/* s3ePointerGetX() takes no argument; s3ePointerGetTouchX(touchID) does, and
+ * both were bound here, so every finger read back as the primary one. The
+ * touch forms are split out below. */
+/* Which position the game actually reads is the open question: it can take one
+ * from the callback event struct, or poll these. Flipping the callback
+ * coordinates changed nothing, which is what it would look like if the menus
+ * poll instead. Log what these hand back, and from where. */
+static void ptr_read_log(const char *what, uint32_t v, uint32_t lr) {
+    static int shown;
+    if (shown < 60) {
+        shown++;
+        printf("  [read ] %s -> %u  (caller RVA %06x)\n", what, (unsigned)v,
+               (unsigned)lr);
+    }
+}
+
 static void hle_ptr_getx(GuestCpu *cpu, GuestMem *mem, void *user) {
     (void)mem; (void)user;
     cpu->r[0] = (uint32_t)g_tap_x;
+    ptr_read_log("GetX", cpu->r[0], cpu->r[GUEST_LR] - g_img.load_base);
+}
+static void hle_ptr_gettouchx(GuestCpu *cpu, GuestMem *mem, void *user) {
+    uint32_t id = cpu->r[0];
+    (void)mem; (void)user;
+    cpu->r[0] = (id < MAX_TOUCH && g_touch[id].active)
+                    ? (uint32_t)g_touch[id].x : (uint32_t)g_tap_x;
+    ptr_read_log("GetTouchX", cpu->r[0], cpu->r[GUEST_LR] - g_img.load_base);
+}
+static void hle_ptr_gettouchy(GuestCpu *cpu, GuestMem *mem, void *user) {
+    uint32_t id = cpu->r[0];
+    (void)mem; (void)user;
+    cpu->r[0] = (id < MAX_TOUCH && g_touch[id].active)
+                    ? (uint32_t)g_touch[id].y : (uint32_t)g_tap_y;
+}
+static void hle_ptr_gettouchstate(GuestCpu *cpu, GuestMem *mem, void *user) {
+    uint32_t id = cpu->r[0];
+    (void)mem; (void)user;
+    cpu->r[0] = (id < MAX_TOUCH && g_touch[id].active)
+                    ? (uint32_t)S3E_PTR_DOWN : (uint32_t)S3E_PTR_UP;
 }
 
 static void hle_ptr_gety(GuestCpu *cpu, GuestMem *mem, void *user) {
@@ -1301,7 +1700,10 @@ static void hle_ptr_getint(GuestCpu *cpu, GuestMem *mem, void *user) {
     case 0:  v = 1; break;              /* AVAILABLE */
     case 2:  v = 2; break;              /* TYPE = STYLUS (touchscreen) */
     case 3:  v = 2; break;              /* STYLUS_TYPE = FINGER */
-    case 4:  v = 0; break;              /* MULTI_TOUCH_AVAILABLE = no */
+    /* Saying no here is what left the game with no in-game controls: it then
+     * registers only the single-touch callbacks and its dual-stick scheme has
+     * nothing to drive it. The Switch touchscreen reports up to 16 contacts. */
+    case 4:  v = 1; break;              /* MULTI_TOUCH_AVAILABLE = yes */
     default: v = 0; break;
     }
     if (prop < 32 && !(seen & (1u << prop))) {
@@ -2142,13 +2544,22 @@ static void bind_slot(uint32_t i, const char *nm) {
         g_slots[i].fn = hle_device_yield;
     else if (!strcmp(nm, "s3ePointerUpdate"))
         g_slots[i].fn = hle_ptr_update;
-    else if (!strcmp(nm, "s3ePointerGetState") ||
-             !strcmp(nm, "s3ePointerGetTouchState"))
+    else if (!strcmp(nm, "s3ePointerGetTouchX"))
+        g_slots[i].fn = hle_ptr_gettouchx;
+    else if (!strcmp(nm, "s3ePointerGetTouchY"))
+        g_slots[i].fn = hle_ptr_gettouchy;
+    else if (!strcmp(nm, "s3ePointerGetTouchState"))
+        g_slots[i].fn = hle_ptr_gettouchstate;
+    else if (!strcmp(nm, "s3ePointerGetState"))
         g_slots[i].fn = hle_ptr_getstate;
-    else if (!strcmp(nm, "s3ePointerGetX") || !strcmp(nm, "s3ePointerGetTouchX"))
+    else if (!strcmp(nm, "s3ePointerGetX"))
         g_slots[i].fn = hle_ptr_getx;
-    else if (!strcmp(nm, "s3ePointerGetY") || !strcmp(nm, "s3ePointerGetTouchY"))
+    else if (!strcmp(nm, "s3ePointerGetY"))
         g_slots[i].fn = hle_ptr_gety;
+    else if (!strcmp(nm, "s3eKeyboardGetState"))
+        g_slots[i].fn = hle_key_getstate;
+    else if (!strcmp(nm, "s3eKeyboardUpdate"))
+        g_slots[i].fn = hle_key_update;
     else if (!strcmp(nm, "s3ePointerGetInt"))
         g_slots[i].fn = hle_ptr_getint;
     else if (ends_with(nm, "UnRegister"))
@@ -2332,6 +2743,22 @@ static void run(void) {
             break;
         }
         printf("heap: recycle freed blocks = %d\n", g_recycle_freed);
+    }
+    {   /* Touch Y origin, same shape of switch. */
+        static const char *paths[] = {"sdmc:/switch/boz/flipy.txt",
+                                      "sdmc:/flipy.txt"};
+        unsigned k;
+        for (k = 0; k < 2; k++) {
+            FILE *f = fopen(paths[k], "rb");
+            char c = 0;
+            if (!f)
+                continue;
+            if (fread(&c, 1, 1, f) == 1 && (c == '0' || c == '1'))
+                g_flip_y = (c == '1');
+            fclose(f);
+            break;
+        }
+        printf("input: flip touch Y = %d\n", g_flip_y);
     }
     startup_stage_write("04 VFS and GL allocator ready");
 
