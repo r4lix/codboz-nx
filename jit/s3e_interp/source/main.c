@@ -6,6 +6,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <string.h>
 #include <math.h>
 #include <float.h>
@@ -24,9 +25,29 @@
 #include "gl_thunks.h"
 #endif
 
-#define STACK_BASE 0x20000000u
+/* Compact guest address space, so every region fits one alias window.
+ *
+ * These addresses were spread across 1.86 GB for no reason beyond being easy
+ * to read: image at 0x4a000000, stack at 0x20000000, surface at 0x40000000,
+ * heap at 0x60000000. The regions themselves total only ~343 MB. That spread
+ * is what makes fastmem impossible here -- svcMapMemory's destination must sit
+ * in the alias region, and probing this process found 512 MB available and
+ * nothing larger, so the window has to span the whole guest address space and
+ * 1.86 GB will never fit.
+ *
+ * Packed, the top of the heap lands at 0x18000000 (384 MB) and the whole guest
+ * address space fits with room. Nothing depended on the old values: they are
+ * used only through these defines, the image is position-independent and
+ * relocated at load, and every durable reference in this project -- hook
+ * addresses, the profiler, the disassembly mapping -- is an RVA computed from
+ * load_base, so all of it follows automatically.
+ *
+ * The bottom 8 MB is deliberately left unmapped so a null guest pointer still
+ * lands on nothing. */
+#define IMAGE_BASE 0x00800000u      /* ~4.8 MB image */
+#define STACK_BASE 0x01000000u
 #define STACK_SIZE (1u << 20)
-#define HEAP_BASE  0x60000000u
+#define HEAP_BASE  0x04000000u      /* 320 MB -> top 0x18000000 */
 #include "boz_build_id.h"   /* generated: hash of the sources in this build */
 /* No __DATE__/__TIME__ here on purpose -- they record when THIS file was
  * compiled, which is not when the binary was built, and the difference is
@@ -1433,7 +1454,7 @@ static PadState g_pad;
 static int g_quit;
 static int g_saw_real_input;         /* once true, the synthetic tap stands down */
 
-#define SURF_BASE    0x40000000u
+#define SURF_BASE    0x01800000u   /* ~16.3 MB, room to 0x04000000 */
 #define SCREEN_W     480u
 #define SCREEN_H     320u
 #define SURF_BPP     2u
@@ -3193,6 +3214,132 @@ static uint32_t fnv1a32(const unsigned char *p, size_t n) {
     return h;
 }
 
+static int g_want_fastmem;
+static VirtmemReservation *g_fastmem_rv;
+
+/* Page-aligned, zeroed. svcMapMemory requires page-aligned source, destination
+ * and length, so every guest region has to start on a page and occupy whole
+ * pages whether or not fastmem is switched on. */
+static uint8_t *page_alloc(size_t n) {
+    size_t sz = (n + 0xFFFu) & ~(size_t)0xFFFu;
+    void *p = memalign(0x1000, sz);
+    if (!p)
+        return NULL;
+    memset(p, 0, sz);
+    return (uint8_t *)p;
+}
+
+/* Reserve 4 GB of address space and alias each guest region into it at its own
+ * guest address. After this, translating a guest pointer is fast_base + addr
+ * with no test of any kind: the guest address is 32 bits, so it cannot leave
+ * the window.
+ *
+ * Horizon gives 39 bits of user address space, so a 4 GB reservation is
+ * affordable; only the ~343 MB actually backed is mapped, and the holes stay
+ * unmapped so a stray access faults rather than silently reading a neighbour.
+ * Failure at any step leaves fast_base NULL and the region path is used. */
+static void fastmem_setup(GuestMem *m) {
+    /* virtmemFindStack, not virtmemFindAslr. svcMapMemory requires its
+     * destination in the ALIAS region; general-purpose address space is
+     * refused with kernel error 110, InvalidMemoryRegion -- which is exactly
+     * what the first attempt got back.
+     *
+     * 4 GB is preferred: then every 32-bit guest address lands inside the
+     * reservation and an unmapped one faults on a hole rather than on
+     * whatever happens to live past the end. 2 GB still covers everything
+     * backed (heap top is 0x74000000); the stub page at 0xF0000000 is only
+     * ever a PC and guest_is_stub short-circuits before any fetch. */
+    /* Probe downwards and report, because "no window" on its own does not
+     * say whether the alias region is small, fragmented, or unavailable --
+     * and the answer decides whether fastmem needs the guest address space
+     * compacted to fit. */
+    static const uint64_t want[] = {
+        0x100000000ull, 0x80000000ull, 0x40000000ull, 0x20000000ull,
+        0x10000000ull, 0x08000000ull, 0x04000000ull };
+    void *base = NULL;
+    uint64_t win = 0;
+    unsigned t;
+    int i, mapped = 0;
+    for (t = 0; t < sizeof want / sizeof *want && !base; t++) {
+        virtmemLock();
+        base = virtmemFindStack(want[t], 0x1000);
+        if (base) {
+            g_fastmem_rv = virtmemAddReservation(base, want[t]);
+            if (g_fastmem_rv) win = want[t]; else base = NULL;
+        }
+        virtmemUnlock();
+        if (!base)
+            printf("fastmem: %u MB alias window unavailable\n",
+                   (unsigned)(want[t] >> 20));
+    }
+    if (!base) {
+        printf("fastmem: no alias window available\n");
+        return;
+    }
+    for (i = 0; i < m->count; i++) {
+        const GuestRegion *r = &m->region[i];
+        uint32_t size = (r->size + 0xFFFu) & ~0xFFFu;
+        Result rc;
+        if ((uint64_t)r->base + size > win) {
+            printf("fastmem: region %08x past the %u MB window\n",
+                   (unsigned)r->base, (unsigned)(win >> 20));
+            break;
+        }
+        rc = svcMapMemory((void *)(uintptr_t)((uint64_t)(uintptr_t)base + r->base),
+                          r->host, size);
+        if (R_FAILED(rc)) {
+            printf("fastmem: map %08x (%u KB) failed %08x\n",
+                   (unsigned)r->base, (unsigned)(size >> 10), rc);
+            break;
+        }
+        mapped++;
+    }
+    if (mapped != m->count) {
+        while (--mapped >= 0) {
+            const GuestRegion *u = &m->region[mapped];
+            svcUnmapMemory((void *)(uintptr_t)((uint64_t)(uintptr_t)base + u->base),
+                           u->host, (u->size + 0xFFFu) & ~0xFFFu);
+        }
+        virtmemLock();
+        virtmemRemoveReservation(g_fastmem_rv);
+        virtmemUnlock();
+        g_fastmem_rv = NULL;
+        return;
+    }
+    /* Repoint everything at the alias, because the source is now gone.
+     *
+     * svcMapMemory does not merely add a second view: it takes the source
+     * pages away, leaving them with no permissions -- which is precisely how
+     * libnx builds thread stacks, allocating, mapping, then using the mapped
+     * address and never the original. So g_heap, g_surf, g_stack and the image
+     * became dead pointers the instant the maps succeeded, and main.c reads all
+     * four directly. The slot tables cache host pointers too, so they have to
+     * be rebuilt from the new region hosts. */
+    for (i = 0; i < m->count; i++)
+        m->region[i].host = (uint8_t *)base + m->region[i].base;
+    guest_slots_build(m);
+    /* One unsigned compare covers both ends: anything below the lowest mapped
+     * address wraps to a huge value and fails the same test that catches
+     * anything above the top. That is what restores NULL for the near-null
+     * pointers the HLE layer passes in -- s3eDebugAssertShow was called with
+     * r0 = 2, which sat inside the window and below every region. */
+    {
+        uint32_t lo = 0xFFFFFFFFu, hi = 0;
+        for (i = 0; i < m->count; i++) {
+            uint32_t rb = m->region[i].base;
+            uint32_t rt = rb + ((m->region[i].size + 0xFFFu) & ~0xFFFu);
+            if (rb < lo) lo = rb;
+            if (rt > hi) hi = rt;
+        }
+        m->fast_lo = lo;
+        m->fast_span = hi - lo;
+        printf("fastmem span %08x..%08x\n", lo, hi);
+    }
+    m->fast_base = (uint8_t *)base;
+    printf("fastmem on: %d regions in a %u MB window at %p\n",
+           m->count, (unsigned)(win >> 20), base);
+}
+
 static void run(void) {
     static const char *paths[] = {"sdmc:/switch/boz/boz.s3e.unpacked",
                                   "sdmc:/boz.s3e.unpacked"};
@@ -3222,7 +3369,7 @@ static void run(void) {
             return;
         }
     }
-    if (s3e_load(file, size, 0, &g_img) != 0) {
+    if (s3e_load(file, size, IMAGE_BASE, &g_img) != 0) {
         printf("s3e_load failed: %s\n", s3e_error());
         return;
     }
@@ -3363,18 +3510,65 @@ static void run(void) {
     }
     startup_stage_write("04 VFS and GL allocator ready");
 
-    g_stack = calloc(1, STACK_SIZE);
-    g_heap = calloc(1, HEAP_SIZE);
-    g_surf = calloc(1, SURF_BYTES);
+    /* Page-aligned so svcMapMemory can alias them into the fastmem window;
+     * the kernel requires page-aligned source, destination and size. Harmless
+     * when fastmem is off. */
+    g_stack = page_alloc(STACK_SIZE);
+    g_heap = page_alloc(HEAP_SIZE);
+    g_surf = page_alloc(SURF_BYTES);
     if (!g_stack || !g_heap || !g_surf) {
         printf("out of memory\n");
         return;
     }
     startup_stage_write("05 guest buffers allocated");
+    {   /* Fastmem: alias every guest region at fast_base + guest_addr, so a
+         * translation becomes one add rather than a chain of dependent loads
+         * through the region table. The guest address space is 32 bits, so a
+         * 4 GB window covers it exactly and no bounds test is needed at all.
+         *
+         * Opt-in behind fastmem.txt, because it changes what an unmapped guest
+         * access does: today guest_ptr returns NULL and the interpreter faults
+         * with an address and a PC history, and under fastmem the process
+         * takes a data abort instead. Bad accesses have been a recurring bug
+         * class here, so the safe path stays one file away.
+         *
+         * Any failure leaves fast_base NULL and everything falls back. */
+        static const char *fm_paths[] = {
+            "sdmc:/switch/boz/fastmem.txt", "sdmc:/fastmem.txt" };
+        int want_fm = 0, k;
+        for (k = 0; k < 2; k++) {
+            FILE *f = fopen(fm_paths[k], "rb");
+            if (f) { fclose(f); want_fm = 1; }
+        }
+        if (want_fm) {
+            /* The loader callocs the image, so it is not page aligned; copy it
+             * into an aligned buffer now that relocations have been applied. */
+            uint32_t ialloc = (g_img.image_alloc + 0xFFFu) & ~0xFFFu;
+            uint8_t *ia = page_alloc(ialloc);
+            if (ia) {
+                memcpy(ia, g_img.image, g_img.image_alloc);
+                free(g_img.image);
+                g_img.image = ia;
+                g_img.image_alloc = ialloc;
+            }
+            g_want_fastmem = 1;
+        } else {
+            printf("fastmem off\n");
+        }
+    }
     guest_mem_add(&g.mem, g_img.load_base, g_img.image_alloc, g_img.image, 1);
     guest_mem_add(&g.mem, STACK_BASE, STACK_SIZE, g_stack, 1);
     guest_mem_add(&g.mem, HEAP_BASE, HEAP_SIZE, g_heap, 1);
     guest_mem_add(&g.mem, SURF_BASE, SURF_BYTES, g_surf, 1);
+    if (g_want_fastmem) {
+        fastmem_setup(&g.mem);   /* after the regions exist, not before */
+        if (g.mem.fast_base) {
+            g_img.image = g.mem.fast_base + IMAGE_BASE;
+            g_stack     = g.mem.fast_base + STACK_BASE;
+            g_heap      = g.mem.fast_base + HEAP_BASE;
+            g_surf      = g.mem.fast_base + SURF_BASE;
+        }
+    }
     startup_stage_write("06 guest memory mapped");
 
     n = g_img.got_count < 511 ? g_img.got_count : 511;

@@ -162,6 +162,25 @@ typedef struct {
      * every access onto different cache lines. */
     struct GuestSlot *rslot;
     struct GuestSlot *wslot;
+    /* Fastmem window: every guest region aliased at fast_base + guest_addr, so
+     * a translation is one add instead of a chain of dependent loads through
+     * the region table. NULL when the mapping could not be set up, in which
+     * case everything below falls back to the region path unchanged.
+     *
+     * The cost is that an unmapped guest address faults the process instead of
+     * returning NULL, so guest_ptr can no longer report a fault gracefully.
+     * That is why it is opt-in. */
+    uint8_t *fast_base;
+    /* Size of the aliased window. Guest addresses at or above it are NOT in
+     * the window and must go the slow way, or the NULL contract that every HLE
+     * handler relies on is silently broken: they pass a register straight to
+     * guest_ptr and test the result, and registers hold garbage all the time
+     * (s3eAccelerometerGetInt was called with r1 = 0xffffefb1). Without this,
+     * that becomes a wild pointer 4 GB above the window instead of a NULL, and
+     * the process dies with no diagnostic. The stub page at 0xF0000000 is
+     * outside every achievable window too. */
+    uint32_t fast_lo;           /* lowest mapped guest address */
+    uint32_t fast_span;         /* mapped extent above fast_lo */
 } GuestMem;
 
 /* Guest address >> GUEST_SLOT_SHIFT -> the region owning that slot.
@@ -222,6 +241,8 @@ void *guest_ifetch_slow(const GuestMem *m, uint32_t addr, uint32_t len);
  * real call plus a scan from region 0 -- to reach, nearly every time, the same
  * region as the access before it. */
 static inline void *guest_ptr(const GuestMem *m, uint32_t addr, uint32_t len) {
+    if (m->fast_base && (uint32_t)(addr - m->fast_lo) < m->fast_span)
+        return m->fast_base + addr;
     const GuestRegion *r = &m->region[m->cache];
     uint32_t off = addr - r->base;
     if (off < r->size && len <= r->size - off)
@@ -246,6 +267,8 @@ static inline void *guest_wptr(GuestMem *m, uint32_t addr, uint32_t len) {
     }
     if (m->undo_active)
         guest_undo_record(m, addr, len);
+    if (m->fast_base && (uint32_t)(addr - m->fast_lo) < m->fast_span)
+        return m->fast_base + addr;
     if (r->writable && off < r->size && len <= r->size - off)
         return r->host + off;
     return guest_wptr_slow(m, addr, len);
@@ -255,6 +278,8 @@ static inline void *guest_wptr(GuestMem *m, uint32_t addr, uint32_t len) {
  * entry; see the comment on GuestMem::icache for why that separation matters. */
 static inline const void *guest_ifetch_ptr(const GuestMem *m, uint32_t addr,
                                            uint32_t len) {
+    if (m->fast_base && (uint32_t)(addr - m->fast_lo) < m->fast_span)
+        return m->fast_base + addr;
     const GuestRegion *r = &m->region[m->icache];
     uint32_t off = addr - r->base;
     if (off < r->size && len <= r->size - off)
