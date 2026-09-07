@@ -22,18 +22,17 @@ int guest_mem_add(GuestMem *m, uint32_t base, uint32_t size, uint8_t *host,
      * guest_ptr never reaches them while it keeps hitting region[cache] -- so
      * a run where every access happened to land in region 0 would leave these
      * at zero. The interpreter would not care, since it reads region[cache]
-     * itself, but JIT code reads these: cache_host NULL would make it load
-     * through a null base, and cache_size zero would make the bounds test
-     * underflow and admit the access rather than reject it. */
+     * itself. JIT code used to read these and now uses the slot tables, but
+     * they are still initialised here: a null host and a zero size are a trap
+     * worth not leaving armed for whatever reads them next. */
     if (m->count == 1) {
         m->cache_base = base;
         m->cache_size = size;
         m->cache_host = host;
         m->cache_writable = (uint32_t)writable;
     }
-    /* Point the write entry at the first writable region there is, so JIT
-     * store code never sees a null host or a zero size -- a zero size makes
-     * its bounds test underflow and admit the access instead of rejecting it. */
+    /* Point the write entry at the first writable region there is, for the
+     * same reason. */
     if (writable && !m->wcache_host) {
         m->wcache = m->count - 1;
         m->wcache_base = base;
@@ -41,7 +40,51 @@ int guest_mem_add(GuestMem *m, uint32_t base, uint32_t size, uint8_t *host,
         m->wcache_host = host;
     }
     m->undo_log = guest_undo_log;
+    guest_slots_build(m);
     return 0;
+}
+
+GuestSlot guest_rslot[GUEST_SLOT_COUNT];
+GuestSlot guest_wslot[GUEST_SLOT_COUNT];
+
+/* Rebuild both slot tables from scratch. Called on every guest_mem_add, which
+ * happens four times at startup and never again, so simplicity beats being
+ * incremental.
+ *
+ * A region claims a slot only when it covers that slot's first byte. The
+ * alternative -- claiming any slot the region touches -- would let a region
+ * starting mid-slot be selected for an address BELOW its base, and `addr -
+ * base` would then wrap to a huge offset. That rejects correctly for almost
+ * every such address, but for the three bytes immediately below base it wraps
+ * back through zero into a small offset that passes the bounds test, and the
+ * access would read from the wrong place. Leaving that leading partial slot
+ * empty costs nothing here (all four regions are 16 MB aligned) and keeps the
+ * emitted test to a single unsigned compare. */
+void guest_slots_build(GuestMem *m) {
+    uint32_t s;
+    int i;
+    memset(guest_rslot, 0, sizeof guest_rslot);
+    memset(guest_wslot, 0, sizeof guest_wslot);
+    for (s = 0; s < GUEST_SLOT_COUNT; s++) {
+        uint64_t slot_start = (uint64_t)s << GUEST_SLOT_SHIFT;
+        for (i = 0; i < m->count; i++) {
+            const GuestRegion *r = &m->region[i];
+            uint64_t end = (uint64_t)r->base + r->size;
+            if ((uint64_t)r->base > slot_start || end <= slot_start)
+                continue;       /* does not cover this slot's first byte */
+            guest_rslot[s].base = r->base;
+            guest_rslot[s].size = r->size;
+            guest_rslot[s].host = r->host;
+            if (r->writable) {
+                guest_wslot[s].base = r->base;
+                guest_wslot[s].size = r->size;
+                guest_wslot[s].host = r->host;
+            }
+            break;              /* regions never overlap */
+        }
+    }
+    m->rslot = guest_rslot;
+    m->wslot = guest_wslot;
 }
 
 /* Regions never overlap, so the first containing region is the only one. A

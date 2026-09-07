@@ -27,7 +27,11 @@
 #define STACK_BASE 0x20000000u
 #define STACK_SIZE (1u << 20)
 #define HEAP_BASE  0x60000000u
-#define BOZ_BUILD_LABEL "jit-r82 " __DATE__ " " __TIME__
+#include "boz_build_id.h"   /* generated: hash of the sources in this build */
+/* No __DATE__/__TIME__ here on purpose -- they record when THIS file was
+ * compiled, which is not when the binary was built, and the difference is
+ * exactly what made a working fix look like a failed copy. */
+#define BOZ_BUILD_LABEL "jit-r82-" BOZ_BUILD_ID
 /* The allocator is a pure bump allocator and free() reclaims nothing, so
  * exhaustion is self-inflicted and the game does not NULL-check malloc -- it
  * runs a C++ constructor on the result and faults writing the vtable. The
@@ -2685,8 +2689,9 @@ static void jit_report(void) {
            (unsigned long long)(g.jit_executed / 1000000ull),
            (unsigned long long)g.jit_verify_blocks,
            (unsigned)g.jit_diverged);
-    printf("  [jit  ] %llu bails, %llu insns lost to them\n",
+    printf("  [jit  ] %llu bails (%llu retiring nothing), %llu insns lost to them\n",
            (unsigned long long)g.jit_bails,
+           (unsigned long long)g.jit_bails_empty,
            (unsigned long long)g.jit_bail_lost);
     guest_jit_report_blockers(&g);
 }
@@ -3169,23 +3174,37 @@ static void run(void) {
             "sdmc:/switch/boz/jit.txt", "sdmc:/jit.txt" };
         static const char *ver_paths[] = {
             "sdmc:/switch/boz/jitverify.txt", "sdmc:/jitverify.txt" };
-        int want_jit = 0, want_ver = 0, k;
+        /* Chaining is separate from the JIT and from its self-check, because
+         * it is the one thing the self-check cannot cover: verification
+         * re-runs a single block through the interpreter, and a chain is by
+         * definition not a single block. So it gets its own switch, and it is
+         * forced off whenever verification is on. */
+        static const char *chain_paths[] = {
+            "sdmc:/switch/boz/chain.txt", "sdmc:/chain.txt" };
+        int want_jit = 0, want_ver = 0, want_chain = 0, k;
         for (k = 0; k < 2; k++) {
             FILE *f = fopen(jit_paths[k], "rb");
             if (f) { fclose(f); want_jit = 1; }
             f = fopen(ver_paths[k], "rb");
             if (f) { fclose(f); want_ver = 1; }
+            f = fopen(chain_paths[k], "rb");
+            if (f) { fclose(f); want_chain = 1; }
         }
         if (want_ver)
             want_jit = 1;
+        if (want_chain)
+            want_jit = 1;
         if (want_jit && guest_jit_init(&g)) {
             g.jit_verify = want_ver;
+            g.jit_chain = want_chain && !want_ver;
             /* undo_active is NOT armed here: guest_run turns it on around the
              * block being checked and off again immediately. Left on globally
              * it logs every interpreter store too, and the rollback then undoes
              * ordinary execution. */
-            printf("jit: enabled%s\n",
-                   want_ver ? ", self-verifying (slow)" : "");
+            printf("jit: enabled%s%s\n",
+                   want_ver ? ", self-verifying (slow)" : "",
+                   g.jit_chain ? ", chaining" :
+                   (want_chain ? ", chaining suppressed by verify" : ""));
         } else if (want_jit) {
             printf("jit: requested but guest_jit_init failed\n");
         }

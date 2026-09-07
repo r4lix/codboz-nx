@@ -172,6 +172,30 @@ ifneq ($(ROMFS),)
 	export NROFLAGS += --romfsdir=$(CURDIR)/$(ROMFS)
 endif
 
+#---------------------------------------------------------------------------------
+# Build identity.
+#
+# The banner was "jit-r82 " __DATE__ " " __TIME__, and those two macros expand
+# when main.c is COMPILED -- not when the binary is linked. Change jit.c alone
+# and main.o is not rebuilt, so the banner keeps reporting the moment main.o
+# was built and two binaries that behave differently announce themselves with
+# the same string. That is not a cosmetic problem: it cost three restarts spent
+# believing a fix had failed to reach the card when it had been running all
+# along, and the wrong conclusion was drawn from the one field that looked
+# authoritative.
+#
+# The identity is now a hash of the sources that actually go into the binary.
+# It changes when the code changes and not otherwise, so the same sources
+# always produce the same string and any difference in the string is a real
+# difference in the build.
+#---------------------------------------------------------------------------------
+BOZ_ID_SRCS := $(sort $(foreach dir,$(SOURCES) $(INCLUDES),$(wildcard $(dir)/*.c $(dir)/*.h)))
+BOZ_BUILD_ID := $(shell cat $(BOZ_ID_SRCS) 2>/dev/null | md5sum 2>/dev/null | cut -c1-8)
+ifeq ($(strip $(BOZ_BUILD_ID)),)
+BOZ_BUILD_ID := nohash
+endif
+BOZ_ID_HDR := $(BUILD)/boz_build_id.h
+
 .PHONY: $(BUILD) clean all
 
 #---------------------------------------------------------------------------------
@@ -179,6 +203,9 @@ all: $(BUILD)
 
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
+	@echo '#define BOZ_BUILD_ID "$(BOZ_BUILD_ID)"' > $(BOZ_ID_HDR).tmp
+	@cmp -s $(BOZ_ID_HDR).tmp $(BOZ_ID_HDR) 2>/dev/null || mv -f $(BOZ_ID_HDR).tmp $(BOZ_ID_HDR)
+	@rm -f $(BOZ_ID_HDR).tmp
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
 #---------------------------------------------------------------------------------

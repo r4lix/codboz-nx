@@ -35,19 +35,32 @@ void guest_jit_report_blockers(Guest *g) { (void)g; }
 extern volatile uint32_t g_native_stage;
 
 #define JIT_CODE_SIZE   (8u << 20)
-#define JIT_CACHE_SLOTS 32768u
+/* 65536, not 32768. With the hotness filter below, occupancy is the hot
+ * working set rather than every PC ever executed -- measured at 28827 entries
+ * over a five-billion-instruction host run. That is 88% of a 32768-slot table,
+ * and a 16-probe walk starts failing well before a table is actually full, so
+ * the count is doubled to leave the probe chains short. */
+#define JIT_CACHE_SLOTS 65536u
 #define JIT_HOT_COUNT   3u
+/* Tagged, direct-mapped hotness counters. 16384 entries x 4 bytes = 64 KB. */
+#define JIT_HOT_SLOTS   16384u
 #define JIT_MAX_GUEST   48u
-#define JIT_MAX_A64     768u
+/* 1536, not 768. The slot-table resolve is about sixteen words where the
+ * single-region check was eight, so a block of 48 guest instructions with a
+ * memory access in most of them no longer fits. The loop guards below stop
+ * cleanly when the buffer fills, but a block cut short for want of space is
+ * one the JIT stops early in for no architectural reason. 6 KB of stack in
+ * compile_block is cheaper than losing block length. */
+#define JIT_MAX_A64     1536u
 
 typedef uint32_t (*JitBlockFn)(Guest *g);
+typedef uint32_t (*JitEnterFn)(Guest *g, void *blk, uint32_t budget);
 
 typedef struct {
     uint32_t key;               /* PC | Thumb bit */
     uint32_t rx_off;
     uint16_t count;
-    uint8_t  state;             /* 0 empty, 1 counting, 2 compiled, 3 reject */
-    uint8_t  hits;
+    uint8_t  state;             /* 0 empty, 1 claimed, 2 compiled, 3 reject */
     /* Why this block is not longer, and how much that costs.
      *
      * Blocks average 1.6 guest instructions, which is too short for the JIT to
@@ -59,13 +72,38 @@ typedef struct {
     uint32_t execs;
     uint32_t end_insn;          /* 0 when the block ended on its own terms */
     uint8_t  end_thumb;
+    /* Direct link to the successor block.
+     *
+     * A block that leaves on a known constant PC ends with a branch slot that
+     * initially falls through to its RET. Once the dispatcher has actually
+     * seen this block hand over to that successor, and the successor is
+     * compiled, the slot is patched to jump straight there -- no return to C,
+     * no hash lookup, no re-entry. link_word is the word index of the slot
+     * within the code cache, link_key the successor's PC|thumb. */
+    uint32_t link_word;         /* 0 = block has no link slot */
+    uint32_t link_key;
+    uint8_t  linked;
 } JitEntry;
+
+/* One hotness counter. No PC is stored -- a 16-bit tag taken from bits of the
+ * hash that the index does not use is enough to tell two PCs apart cheaply,
+ * and a tag collision costs at worst one wasted block-table slot. */
+typedef struct {
+    uint16_t tag;
+    uint8_t  hits;
+    uint8_t  pad;
+} JitCount;
 
 typedef struct {
     Jit code;
     uint8_t *rw, *rx;
     uint32_t used;
     JitEntry *entry;
+    JitCount *count;
+    uint32_t enter_off;         /* trampoline that owns w19/w20 */
+    JitEntry *last;             /* block executed on the previous dispatch */
+    int chain;                  /* linking enabled for this run */
+    uint32_t links;             /* chain edges installed */
     int ready;
     int probe_only;             /* stage-one hardware validation gate */
 } JitContext;
@@ -73,6 +111,8 @@ typedef struct {
 typedef struct {
     uint32_t code[JIT_MAX_A64];
     uint32_t n;
+    uint32_t link_word;         /* index of the chain branch, 0 if none */
+    uint32_t link_key;          /* successor PC|thumb */
 } A64;
 
 static void emit(A64 *a, uint32_t insn) {
@@ -85,6 +125,14 @@ static void emit(A64 *a, uint32_t insn) {
  * leaf block and requires no prologue or ABI spills. */
 static void e_ldr_w(A64 *a, unsigned rt, unsigned byte_off) {
     emit(a, 0xB9400000u | ((byte_off >> 2) << 10) | (0u << 5) | rt);
+}
+/* LDR Wt,[Xn,#off] and LDR Xt,[Xn,#off] -- the existing pair is hardwired to
+ * x0, and the slot table is reached through a pointer in another register. */
+static void e_ldr_off(A64 *a, unsigned rt, unsigned rn, unsigned byte_off) {
+    emit(a, 0xB9400000u | ((byte_off >> 2) << 10) | (rn << 5) | rt);
+}
+static void e_ldr64_off(A64 *a, unsigned rt, unsigned rn, unsigned byte_off) {
+    emit(a, 0xF9400000u | ((byte_off >> 3) << 10) | (rn << 5) | rt);
 }
 static void e_str_w(A64 *a, unsigned rt, unsigned byte_off) {
     emit(a, 0xB9000000u | ((byte_off >> 2) << 10) | (0u << 5) | rt);
@@ -127,7 +175,32 @@ static void e_set_nz(A64 *a, unsigned wr) {
 }
 
 static void e_return(A64 *a, uint32_t retired) {
-    e_mov32(a, 0, retired);
+    emit(a, 0x11000000u | ((retired & 0xFFFu) << 10) | (19u << 5) | 19u);
+                                                   /* ADD w19,w19,#retired */
+    emit(a, 0xD65F03C0u);                          /* RET */
+}
+
+/* Leave the block at a PC known while compiling, with a slot to chain from.
+ *
+ * The slot starts as a branch to the RET immediately after it, so an unlinked
+ * block behaves exactly as e_return did. Patching that one word to point at
+ * the successor's entry turns the return, the C-side hash lookup and the
+ * re-entry into a single branch -- which is the entire point: at three guest
+ * instructions per block, the dispatcher costs more than the block does.
+ *
+ * w20 carries the remaining instruction budget so a chain cannot outrun the
+ * limit guest_run was called with; when it goes non-positive the chain stops
+ * and control returns to C, which re-checks hooks, the halt address and
+ * everything else it is responsible for. */
+static void e_return_linkable(A64 *a, uint32_t retired, uint32_t next_key) {
+    emit(a, 0x11000000u | ((retired & 0xFFFu) << 10) | (19u << 5) | 19u);
+                                                   /* ADD  w19,w19,#retired */
+    emit(a, 0x71000000u | ((retired & 0xFFFu) << 10) | (20u << 5) | 20u);
+                                                   /* SUBS w20,w20,#retired */
+    emit(a, 0x54000000u | (2u << 5) | 13u);        /* B.LE +2 -> the RET */
+    a->link_word = a->n;
+    a->link_key = next_key;
+    emit(a, 0x14000001u);                          /* B +1 -> the RET */
     emit(a, 0xD65F03C0u);                          /* RET */
 }
 
@@ -140,8 +213,56 @@ static void e_bail(A64 *a, uint32_t pc, uint32_t n) {
     emit(a, 0x52800000u | ((pc & 0xFFFFu) << 5) | 9u);          /* MOVZ w9 */
     emit(a, 0x72A00000u | (((pc >> 16) & 0xFFFFu) << 5) | 9u);  /* MOVK lsl16 */
     e_store_r(a, 9, GUEST_PC);
-    emit(a, 0x52800000u | ((n & 0xFFFFu) << 5) | 0u);           /* MOVZ w0,#n */
+    /* Still exactly five instructions: the count moved from w0 into the w19
+     * accumulator, which is what makes a chain of blocks add up. Keeping the
+     * size identical matters -- several branch-over-the-bail distances are
+     * hardcoded as +6 and would all have to change together. */
+    emit(a, 0x11000000u | ((n & 0xFFFu) << 10) | (19u << 5) | 19u); /* ADD w19,w19,#n */
     emit(a, 0xD65F03C0u);                                       /* RET */
+}
+
+/* Resolve a guest address through the slot table.
+ *
+ * In:  w9 = guest address.  Out: w9 = offset into the region, x12 = host base,
+ * so the caller's access is still one `LDR/STR wN,[x12,w9,uxtw]`. Clobbers
+ * w10 and w11. On a miss the block bails at `pc` having retired `n`.
+ *
+ * This replaces a bounds test against the ONE region the interpreter last
+ * resolved. That test was cheap and wrong-shaped: real code alternates between
+ * stack, heap and image, so the cached region was usually not the one being
+ * accessed, and the block ended. Measured on hardware, 68% of block entries
+ * bailed without retiring a single instruction and 970M instructions were lost
+ * to bails against 2552M retired. Indexing a table by the top byte of the
+ * address resolves any region in the same handful of instructions and makes a
+ * bail mean what it should -- genuinely unmapped, or an access running off a
+ * region end -- rather than "wrong region cached".
+ *
+ * `span` is the number of bytes touched; the test is unsigned
+ * `off + span-1 < size`, which a zero size (an unmapped slot) always fails. */
+static void e_resolve(A64 *a, int write, uint32_t span, uint32_t pc,
+                      uint32_t n) {
+    unsigned mem = (unsigned)offsetof(Guest, mem);
+    unsigned toff = mem + (unsigned)(write ? offsetof(GuestMem, wslot)
+                                           : offsetof(GuestMem, rslot));
+    emit(a, 0xF9400000u | ((toff >> 3) << 10) | (0u << 5) | 12u);
+                                                 /* LDR x12,[x0,#slot table] */
+    emit(a, 0x53000000u | (GUEST_SLOT_SHIFT << 16) | (31u << 10) |
+            (9u << 5) | 11u);                    /* LSR w11,w9,#24 */
+    emit(a, 0x8B200000u | (11u << 16) | (2u << 13) | (4u << 10) |
+            (12u << 5) | 11u);                   /* ADD x11,x12,w11,UXTW #4 */
+    e_ldr_off(a, 10, 11, 0);                     /* w10 = slot->base */
+    e_rr(a, 0x4B000000u, 9, 9, 10);              /* w9 = addr - base */
+    e_ldr_off(a, 10, 11, 4);                     /* w10 = slot->size */
+    if (span > 1u) {
+        emit(a, 0x11000000u | ((span - 1u) << 10) | (9u << 5) | 12u);
+                                                 /* ADD w12,w9,#span-1 */
+        e_rr(a, 0x6B000000u, 31, 12, 10);        /* CMP w12,w10 */
+    } else {
+        e_rr(a, 0x6B000000u, 31, 9, 10);         /* CMP w9,w10 */
+    }
+    emit(a, 0x54000000u | (6u << 5) | 3u);       /* B.LO +6 (skip the bail) */
+    e_bail(a, pc, n);
+    e_ldr64_off(a, 12, 11, 8);                   /* x12 = slot->host */
 }
 
 /* Guest load, address in w9, result into w9.
@@ -158,20 +279,7 @@ static void e_bail(A64 *a, uint32_t pc, uint32_t n) {
  * `bytes` is 4 or 1. Halfword and signed forms are deliberately absent rather
  * than guessed at; they can be added the same way once these are proven. */
 static void e_load_mem(A64 *a, int bytes, uint32_t pc, uint32_t n) {
-    unsigned mem = (unsigned)offsetof(Guest, mem);
-    e_ldr_w(a, 12, mem + (unsigned)offsetof(GuestMem, cache_base));
-    e_rr(a, 0x4B000000u, 9, 9, 12);              /* SUB w9,w9,w12 -> offset */
-    e_ldr_w(a, 12, mem + (unsigned)offsetof(GuestMem, cache_size));
-    /* An access of `bytes` starting at off is in range when
-     * off <= size - bytes; comparing off against size alone would admit the
-     * last few bytes of a region as the start of an access running past it. */
-    emit(a, 0x51000000u | ((uint32_t)bytes << 10) | (12u << 5) | 12u); /* SUB w12,w12,#bytes */
-    e_rr(a, 0x6B000000u, 31, 9, 12);             /* CMP w9,w12 */
-    emit(a, 0x54000000u | (6u << 5) | 9u);       /* B.LS +6 (skip the bail) */
-    e_bail(a, pc, n);
-    emit(a, 0xF9400000u |
-            (((mem + (unsigned)offsetof(GuestMem, cache_host)) >> 3) << 10) |
-            (0u << 5) | 12u);                    /* LDR x12,[x0,#host] */
+    e_resolve(a, 0, (uint32_t)bytes, pc, n);     /* w9 = off, x12 = host */
     if (bytes == 4)
         emit(a, 0xB8604800u | (9u << 16) | (12u << 5) | 9u);  /* LDR  w9,[x12,w9,uxtw] */
     else if (bytes == 2)
@@ -257,17 +365,9 @@ static void e_interwork(A64 *a) {
 static void e_store_mem(A64 *a, int bytes, uint32_t pc, uint32_t n, int verify) {
     unsigned mem = (unsigned)offsetof(Guest, mem);
     e_rr(a, 0x2A000000u, 15, 31, 9);             /* MOV w15,w9 (keep address) */
-    /* No permission test: the write cache only ever holds writable regions. */
-    e_ldr_w(a, 12, mem + (unsigned)offsetof(GuestMem, wcache_base));
-    e_rr(a, 0x4B000000u, 9, 9, 12);              /* w9 = addr - base */
-    e_ldr_w(a, 12, mem + (unsigned)offsetof(GuestMem, wcache_size));
-    emit(a, 0x51000000u | ((uint32_t)bytes << 10) | (12u << 5) | 12u);
-    e_rr(a, 0x6B000000u, 31, 9, 12);             /* CMP w9,w12 */
-    emit(a, 0x54000000u | (6u << 5) | 9u);       /* B.LS +6 */
-    e_bail(a, pc, n);
-    emit(a, 0xF9400000u |
-            (((mem + (unsigned)offsetof(GuestMem, wcache_host)) >> 3) << 10) |
-            (0u << 5) | 12u);                    /* LDR x12,[x0,#wcache_host] */
+    /* No permission test: the write table only ever holds writable regions,
+     * exactly as the write cache it replaces only ever did. */
+    e_resolve(a, 1, (uint32_t)bytes, pc, n);     /* w9 = off, x12 = host */
 
     if (verify) {
         unsigned noff = mem + (unsigned)offsetof(GuestMem, undo_n);
@@ -319,18 +419,34 @@ static int has_hook(const Guest *g, uint32_t pc) {
 static int emit_dp(A64 *a, uint32_t op, int setflags, int writes,
                    uint32_t rd) {
     uint32_t base;
+    /* Whether the emitted instruction actually sets NZCV itself. It must, or
+     * the merge below takes whatever the host flags happened to hold -- and
+     * they hold something: the region bounds test in e_resolve ends in a CMP,
+     * so a flag-setting logical op two instructions after a load was reading
+     * the result of comparing an offset against a region size.
+     *
+     * That is what made BICS wrong. AArch64 has ANDS and BICS but no ORRS and
+     * no EORS, so those two have to set the flags with a separate test, and
+     * BIC simply had no S-form selected at all. All three merged stale flags.
+     * Unreachable until the slot table stopped blocks bailing at their first
+     * load, then immediately wrong on hardware. */
+    int self_flags = 1;
     switch (op) {
     case 0x0: base = setflags ? 0x6A000000u : 0x0A000000u; break; /* AND/S */
-    case 0x1: base = 0x4A000000u; break;                         /* EOR */
     case 0x2: base = setflags ? 0x6B000000u : 0x4B000000u; break;/* SUB/S */
     case 0x4: base = setflags ? 0x2B000000u : 0x0B000000u; break;/* ADD/S */
-    case 0xC: base = 0x2A000000u; break;                         /* ORR */
-    case 0xE: base = 0x0A200000u; break;                         /* BIC */
+    case 0xE: base = setflags ? 0x6A200000u : 0x0A200000u; break;/* BIC/S */
+    case 0x1: base = 0x4A000000u; self_flags = 0; break;         /* EOR */
+    case 0xC: base = 0x2A000000u; self_flags = 0; break;         /* ORR */
     default: return 0;
     }
-    e_rr(a, base, writes ? 9u : 31u, 9, 10);
+    /* An op with no S-form has to keep its result somewhere testable, so it
+     * computes into w9 even when the architectural result is discarded. */
+    e_rr(a, base, (writes || (setflags && !self_flags)) ? 9u : 31u, 9, 10);
     if (setflags) {
-        if (op == 2 || op == 4)
+        if (!self_flags)
+            e_set_nz(a, 9);                      /* ANDS wzr,w9,w9 then merge */
+        else if (op == 2 || op == 4)
             e_merge_nzcv(a, CPSR_N | CPSR_Z | CPSR_C | CPSR_V);
         else
             e_merge_nzcv(a, CPSR_N | CPSR_Z);
@@ -344,7 +460,7 @@ static int compile_arm(Guest *g, A64 *a, uint32_t start, uint32_t until,
                        uint16_t *out_count, uint32_t *out_end) {
     uint32_t pc = start, n = 0;
     *out_end = 0;
-    while (n < JIT_MAX_GUEST && a->n + 40 < JIT_MAX_A64) {
+    while (n < JIT_MAX_GUEST && a->n + 48 < JIT_MAX_A64) {
         uint32_t insn, op, S, rn, rd;
         /* Reaching a hook, the halt address, or unreadable memory ends the
          * block for reasons that have nothing to do with an encoding. Clearing
@@ -394,7 +510,10 @@ static int compile_arm(Guest *g, A64 *a, uint32_t start, uint32_t until,
             }
             e_set_pc(a, pc + 8u + (uint32_t)off);
             n++;
-            e_return(a, n);
+            /* A taken branch to a constant address: the target is a real
+             * instruction and a block will exist there, so this is the exit
+             * that is actually worth chaining. */
+            e_return_linkable(a, n, pc + 8u + (uint32_t)off);
             *out_count = (uint16_t)n;
             *out_end = 0;       /* ended on its own terms, not blocked */
             return 1;
@@ -503,9 +622,15 @@ static int compile_arm(Guest *g, A64 *a, uint32_t start, uint32_t until,
     if (!n)
         return 0;
     e_set_pc(a, pc);
+    /* Deliberately NOT linkable. A block falls out here because it reached an
+     * instruction it could not lower, so the next PC is exactly that
+     * instruction -- and a block compiled there would be rejected on its first
+     * instruction. The link could never be satisfied, and measuring it proved
+     * the point: 2 links formed across 35708 blocks. Only branch exits, whose
+     * target is a real instruction, are worth a slot. */
     e_return(a, n);
     *out_count = (uint16_t)n;
-    if (n >= JIT_MAX_GUEST || a->n + 40u >= JIT_MAX_A64)
+    if (n >= JIT_MAX_GUEST || a->n + 48u >= JIT_MAX_A64)
         *out_end = 0;           /* filled up; nothing blocked it */
     return 1;
 }
@@ -515,7 +640,7 @@ static int compile_thumb(Guest *g, A64 *a, uint32_t start, uint32_t until,
     uint32_t pc = start, n = 0;
     int verify = g->jit_verify;
     *out_end = 0;
-    while (n < JIT_MAX_GUEST && a->n + 40 < JIT_MAX_A64) {
+    while (n < JIT_MAX_GUEST && a->n + 48 < JIT_MAX_A64) {
         uint32_t hw;
         if (pc == (until & ~1u) || has_hook(g, pc) ||
             !guest_ld16(&g->mem, pc, &hw)) {
@@ -576,7 +701,8 @@ static int compile_thumb(Guest *g, A64 *a, uint32_t start, uint32_t until,
                     e_store_r(a, 9, GUEST_LR);
                 }
                 e_set_pc(a, pc + 4u + (uint32_t)off);
-                n++; e_return(a, n); *out_count = (uint16_t)n; *out_end = 0;
+                n++; e_return_linkable(a, n, (pc + 4u + (uint32_t)off) | 1u);
+                *out_count = (uint16_t)n; *out_end = 0;
                 return 1;
             }
 
@@ -735,27 +861,17 @@ static int compile_thumb(Guest *g, A64 *a, uint32_t start, uint32_t until,
             uint32_t pop = (hw & 0xFE00u) == 0xBC00u;
             uint32_t cnt = extra, r, off = 0;
             unsigned mem = (unsigned)offsetof(Guest, mem);
-            unsigned cb, cs, ch;
             for (r = 0; r < 8; r++) if (list & (1u << r)) cnt++;
-            if (!cnt || a->n + 10u * cnt + 60u > JIT_MAX_A64)
+            if (!cnt || a->n + 10u * cnt + 80u > JIT_MAX_A64)
                 break;
-            cb = pop ? (unsigned)offsetof(GuestMem, cache_base)
-                     : (unsigned)offsetof(GuestMem, wcache_base);
-            cs = pop ? (unsigned)offsetof(GuestMem, cache_size)
-                     : (unsigned)offsetof(GuestMem, wcache_size);
-            ch = pop ? (unsigned)offsetof(GuestMem, cache_host)
-                     : (unsigned)offsetof(GuestMem, wcache_host);
             e_load_r(a, 16, GUEST_SP);
             if (!pop)                                    /* PUSH: SP - 4*cnt */
                 emit(a, 0x51000000u | ((cnt * 4u) << 10) | (16u << 5) | 16u);
-            e_ldr_w(a, 12, mem + cb);
-            e_rr(a, 0x4B000000u, 9, 16, 12);             /* w9 = base - region */
-            e_ldr_w(a, 12, mem + cs);
-            emit(a, 0x51000000u | ((cnt * 4u) << 10) | (12u << 5) | 12u);
-            e_rr(a, 0x6B000000u, 31, 9, 12);             /* CMP w9,w12 */
-            emit(a, 0x54000000u | (6u << 5) | 9u);       /* B.LS +6 */
-            e_bail(a, pc, n);
-            emit(a, 0xF9400000u | (((mem + ch) >> 3) << 10) | (0u << 5) | 12u);
+            e_rr(a, 0x2A000000u, 9, 31, 16);             /* MOV w9,w16 */
+            /* The whole transfer is still one check: the span is 4*cnt bytes
+             * from the lowest address touched, so a bail happens before any
+             * register or memory has changed. */
+            e_resolve(a, !pop, cnt * 4u, pc, n);
             emit(a, 0x8B204000u | (9u << 16) | (12u << 5) | 12u);
                                                  /* x12 = host + offset */
             for (r = 0; r < 9; r++) {
@@ -963,16 +1079,53 @@ static int compile_thumb(Guest *g, A64 *a, uint32_t start, uint32_t until,
         } else if ((hw & 0xF800u) == 0xE000u) {          /* B */
             int32_t off = (int32_t)((hw & 0x7FFu) << 21) >> 20;
             e_set_pc(a, pc + 4u + (uint32_t)off);
-            n++; e_return(a, n); *out_count = (uint16_t)n; *out_end = 0;
+            n++; e_return_linkable(a, n, (pc + 4u + (uint32_t)off) | 1u);
+            *out_count = (uint16_t)n; *out_end = 0;
             return 1;
         } else break;
         pc += 2; n++;
     }
     if (!n) return 0;
-    e_set_pc(a, pc); e_return(a, n); *out_count = (uint16_t)n;
-    if (n >= JIT_MAX_GUEST || a->n + 40u >= JIT_MAX_A64)
+    e_set_pc(a, pc); e_return(a, n); *out_count = (uint16_t)n;   /* see above */
+    if (n >= JIT_MAX_GUEST || a->n + 48u >= JIT_MAX_A64)
         *out_end = 0;           /* filled up; nothing blocked it */
     return 1;
+}
+
+/* Has this PC been seen JIT_HOT_COUNT times?
+ *
+ * This exists because claiming a block-table slot on the FIRST sighting of a
+ * PC is what held coverage to ~1%. Slots are never released, so one-shot
+ * startup and loader code filled all of them by instruction ~816k -- and the
+ * first frame is at 743M. From then on lookup() failed its probe walk for
+ * every new PC and the JIT declined the entire game, having compiled nothing
+ * but the loader. Simulating the table over real runs measured the reachable
+ * share of the instruction stream at 0.85% after 300M instructions and 0.08%
+ * after 5B: it got worse the longer the game ran, because the table had frozen
+ * before the game started.
+ *
+ * Counting sightings here instead costs 64 KB and no slot. Cold code churns
+ * this array and never touches the block table; the same simulation puts the
+ * reachable share at 99.89%. Direct-mapped and tagged rather than hashed with
+ * probing, because this runs on every declined PC and must stay a handful of
+ * instructions: a tag mismatch simply takes the entry over, so a PC that is
+ * genuinely hot re-hits and promotes anyway, while a PC that is not loses
+ * nothing worth keeping.
+ *
+ * The hits==0 test matters: an untouched array is all zeroes, so without it a
+ * PC whose tag is 0 would read a fresh entry as an established one. */
+static int jit_hot(JitContext *j, uint32_t key) {
+    uint32_t h = key * 2654435761u;
+    JitCount *c = &j->count[h & (JIT_HOT_SLOTS - 1u)];
+    uint16_t tag = (uint16_t)(h >> 16);
+    if (c->tag != tag || !c->hits) {
+        c->tag = tag;
+        c->hits = 1;
+        return 0;
+    }
+    if (c->hits < 255u)
+        c->hits++;
+    return c->hits >= JIT_HOT_COUNT;
 }
 
 static JitEntry *lookup(JitContext *j, uint32_t key) {
@@ -1025,6 +1178,10 @@ static int compile_block(Guest *g, JitContext *j, JitEntry *e, uint32_t until) {
     e->rx_off = off;
     e->count = count;
     e->state = 2;
+    /* Word index of the chain slot within the cache, not within the block. */
+    e->link_word = a.link_word ? (off / 4u) + a.link_word : 0u;
+    e->link_key = a.link_key;
+    e->linked = 0;
     j->used = off + bytes;
     g->jit_blocks++;
     if (g->jit_blocks == 1 || g->jit_blocks == 100 ||
@@ -1032,6 +1189,54 @@ static int compile_block(Guest *g, JitContext *j, JitEntry *e, uint32_t until) {
         printf("  [jit  ] %u blocks, %u KB code\n",
                g->jit_blocks, j->used >> 10);
     return 1;
+}
+
+/* The one piece of generated code C calls directly.
+ *
+ * Blocks keep their retired count in w19 and the remaining budget in w20, so a
+ * chain of them adds up without returning to C. Both are callee-saved, which
+ * is exactly why they are usable here and exactly why they have to be saved:
+ * the C caller expects them preserved. Every block RETs to this frame,
+ * including one reached through a chain -- the chain branches are plain B, so
+ * the link register still points here from the original BLR.
+ *
+ * Returns the total guest instructions retired across the whole chain. */
+static uint32_t emit_enter(A64 *a) {
+    emit(a, 0xA9800000u | ((0x7Cu) << 15) | (20u << 10) | (31u << 5) | 19u);
+                                        /* STP x19,x20,[sp,#-32]! */
+    emit(a, 0xF9000000u | (2u << 10) | (31u << 5) | 30u);   /* STR x30,[sp,#16] */
+    emit(a, 0x52800000u | (0u << 5) | 19u);                 /* MOV w19,#0 */
+    emit(a, 0x2A000000u | (2u << 16) | (31u << 5) | 20u);   /* MOV w20,w2 */
+    emit(a, 0xD63F0020u);                                   /* BLR x1 */
+    emit(a, 0x2A000000u | (19u << 16) | (31u << 5) | 0u);   /* MOV w0,w19 */
+    emit(a, 0xF9400000u | (2u << 10) | (31u << 5) | 30u);   /* LDR x30,[sp,#16] */
+    emit(a, 0xA8C00000u | (4u << 15) | (20u << 10) | (31u << 5) | 19u);
+                                        /* LDP x19,x20,[sp],#32 */
+    emit(a, 0xD65F03C0u);                                   /* RET */
+    return a->n;
+}
+
+/* Point `from`'s chain slot at `to`. One word, but it is RX memory, so it
+ * costs a writable/executable transition pair and the cache maintenance that
+ * goes with them. Links are installed once per edge and there are only as many
+ * edges as blocks, so the cost is bounded and paid during warm-up. */
+static void jit_link(JitContext *j, JitEntry *from, JitEntry *to) {
+    uint32_t *slot_rw = (uint32_t *)j->rw + from->link_word;
+    int32_t delta = (int32_t)(to->rx_off / 4u) - (int32_t)from->link_word;
+    Result rc;
+    if (delta > 0x01FFFFFF || delta < -0x02000000)
+        return;                         /* out of B range; leave it returning */
+    rc = jitTransitionToWritable(&j->code);
+    if (R_FAILED(rc))
+        return;
+    *slot_rw = 0x14000000u | ((uint32_t)delta & 0x03FFFFFFu);
+    armDCacheFlush(slot_rw, 4);
+    rc = jitTransitionToExecutable(&j->code);
+    if (R_FAILED(rc))
+        return;
+    armICacheInvalidate((uint32_t *)j->rx + from->link_word, 4);
+    from->linked = 1;
+    j->links++;
 }
 
 int guest_jit_init(Guest *g) {
@@ -1042,10 +1247,12 @@ int guest_jit_init(Guest *g) {
     if (!j) return 0;
     j->entry = (JitEntry *)calloc(JIT_CACHE_SLOTS, sizeof *j->entry);
     if (!j->entry) { free(j); return 0; }
+    j->count = (JitCount *)calloc(JIT_HOT_SLOTS, sizeof *j->count);
+    if (!j->count) { free(j->entry); free(j); return 0; }
     rc = jitCreate(&j->code, JIT_CODE_SIZE);
     if (R_FAILED(rc)) {
         printf("  [jit  ] unavailable (jitCreate=%08x), interpreter only\n", rc);
-        free(j->entry); free(j); return 0;
+        free(j->count); free(j->entry); free(j); return 0;
     }
     j->rw = (uint8_t *)jitGetRwAddr(&j->code);
     j->rx = (uint8_t *)jitGetRxAddr(&j->code);
@@ -1088,6 +1295,22 @@ int guest_jit_init(Guest *g) {
         j->used = 16u;
         j->probe_only = 0;
     }
+    {   /* The trampoline is emitted once, at the head of the cache. */
+        A64 t;
+        uint32_t bytes;
+        memset(&t, 0, sizeof t);
+        emit_enter(&t);
+        bytes = t.n * 4u;
+        rc = jitTransitionToWritable(&j->code);
+        if (R_FAILED(rc)) { guest_jit_close(g); return 0; }
+        memcpy(j->rw + j->used, t.code, bytes);
+        armDCacheFlush(j->rw + j->used, bytes);
+        rc = jitTransitionToExecutable(&j->code);
+        if (R_FAILED(rc)) { guest_jit_close(g); return 0; }
+        armICacheInvalidate(j->rx + j->used, bytes);
+        j->enter_off = j->used;
+        j->used += bytes;
+    }
     return 1;
 }
 
@@ -1095,7 +1318,7 @@ void guest_jit_close(Guest *g) {
     JitContext *j = (JitContext *)g->jit;
     if (!j) return;
     jitClose(&j->code);
-    free(j->entry); free(j); g->jit = NULL;
+    free(j->count); free(j->entry); free(j); g->jit = NULL;
 }
 
 /* r16 hardware trial: enable the deliberately narrow tier automatically. */
@@ -1146,6 +1369,9 @@ void guest_jit_report_blockers(Guest *g) {
             worst_insn[idx] = e->end_insn;
         }
     }
+    g->jit_links = j->links;
+    printf("  [jit  ] %u chain links installed, chaining %s\n",
+           j->links, j->chain ? "on" : "off");
     if (!total)
         return;
     printf("  [jitb ] what ends blocks, by executions cost:\n");
@@ -1190,20 +1416,51 @@ int guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
     j = (JitContext *)g->jit;
     if (j->probe_only)
         return 0;
+    j->chain = g->jit_chain && !g->jit_verify;
     key = g->cpu.r[GUEST_PC] | (guest_is_thumb(&g->cpu) ? 1u : 0u);
     e = lookup(j, key);
     if (!e) return 0;
-    if (!e->state) { e->key = key; e->state = 1; e->hits = 1; return 0; }
-    if (e->state == 3) return 0;
-    if (e->state == 1) {
-        if (++e->hits < JIT_HOT_COUNT) return 0;
-        if (!compile_block(g, j, e, until)) return 0;
+    /* An empty slot is left empty until the PC has proved it is worth one.
+     * lookup() returns the first empty slot in the probe chain, and entries
+     * are never released, so a key can never sit beyond an empty slot in its
+     * own chain -- declining to claim this one cannot hide an existing block.
+     * A slot already claimed skips the filter entirely, so a compiled block
+     * stays reachable even if a tag collision later evicts its counter. */
+    if (!e->state) {
+        if (!jit_hot(j, key)) return 0;
+        e->key = key;
+        e->state = 1;
     }
+    if (e->state == 3) return 0;
+    if (e->state == 1 && !compile_block(g, j, e, until)) return 0;
     if (remaining < e->count) return 0;
-    memcpy(&fn, &(void *){j->rx + e->rx_off}, sizeof fn);
-    g_native_stage = 200;
-    n = fn(g);
-    g_native_stage = 201;
+    /* Install the edge the dispatcher just observed.
+     *
+     * Links are formed from real transitions rather than guessed at compile
+     * time: the predecessor left on a constant PC, control arrived here, and
+     * this block is compiled -- so the edge is real and worth a branch. Never
+     * link to a PC carrying a hook (an observe hook falls through to the JIT,
+     * and a chain would silently skip it), and never while verifying, because
+     * the verifier re-runs one block at a time and a chain is not one block. */
+    if (j->chain && j->last && !j->last->linked &&
+        j->last->link_word && j->last->link_key == key &&
+        !g->jit_verify && !has_hook(g, key & ~1u))
+        jit_link(j, j->last, e);
+    {
+        JitEnterFn enter;
+        void *blk = j->rx + e->rx_off;
+        /* Capped so w20 stays comfortably positive: the per-block decrement is
+         * an imm12 and the chain test is signed. */
+        uint32_t budget = remaining > 0x00FFFFFFull ? 0x00FFFFFFu
+                                                    : (uint32_t)remaining;
+        memcpy(&enter, &(void *){j->rx + j->enter_off}, sizeof enter);
+        g_native_stage = 200;
+        n = enter(g, blk, budget);
+        g_native_stage = 201;
+        j->last = e;
+        if (n > budget) n = 0;      /* cannot happen; refuse to trust it */
+    }
+    (void)fn;
     /* Once loads could bail mid-block this stopped being "the leaf always
      * returns its count". A short count is a region-check miss: the block ran,
      * updated the registers it got to, and left PC on the instruction it could
@@ -1211,8 +1468,21 @@ int guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
      * instructions were not counted, and with verification on they were never
      * checked either, so precisely the new code path was the one going
      * untested. */
-    if (!n || n > e->count) return 0;
-    if (n < e->count) {
+    /* A block whose FIRST instruction bails returns zero, and until now that
+     * was counted nowhere -- indistinguishable from a PC the JIT never had a
+     * block for. It is not the same thing at all: the block exists, was
+     * entered, and gave the whole thing back, which is the shape a
+     * region-cache miss on a leading load takes. Count it separately, so the
+     * next bottleneck can be read off the report rather than guessed at. */
+    if (!n || (!j->chain && n > e->count)) {
+        if (!n) {
+            g->jit_bails++;
+            g->jit_bails_empty++;
+            g->jit_bail_lost += e->count;
+        }
+        return 0;
+    }
+    if (!j->chain && n < e->count) {
         g->jit_bails++;
         g->jit_bail_lost += e->count - n;
     }

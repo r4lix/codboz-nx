@@ -94,19 +94,21 @@ typedef struct {
     /* The resolved data region, denormalised out of region[cache].
      *
      * The interpreter can afford to index region[cache] because it is already
-     * holding that pointer; JIT-generated code cannot -- computing &region[i]
-     * costs a multiply and two adds before the bounds test even starts, on
-     * every single guest load. Keeping the three fields it actually needs in
-     * fixed slots turns the emitted sequence into two loads, a subtract, a
-     * compare and the access itself. They are written wherever `cache` is,
-     * which is only ever the slow paths in guest.c. */
+     * holding that pointer; this keeps the three fields it actually needs in
+     * fixed slots. Written wherever `cache` is, which is only ever the slow
+     * paths in guest.c.
+     *
+     * JIT code used to read these too, and no longer does -- one resolved
+     * region is the wrong shape for a consumer that cannot re-resolve and
+     * carry on, because a miss ends the block. It uses the slot tables below
+     * instead. These remain the interpreter's own cache. */
     uint32_t    cache_base;
     uint32_t    cache_size;
     uint8_t    *cache_host;
     /* Whether that region may be written. The data cache is shared between
      * reads and writes, so it can be pointing at the image -- which is not
-     * writable -- when a store arrives. JIT code has to test this or it would
-     * happily write into read-only memory the interpreter would have refused. */
+     * writable -- when a store arrives. (JIT code no longer consults this: its
+     * write table simply leaves unwritable regions with size 0.) */
     uint32_t    cache_writable;
     /* And again for stores, which need their own.
      *
@@ -154,7 +156,45 @@ typedef struct {
     int         undo_active;
     uint32_t    undo_n;
     uint32_t    undo_overflow;  /* writes past the log's capacity */
+    /* Slot tables for JIT-generated code (see GuestSlot). Pointers rather than
+     * arrays for the same reason the undo log is external: 8 KB of table in
+     * the middle of this struct would push the fields the interpreter reads on
+     * every access onto different cache lines. */
+    struct GuestSlot *rslot;
+    struct GuestSlot *wslot;
 } GuestMem;
+
+/* Guest address >> GUEST_SLOT_SHIFT -> the region owning that slot.
+ *
+ * The single denormalised cache above resolves one region at a time, which is
+ * right for the interpreter (it re-resolves on a miss and carries on) and
+ * wrong for JIT code (a miss ends the block). Real code alternates between
+ * stack, heap and image constantly, so on hardware 68% of all block entries
+ * were bailing before they retired a single instruction -- entering generated
+ * code, missing the cache on a leading load, and handing the whole block back.
+ *
+ * Every region is at least 1 MB and starts on a 16 MB boundary, so indexing by
+ * the top byte of the address resolves all four of them with no comparison at
+ * all. A slot is filled only when its region covers the slot's FIRST byte,
+ * which is what makes `addr - base` safe to compute before the bounds test:
+ * the subtraction can never wrap into a small offset for an address that sits
+ * just below the region. Anything not covered keeps size 0, and since the test
+ * is unsigned `off + bytes-1 < size`, a zero size rejects every address --
+ * the block bails and the interpreter faults properly, exactly as before. */
+typedef struct GuestSlot {
+    uint32_t base;
+    uint32_t size;              /* 0 = unmapped here; every access bails */
+    uint8_t *host;
+} GuestSlot;
+
+#define GUEST_SLOT_SHIFT 24
+#define GUEST_SLOT_COUNT 256u
+
+extern GuestSlot guest_rslot[GUEST_SLOT_COUNT];
+extern GuestSlot guest_wslot[GUEST_SLOT_COUNT];
+
+/* Rebuild both tables from the region list. Called by guest_mem_add. */
+void guest_slots_build(GuestMem *m);
 
 /* The log itself lives outside GuestMem so the struct the interpreter touches
  * on every access stays small: it is read on the hot path, and 4 KB of undo
@@ -387,8 +427,11 @@ typedef struct {
      * exactly the ambiguity that made four rounds of lowering look identical.
      * jit_bail_lost is what a better memory fast path would recover. */
     uint64_t jit_bails;
+    uint64_t jit_bails_empty;   /* bailed before retiring anything */
     uint64_t jit_bail_lost;
     int      jit_verify;
+    int      jit_chain;     /* link compiled blocks directly to each other */
+    uint32_t jit_links;     /* chain edges installed */
     uint64_t jit_verify_blocks;
     uint32_t jit_diverged;
 } Guest;

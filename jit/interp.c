@@ -2419,7 +2419,15 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
         if (jitctx) {
             uint32_t retired = 0;
             int ran;
-            GuestCpu before = g->cpu;
+            /* Snapshot the register file only when something will compare
+             * it. This is a 68-byte copy and it was being made on every
+             * dispatch whether verifying or not -- the compiler cannot sink
+             * it past the call, because the call can read g->cpu. At three
+             * guest instructions per block that copy was a real share of
+             * what the JIT had to earn back before it broke even. */
+            GuestCpu before;
+            if (g->jit_verify)
+                before = g->cpu;
             /* Record stores only while the block itself is running.
              *
              * Arming this once at startup was wrong in a way that took a
