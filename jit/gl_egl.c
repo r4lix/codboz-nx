@@ -551,6 +551,43 @@ static void fps_overlay(EGLDisplay dpy, EGLSurface surface) {
         glDisable(GL_SCISSOR_TEST);
 }
 
+extern int input_debug_marks(int *fx, int *fy, int *gx, int *gy);
+extern int g_touch_dbg;
+
+/* Draw where the finger is (green) and where the game thinks it is (red).
+ *
+ * Same technique as fps_overlay: scissor a small rectangle and clear it, so no
+ * shader, no geometry, and no state beyond scissor, clear colour and colour
+ * mask -- all restored. If the two squares coincide the pointer mapping is
+ * correct; if one mirrors the other, the axis that is wrong is visible
+ * directly rather than being inferred from a description. */
+static void touch_overlay(void) {
+    GLboolean scissor_was, color_mask[4];
+    GLint old_scissor[4];
+    GLfloat old_clear[4];
+    int fx, fy, gx, gy, k;
+    if (!g_touch_dbg || !input_debug_marks(&fx, &fy, &gx, &gy))
+        return;
+    scissor_was = glIsEnabled(GL_SCISSOR_TEST);
+    glGetIntegerv(GL_SCISSOR_BOX, old_scissor);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, old_clear);
+    glGetBooleanv(GL_COLOR_WRITEMASK, color_mask);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glEnable(GL_SCISSOR_TEST);
+    for (k = 0; k < 2; k++) {
+        int cx = k ? gx : fx, cy = k ? gy : fy;
+        if (k) glClearColor(1.0f, 0.0f, 0.0f, 1.0f);   /* game's idea: red */
+        else   glClearColor(0.0f, 1.0f, 0.0f, 1.0f);   /* finger: green */
+        glScissor(cx - 6, cy - 6, 13, 13);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
+    glClearColor(old_clear[0], old_clear[1], old_clear[2], old_clear[3]);
+    glColorMask(color_mask[0], color_mask[1], color_mask[2], color_mask[3]);
+    glScissor(old_scissor[0], old_scissor[1], old_scissor[2], old_scissor[3]);
+    if (!scissor_was)
+        glDisable(GL_SCISSOR_TEST);
+}
+
 static void te_SwapBuffers(GuestCpu *c, GuestMem *m, void *u) {
     void *dpy, *s;
     static int shown;
@@ -558,6 +595,7 @@ static void te_SwapBuffers(GuestCpu *c, GuestMem *m, void *u) {
     if (!tok_in(ga(c, m, 0), &dpy, K_DPY) || !tok_in(ga(c, m, 1), &s, K_SFC))
         BAD_HANDLE("SwapBuffers");
     fps_overlay((EGLDisplay)dpy, (EGLSurface)s);
+    touch_overlay();
     c->r[0] = (uint32_t)eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)s);
     if (c->r[0])
         egl_frame_presented();

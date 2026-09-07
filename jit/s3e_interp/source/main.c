@@ -1647,40 +1647,59 @@ static void tap_arm(int frame) {
  * touch at screen (sx, sy) is game ((sx - 100) * 480/1080, sy * 320/720).
  * Both spaces have their origin at the top left, so no flip is involved --
  * unlike the GL viewport, which measures from the bottom. */
-/* Touch Y origin. The panel reports top-left, but the guest viewport goes to
- * glViewport unflipped and GL's origin is bottom-left, so guest y=0 is the
- * BOTTOM of the screen. Confirmed on hardware: a press near panel y=690 -- the
- * bottom edge, on the Back button -- mapped to guest y=308 and activated
- * something at the top of the screen instead.
+/* Touch Y origin: top-left, the same as the panel, with no flip anywhere.
  *
- * The rendering is self-consistent either way, which is why this could not be
- * read off a screenshot. Put 0 in sdmc:/switch/boz/flipy.txt to go back. */
-/* Bitmask, because the two delivery paths may not agree:
- *   bit 0 (1) - single-touch: s3ePointer id 0/1 and the polling getters,
- *               which the game's UI layer handles
- *   bit 1 (2) - multi-touch: s3ePointer id 2/3, which the engine handles
- * "Sometimes the right spot, sometimes the opposite" is what a disagreement
- * between them looks like, and menus worked before the flip while gameplay
- * needed it. Put 0-3 in flipy.txt; 3 flips both, 2 flips only the engine. */
-/* Default 1: UI layer flipped, engine not.
- *
- * Both halves are observed, not reasoned. In the menus, Back at the bottom of
- * the screen activated something at the top when unflipped -- the UI handler
- * (s3ePointer id 0/1) needs the flip. In game, with the flip on, the knife
- * drawn at the bottom responded to a touch at the top, pause drawn top-left
- * responded at the bottom, and character movement was inverted vertically but
- * correct horizontally -- the engine handler (id 2/3) needs no flip. That last
- * detail is decisive: the virtual stick works on deltas, so a wrong Y inverts
- * one axis and leaves the other alone, which is exactly what it did. */
-static int g_flip_y = 1;
-#define FLIP_SINGLE (g_flip_y & 1)
-#define FLIP_MULTI  (g_flip_y & 2)
+ * The old reasoning here -- that glViewport's bottom-left origin makes guest
+ * y=0 the bottom of the screen -- is wrong. The viewport only places NDC; the
+ * game's own ortho projection decides which way y grows, and the picture is
+ * upright, so guest y is top-down like the panel. */
 static int g_touch_ready;
 static int g_real_down;              /* contact state on the previous update */
 static int g_cur_x = (int)(SCREEN_W / 2), g_cur_y = (int)(SCREEN_H / 2);
 
 static int clampi(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* Touch markers for the GL overlay, in GL coordinates (origin bottom-left).
+ *
+ * Two of them, and that is the point: one where the finger physically is, one
+ * where the game believes it is. If they sit on top of each other the mapping
+ * is right; if one is the other's mirror the mapping is wrong and you can see
+ * which axis without describing anything. Guessing at this from descriptions
+ * has produced two wrong fixes already.
+ *
+ * The marks linger after release so the release position -- which is what UI
+ * buttons act on, and where the bug lived -- stays visible long enough to see.
+ */
+/* Touch diagnostics: the two on-screen squares and the pointer logging.
+ * Off unless touchdbg.txt is on the card -- the markers are drawn every frame
+ * and have no business appearing while anyone is playing. Kept rather than
+ * deleted because seeing where the game thinks the finger is, next to where it
+ * actually is, is what finally separated "wrong coordinates" from "right
+ * coordinates, wrong widget". */
+int g_touch_dbg;
+static int g_mark_hold;
+static int g_mark_fx, g_mark_fy, g_mark_gx, g_mark_gy;
+
+int input_debug_marks(int *fx, int *fy, int *gx, int *gy);
+int input_debug_marks(int *fx, int *fy, int *gx, int *gy) {
+    if (g_mark_hold <= 0)
+        return 0;
+    g_mark_hold--;
+    *fx = g_mark_fx; *fy = g_mark_fy;
+    *gx = g_mark_gx; *gy = g_mark_gy;
+    return 1;
+}
+
+static void mark_update(int active, int raw_x, int raw_y, int gx, int gy) {
+    if (active && g_touch_dbg) {
+        g_mark_fx = raw_x;
+        g_mark_fy = (int)FB_H - 1 - raw_y;              /* panel -> GL */
+        g_mark_gx = (int)VIEW_X + gx * (int)VIEW_W / (int)SCREEN_W;
+        g_mark_gy = (int)FB_H - 1 - gy * (int)FB_H / (int)SCREEN_H;
+        g_mark_hold = 90;                               /* ~3 s at 30 fps */
+    }
 }
 
 static int input_poll(int *px, int *py) {
@@ -1698,8 +1717,6 @@ static int input_poll(int *px, int *py) {
                      / (int)VIEW_W, 0, (int)SCREEN_W - 1);
         *py = clampi((int)ts.touches[0].y * (int)SCREEN_H / (int)FB_H,
                      0, (int)SCREEN_H - 1);
-        if (FLIP_SINGLE)
-            *py = (int)SCREEN_H - 1 - *py;
         g_cur_x = *px;
         g_cur_y = *py;
         return 1;
@@ -1713,10 +1730,8 @@ static int input_poll(int *px, int *py) {
         if (st.x > 6000 || st.x < -6000)
             g_cur_x = clampi(g_cur_x + st.x / 4000, 0, (int)SCREEN_W - 1);
         if (st.y > 6000 || st.y < -6000)
-            /* Guest y grows upward when g_flip_y is set, so pushing the stick
-             * up has to increase it or the docked cursor moves the wrong way. */
-            g_cur_y = clampi(g_cur_y + (g_flip_y ? st.y : -st.y) / 4000, 0,
-                             (int)SCREEN_H - 1);
+            /* Guest y is top-down, so pushing the stick up must decrease it. */
+            g_cur_y = clampi(g_cur_y - st.y / 4000, 0, (int)SCREEN_H - 1);
     }
     held = padGetButtons(&g_pad);
     *px = g_cur_x;
@@ -1773,11 +1788,7 @@ static void key_update(GuestMem *mem) {
         u64 combo = held & (HidNpadButton_ZL | HidNpadButton_ZR);
         int both = combo == (HidNpadButton_ZL | HidNpadButton_ZR);
         int was_both = prev_combo == (HidNpadButton_ZL | HidNpadButton_ZR);
-        if (both && !was_both) {
-            g_flip_y = (g_flip_y + 1) & 3;
-            printf("  [key  ] flip mode -> %d (single=%d multi=%d)\n",
-                   g_flip_y, FLIP_SINGLE ? 1 : 0, FLIP_MULTI ? 1 : 0);
-        }
+        (void)both; (void)was_both;
         prev_combo = combo;
     }
 
@@ -1870,8 +1881,6 @@ static void touch_update(GuestMem *mem) {
                               (int)SCREEN_W - 1);
             now[n].y = clampi((int)ts.touches[i].y * (int)SCREEN_H / (int)FB_H,
                               0, (int)SCREEN_H - 1);
-            if (FLIP_MULTI)
-                now[n].y = (int)SCREEN_H - 1 - now[n].y;
             now[n].raw_x = (int)ts.touches[i].x;
             now[n].raw_y = (int)ts.touches[i].y;
             /* Drive the polled getters straight from the first in-viewport
@@ -1882,8 +1891,12 @@ static void touch_update(GuestMem *mem) {
              * condition that has to hold. */
             if (n == 0) {
                 g_tap_x = now[0].x;
-                g_tap_y = FLIP_SINGLE ? (int)SCREEN_H - 1 - now[0].y
-                                      : now[0].y;
+                g_tap_y = now[0].y;
+                /* Keep the stick cursor parked on the same contact, so the
+                 * idle path's g_tap := cursor cannot drag the getters back to
+                 * an older touch when input_poll skipped this one (bezel). */
+                g_cur_x = now[0].x;
+                g_cur_y = now[0].y;
             }
             n++;
         }
@@ -1927,7 +1940,26 @@ static void touch_update(GuestMem *mem) {
     }
 }
 
+/* Sequence number shared by Update and the getters, so the log shows the
+ * ORDER. s3ePointerUpdate is a GUEST call: if the game reads the getters
+ * before calling it, it is reading the previous sample by construction, and
+ * no amount of correcting the coordinates can help. */
+static unsigned g_ptr_seq;
+
+static void hle_ptr_update_body(GuestCpu *cpu, GuestMem *mem, void *user);
+
 static void hle_ptr_update(GuestCpu *cpu, GuestMem *mem, void *user) {
+    static int shown;
+    hle_ptr_update_body(cpu, mem, user);
+    g_ptr_seq++;
+    if (g_touch_dbg && shown < 200) {
+        shown++;
+        printf("  [upd  ] seq=%u tap=(%d,%d) state=%d down=%d\n",
+               g_ptr_seq, g_tap_x, g_tap_y, g_ptr_state, g_real_down);
+    }
+}
+
+static void hle_ptr_update_body(GuestCpu *cpu, GuestMem *mem, void *user) {
     static int last_motion_x = -1, last_motion_y = -1;
     int x = 0, y = 0, down;
     (void)user;
@@ -1946,37 +1978,141 @@ static void hle_ptr_update(GuestCpu *cpu, GuestMem *mem, void *user) {
         y = g_touch[0].y;
         down = 1;
     }
+    /* Position leads the button by one update.
+     *
+     * Everything on our side measures correct: the overlay squares coincide,
+     * press and release carry their own coordinates (14/17, the misses being
+     * drags), and GetX returns the new position on the very update the press
+     * is reported. The game still acts on the previous position, which means
+     * it tests the button BEFORE it consumes the coordinate -- it acts on a
+     * cursor it latched on an earlier update. That is why pressing twice
+     * works: the first press moves its cursor, the second acts on it.
+     *
+     * A real touchscreen hides this, because contact position is reported a
+     * little before the pressed state settles. Here both arrive in the same
+     * update. So the first update of a contact delivers the position and the
+     * motion event with the button still up, and the press is reported on the
+     * next one -- which is exactly the two-press dance done for the game
+     * instead of by the user.
+     *
+     * A contact that vanishes before that second update still has to produce a
+     * press, or fast taps would be swallowed entirely. */
+    static int press_armed;
+    int report_down = down;
+    if (down && !g_real_down) {
+        if (!press_armed) {
+            press_armed = 1;
+            report_down = 0;        /* this update carries position only */
+            /* The block below is skipped when down is 0, so publish the
+             * position here or the "position only" update carries nothing.
+             * touch_update happens to have set g_tap from the contact already,
+             * but the stick cursor has no such side effect, and the guest's
+             * hover path (RVA 0x81908: obj+0x60 := widget under the pointer,
+             * only while NOT touching) is the whole point of this update. */
+            g_tap_x = x;
+            g_tap_y = y;
+            mark_update(1, g_touch[0].raw_x, g_touch[0].raw_y, x, y);
+            if (x != last_motion_x || y != last_motion_y) {
+                motion_fire(mem, x, y);
+                last_motion_x = x;
+                last_motion_y = y;
+            }
+        } else {
+            press_armed = 0;
+        }
+    } else if (!down) {
+        if (press_armed) {
+            press_armed = 0;
+            report_down = 1;        /* too quick to split: press now, release next */
+        }
+    }
+    down = report_down;
     if (down || g_real_down) {
-        g_tap_x = x;
-        g_tap_y = y;
+        /* Only while a finger is down.
+         *
+         * On the release frame g_touch[0] has been cleared, so the override
+         * above does not run and x,y come from input_poll's stick-cursor
+         * fallback instead of the tracked contact. Assigning from that pushed
+         * a coordinate from an unrelated source into the RELEASED event and
+         * into the polled getters -- and while the Y flip existed it was the
+         * MIRRORED one, so a menu press landed on the right widget and its
+         * release landed on the widget's vertical mirror. UI buttons act on
+         * release, which is precisely why menus read as reversed while
+         * gameplay, driven by ids 2/3, was correct.
+         *
+         * Removing the flip hides this by making both sources agree. It is
+         * still wrong: the SDK contract is that the coordinates stay at the
+         * last tap location after release. */
+        if (down) {
+            g_tap_x = x;
+            g_tap_y = y;
+        }
+        /* Marker takes the screen-space y, not the UI-space one: when the
+         * conversion is right the game acts where the finger is, so the red
+         * square should sit on the green one. */
+        mark_update(down, g_touch[0].raw_x, g_touch[0].raw_y, x, y);
         if (!g_saw_real_input) {
             g_saw_real_input = 1;
             printf("  [in   ] real input active -- synthetic tap stands down\n");
         }
+        /* Position BEFORE button, which is the whole bug.
+         *
+         * The game's menu keeps a highlighted item, moves it from the motion
+         * event, and acts on the press event. Queueing the press first meant a
+         * fresh touch clicked whatever was highlighted from the PREVIOUS touch
+         * and only then moved the highlight -- so the first press moved the
+         * cursor, the second applied it, and when the stale highlight happened
+         * to be on a clickable item the first press activated that instead.
+         * That is the "I press once to move, once to apply" behaviour, and why
+         * it felt arbitrary: it depended on what was under the old position.
+         *
+         * A real device reports the contact's position before its button
+         * transition, so delivering motion first is also what the SDK contract
+         * implies. */
+        if (down && (x != last_motion_x || y != last_motion_y)) {
+            motion_fire(mem, x, y);
+            last_motion_x = x;
+            last_motion_y = y;
+        }
+
+        /* id 1 is s3ePointerMotionEvent {x,y}. The old port only updated the
+         * polling getters, so code driven by the registered motion callback
+         * saw the press at one position but no drag/movement at all. */
         if (down && !g_real_down) {
             g_ptr_state = S3E_PTR_PRESSED;
+            /* Ground truth for the coordinate path: the raw panel sample, the
+             * tracked contact, and what the polled getters will report.
+             * Guessing at this has produced two wrong fixes already. */
+            if (g_touch_dbg)
+                printf("  [tapdbg] PRESS panel=(%d,%d) touch0=(%d,%d) tap=(%d,%d)\n",
+                   g_touch[0].raw_x, g_touch[0].raw_y,
+                   g_touch[0].x, g_touch[0].y, g_tap_x, g_tap_y);
             tap_fire(mem, &g_ev_press, 1);
         } else if (down) {
             g_ptr_state = S3E_PTR_DOWN;
         } else {
             g_ptr_state = S3E_PTR_RELEASED;
+            if (g_touch_dbg)
+                printf("  [tapdbg] RELEASE tap=(%d,%d) xy=(%d,%d)\n",
+                   g_tap_x, g_tap_y, x, y);
             tap_fire(mem, &g_ev_release, 0);
-        }
-        /* id 1 is s3ePointerMotionEvent {x,y}. The old port only updated the
-         * polling getters, so code driven by the registered motion callback
-         * saw the press at one position but no drag/movement at all. */
-        if (down && (x != last_motion_x || y != last_motion_y)) {
-            motion_fire(mem, x, y);
-            last_motion_x = x;
-            last_motion_y = y;
         }
         g_real_down = down;
         cpu->r[0] = 0;
         return;
     }
     g_real_down = 0;
-    if (g_saw_real_input)
+    if (g_saw_real_input) {
         g_ptr_state = S3E_PTR_UP;
+        /* Button up: the getters follow the cursor, as a mouse's would. The
+         * guest only moves its hover widget (obj+0x60, RVA 0x81908) while the
+         * pointer is up, and it sends the press to THAT widget (RVA 0x819c6),
+         * so a docked stick cursor that is invisible until A is pressed hits
+         * whatever was hovered on the previous press. In handheld mode this is
+         * a no-op: input_poll leaves g_cur at the last contact. */
+        g_tap_x = x;
+        g_tap_y = y;
+    }
 
     if (!g_saw_real_input && g_tap_armed && !g_tap_done) {
         g_tap_step++;
@@ -2015,10 +2151,10 @@ static void hle_ptr_getstate(GuestCpu *cpu, GuestMem *mem, void *user) {
  * poll instead. Log what these hand back, and from where. */
 static void ptr_read_log(const char *what, uint32_t v, uint32_t lr) {
     static int shown;
-    if (shown < 60) {
+    if (g_touch_dbg && shown < 200) {
         shown++;
-        printf("  [read ] %s -> %u  (caller RVA %06x)\n", what, (unsigned)v,
-               (unsigned)lr);
+        printf("  [read ] seq=%u %s -> %u  (caller RVA %06x)\n",
+               g_ptr_seq, what, (unsigned)v, (unsigned)lr);
     }
 }
 
@@ -3492,21 +3628,14 @@ static void run(void) {
         }
         printf("heap: recycle freed blocks = %d\n", g_recycle_freed);
     }
-    {   /* Touch Y origin, same shape of switch. */
-        static const char *paths[] = {"sdmc:/switch/boz/flipy.txt",
-                                      "sdmc:/flipy.txt"};
+    {   /* touchdbg.txt: on-screen touch markers and pointer logging. */
+        static const char *tp[] = {"sdmc:/switch/boz/touchdbg.txt",
+                                   "sdmc:/touchdbg.txt"};
         unsigned k;
         for (k = 0; k < 2; k++) {
-            FILE *f = fopen(paths[k], "rb");
-            char c = 0;
-            if (!f)
-                continue;
-            if (fread(&c, 1, 1, f) == 1 && (c == '0' || c == '1'))
-                g_flip_y = (c == '1');
-            fclose(f);
-            break;
+            FILE *f = fopen(tp[k], "rb");
+            if (f) { fclose(f); g_touch_dbg = 1; break; }
         }
-        printf("input: flip touch Y = %d\n", g_flip_y);
     }
     startup_stage_write("04 VFS and GL allocator ready");
 
