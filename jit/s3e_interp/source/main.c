@@ -545,6 +545,68 @@ static void slow_fill(GuestMem *mem, uint32_t dst, uint32_t byte, uint32_t len) 
  * it pushes and pops, so they are untouched here. That makes the hook register
  * identical to the code it replaces, which is what lets the differential
  * harness compare equal instead of reporting three false divergences. */
+/* Componentwise 16-bit vector add, RVA 0x00506c -- 26 bytes, 2% of all guest
+ * instructions. r0 = out, r1 = a, r2 = b, three u16 components each.
+ *
+ * The adds are Thumb ADD (register) T2, which does NOT set flags, so there is
+ * nothing to reproduce in CPSR. The one observable clobber is r2: the guest
+ * computes a.x + b.x into it as a full 32-bit value and only the store
+ * truncates, so the register keeps the untruncated sum. */
+#define RVA_VEC3_ADD16 0x00506cu
+
+static uint32_t g_vadd_hits, g_vadd_skips;
+
+static void hook_vec3_add16(GuestCpu *cpu, GuestMem *mem, void *user) {
+    const void *ap, *bp;
+    void *op;
+    uint16_t A[3], B[3], O[3];
+    (void)user;
+    ap = guest_ptr(mem, cpu->r[1], (uint32_t)sizeof A);
+    bp = guest_ptr(mem, cpu->r[2], (uint32_t)sizeof B);
+    op = guest_wptr(mem, cpu->r[0], (uint32_t)sizeof O);
+    if (!ap || !bp || !op) { g_vadd_skips++; return; }
+    memcpy(A, ap, sizeof A);
+    memcpy(B, bp, sizeof B);
+    O[0] = (uint16_t)(A[0] + B[0]);
+    O[1] = (uint16_t)(A[1] + B[1]);
+    O[2] = (uint16_t)(A[2] + B[2]);
+    memcpy(op, O, sizeof O);
+    cpu->r[2] = (uint32_t)A[0] + (uint32_t)B[0];
+    g_vadd_hits++;
+}
+
+/* Normalise, RVA 0x0035d0 -- 2% of all guest instructions in ten bytes:
+ *
+ *     while ((int32_t)r2 >= 0) { r0--; r2 <<= 1; }   then bx lr
+ *
+ * The loop head is also the function tail, so a hook here returning to LR is
+ * exactly what the guest does. It collapses to one count-leading-zeros.
+ *
+ * Flags matter here, unlike the vector add. The loop leaves CPSR from its
+ * final `cmp r2, #0` on a negative value: N set, Z clear, C set (a subtract of
+ * zero never borrows), V clear. The caller is free to branch on that.
+ *
+ * r2 == 0 is not handled because the guest cannot handle it either -- shifting
+ * zero never sets bit 31, so the original spins forever. Counting it and
+ * returning is the least-bad answer; a hang would be worse and inventing a
+ * result would be a lie. */
+#define RVA_NORMALISE 0x0035d0u
+
+static uint32_t g_norm_hits, g_norm_skips;
+
+static void hook_normalise(GuestCpu *cpu, GuestMem *mem, void *user) {
+    uint32_t v = cpu->r[2];
+    unsigned n;
+    (void)mem; (void)user;
+    if (!v) { g_norm_skips++; return; }
+    n = (unsigned)__builtin_clz(v);
+    cpu->r[2] = v << n;
+    cpu->r[0] -= n;
+    cpu->cpsr = (cpu->cpsr & ~(CPSR_N | CPSR_Z | CPSR_C | CPSR_V))
+              | CPSR_N | CPSR_C;
+    g_norm_hits++;
+}
+
 #define RVA_VTX_TRANSFORM 0x00524cu
 
 static uint32_t g_vtx_hits, g_vtx_skips;
@@ -3399,7 +3461,11 @@ static void run(void) {
         hooks[d + 4].fn = hook_f32_mul_guard;
         hooks[d + 5].addr = g_img.load_base + RVA_VTX_TRANSFORM;
         hooks[d + 5].fn = hook_vtx_transform;
-        g.hook_count = d + 6;
+        hooks[d + 6].addr = g_img.load_base + RVA_VEC3_ADD16;
+        hooks[d + 6].fn = hook_vec3_add16;
+        hooks[d + 7].addr = g_img.load_base + RVA_NORMALISE;
+        hooks[d + 7].fn = hook_normalise;
+        g.hook_count = d + 8;
     }
 
     g.cpu.r[GUEST_SP] = STACK_BASE + STACK_SIZE - 16;
@@ -3507,6 +3573,9 @@ static void run(void) {
            g.executed ? 100.0 * (double)g.jit_executed / (double)g.executed : 0.0);
     printf("  [fast ] vertex transform: %u hooked, %u skipped (unmapped)\n",
            (unsigned)g_vtx_hits, (unsigned)g_vtx_skips);
+    printf("  [fast ] vec3 add: %u hooked, %u skipped; normalise: %u hooked, %u skipped\n",
+           (unsigned)g_vadd_hits, (unsigned)g_vadd_skips,
+           (unsigned)g_norm_hits, (unsigned)g_norm_skips);
     printf("fastmem: memcpy %u calls/%llu bytes, memset %u calls/%llu bytes\n",
            (unsigned)g_fast_mem_hits[0],
            (unsigned long long)g_fast_mem_bytes[0],
