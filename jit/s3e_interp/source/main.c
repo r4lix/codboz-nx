@@ -524,6 +524,62 @@ static void slow_fill(GuestMem *mem, uint32_t dst, uint32_t byte, uint32_t len) 
         }
 }
 
+/* Software vertex transform, RVA 0x00524c -- 92 bytes, and 6% of every guest
+ * instruction the game executes. The top entry in pcprof by a wide margin.
+ *
+ *   out[i] = ((m[i]*x + m[i+3]*y + m[i+6]*z) >> 12) + m[i+9]   for i = 0,1,2
+ *
+ * r0 = out (3 x int32), r1 = matrix (12 x int32, Q12), r2 = vertex
+ * (3 x int16, sign extended). A 3x3 rotate in 12.12 fixed point plus a
+ * translation. The game reports Transform -> HW and then does this on the CPU
+ * anyway -- skinning or culling, most likely.
+ *
+ * Two details decide whether this is bit-exact rather than merely close. MUL
+ * and MLA wrap modulo 2^32 and signed overflow is undefined in C, so the
+ * accumulation is done in uint32_t and only the shift is signed. And ASR
+ * rounds toward minus infinity, not toward zero, so it has to be an arithmetic
+ * shift of a signed value rather than a division.
+ *
+ * The scratch registers are set to what the real function leaves behind: r1
+ * from its last load, r2 the sign-extended z, and ip the second output. r4-r8
+ * it pushes and pops, so they are untouched here. That makes the hook register
+ * identical to the code it replaces, which is what lets the differential
+ * harness compare equal instead of reporting three false divergences. */
+#define RVA_VTX_TRANSFORM 0x00524cu
+
+static uint32_t g_vtx_hits, g_vtx_skips;
+
+static void hook_vtx_transform(GuestCpu *cpu, GuestMem *mem, void *user) {
+    const void *mp, *vp;
+    void *op;
+    int32_t M[12], O[3];
+    int16_t V[3];
+    int i;
+    (void)user;
+    mp = guest_ptr(mem, cpu->r[1], (uint32_t)sizeof M);
+    vp = guest_ptr(mem, cpu->r[2], (uint32_t)sizeof V);
+    op = guest_wptr(mem, cpu->r[0], (uint32_t)sizeof O);
+    if (!mp || !vp || !op) {
+        /* Unmapped: leave the state alone rather than inventing a result. The
+         * real function would have faulted here; this at least does not lie. */
+        g_vtx_skips++;
+        return;
+    }
+    memcpy(M, mp, sizeof M);
+    memcpy(V, vp, sizeof V);
+    for (i = 0; i < 3; i++) {
+        uint32_t acc = (uint32_t)M[i]     * (uint32_t)(int32_t)V[0]
+                     + (uint32_t)M[i + 3] * (uint32_t)(int32_t)V[1]
+                     + (uint32_t)M[i + 6] * (uint32_t)(int32_t)V[2];
+        O[i] = (int32_t)((uint32_t)((int32_t)acc >> 12) + (uint32_t)M[i + 9]);
+    }
+    memcpy(op, O, sizeof O);
+    cpu->r[1] = (uint32_t)M[9];
+    cpu->r[2] = (uint32_t)(int32_t)V[2];
+    cpu->r[12] = (uint32_t)O[1];
+    g_vtx_hits++;
+}
+
 static void hook_native_memcpy(GuestCpu *cpu, GuestMem *mem, void *user) {
     uint32_t dst = cpu->r[0], src = cpu->r[1], len = cpu->r[2];
     void *d;
@@ -3284,7 +3340,10 @@ static void run(void) {
     g.hle.count = n + 1;
     startup_stage_write("07 imports bound");
 
-    static GuestHook hooks[16];
+    /* 24, not 16: ctype takes the count to 11, the divide block to 16, and
+     * the vertex transform made that one past the end. Sized with room so
+     * the next hook is not a silent overrun. */
+    static GuestHook hooks[24];
     hooks[0].addr = g_img.load_base + RVA_MGR_MALLOC;
     hooks[0].fn = hook_malloc;
     hooks[1].addr = g_img.load_base + RVA_MGR_REALLOC;
@@ -3338,7 +3397,9 @@ static void run(void) {
         hooks[d + 3].fn = hook_f32_guard;
         hooks[d + 4].addr = g_img.load_base + RVA_F32_MUL_GUARD;
         hooks[d + 4].fn = hook_f32_mul_guard;
-        g.hook_count = d + 5;
+        hooks[d + 5].addr = g_img.load_base + RVA_VTX_TRANSFORM;
+        hooks[d + 5].fn = hook_vtx_transform;
+        g.hook_count = d + 6;
     }
 
     g.cpu.r[GUEST_SP] = STACK_BASE + STACK_SIZE - 16;
@@ -3444,6 +3505,8 @@ static void run(void) {
            (unsigned)g.jit_blocks, (unsigned long long)g.jit_executed,
            (unsigned long long)g.executed,
            g.executed ? 100.0 * (double)g.jit_executed / (double)g.executed : 0.0);
+    printf("  [fast ] vertex transform: %u hooked, %u skipped (unmapped)\n",
+           (unsigned)g_vtx_hits, (unsigned)g_vtx_skips);
     printf("fastmem: memcpy %u calls/%llu bytes, memset %u calls/%llu bytes\n",
            (unsigned)g_fast_mem_hits[0],
            (unsigned long long)g_fast_mem_bytes[0],
