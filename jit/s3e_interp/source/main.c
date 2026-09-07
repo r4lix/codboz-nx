@@ -3392,12 +3392,34 @@ static void run(void) {
      * page, callback trampolines) falls out on the bounds test rather than
      * needing its own range. ~440 KB for a 7 MB image; if the allocation
      * fails the pointer stays NULL and the loop skips it. */
-    g.pcprof_base = g_img.load_base;
-    g.pcprof_buckets = (g_img.image_size + 15u) >> 4;
-    g.iprof = g_iprof;
-    g.pcprof = (uint32_t *)calloc(g.pcprof_buckets, sizeof(uint32_t));
-    if (!g.pcprof)
-        g.pcprof_buckets = 0;
+    /* Both profilers are opt-in, because both cost per-instruction work on the
+     * one path every guest instruction takes: pcprof is three field loads and
+     * an increment into a ~440 KB array, iprof a load and an increment in both
+     * decoders. The host bench has always gated iprof for exactly this reason
+     * -- "the counter is itself per-instruction work" -- while the device build
+     * left both running permanently, folding their cost into every frame the
+     * game has ever rendered here.
+     *
+     * Put profile.txt on the card when choosing what to hook; leave it off to
+     * play. The reports already handle a NULL pointer by printing nothing. */
+    {
+        static const char *prof_paths[] = {
+            "sdmc:/switch/boz/profile.txt", "sdmc:/profile.txt" };
+        int want_prof = 0, k;
+        for (k = 0; k < 2; k++) {
+            FILE *f = fopen(prof_paths[k], "rb");
+            if (f) { fclose(f); want_prof = 1; }
+        }
+        g.pcprof_base = g_img.load_base;
+        g.pcprof_buckets = (g_img.image_size + 15u) >> 4;
+        if (want_prof) {
+            g.iprof = g_iprof;
+            g.pcprof = (uint32_t *)calloc(g.pcprof_buckets, sizeof(uint32_t));
+        }
+        if (!g.pcprof)
+            g.pcprof_buckets = 0;
+        printf("profilers %s\n", want_prof ? "on (profile.txt)" : "off");
+    }
     g.hle.slot = g_slots;
     g.hle.count = n + 1;
     startup_stage_write("07 imports bound");

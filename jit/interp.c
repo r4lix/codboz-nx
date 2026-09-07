@@ -2357,6 +2357,19 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
 #ifdef BOZ_JIT
     void *jitctx = g->jit;
 #endif
+    /* Hoisted for the run, for the same reason jitctx is: handlers called
+     * from inside this loop are opaque, so the compiler must assume any of
+     * them could change these and reload on every guest instruction.
+     * Between them that was four loads and a read-modify-write per
+     * instruction on the one path every instruction takes. guest_run is
+     * entered once per few million instructions, so a stale copy is at
+     * worst one run late -- hooks are installed at startup and the watch is
+     * a bring-up tool. */
+    uint32_t *pcprof = g->pcprof;
+    uint32_t pcprof_base = g->pcprof_base;
+    uint32_t pcprof_buckets = g->pcprof_buckets;
+    uint32_t watch_addr = g->mem.watch_addr;
+    uint32_t hook_count = g->hook_count;
     uint8_t hook_map[256];
     /* Once per guest_run, not once per instruction: this is entered every few
      * million instructions, so the guard costs nothing measurable and no call
@@ -2366,10 +2379,10 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
         thumb_kind_init();
         kinds_ready = 1;
     }
-    if (g->hook_count) {
+    if (hook_count) {
         uint32_t i;
         memset(hook_map, 0, sizeof hook_map);
-        for (i = 0; i < g->hook_count; i++)
+        for (i = 0; i < hook_count; i++)
             hook_map[((g->hook[i].addr & ~1u) >> 1) & 0xFFu] = 1;
     }
 
@@ -2386,18 +2399,18 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
         /* Only stamp the PC when something is actually watching for it. The
          * watch is a bring-up tool for finding what corrupts a guest word;
          * paying a store per instruction to keep it ready cost 2.8%. */
-        if (g->mem.watch_addr)
+        if (watch_addr)
             g->mem.current_pc = pc;
 
-        if (g->pcprof) {
-            uint32_t off = ((pc & ~1u) - g->pcprof_base) >> 4;
-            if (off < g->pcprof_buckets)
-                g->pcprof[off]++;
+        if (pcprof) {
+            uint32_t off = ((pc & ~1u) - pcprof_base) >> 4;
+            if (off < pcprof_buckets)
+                pcprof[off]++;
         }
 
-        if (g->hook_count && hook_map[(pc >> 1) & 0xFFu]) {
+        if (hook_count && hook_map[(pc >> 1) & 0xFFu]) {
             uint32_t hi;
-            for (hi = 0; hi < g->hook_count; hi++) {
+            for (hi = 0; hi < hook_count; hi++) {
                 if ((g->hook[hi].addr & ~1u) != pc)
                     continue;
                 g->hook[hi].fn(&g->cpu, &g->mem, g->hook[hi].user);
@@ -2405,7 +2418,7 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
                     branch_interworking(&g->cpu, g->cpu.r[GUEST_LR]);
                 break;
             }
-            if (hi < g->hook_count && !g->hook[hi].observe) {
+            if (hi < hook_count && !g->hook[hi].observe) {
                 g->executed++;
                 continue;
             }

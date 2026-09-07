@@ -56,34 +56,41 @@ extern volatile uint32_t g_native_stage;
 typedef uint32_t (*JitBlockFn)(Guest *g);
 typedef uint32_t (*JitEnterFn)(Guest *g, void *blk, uint32_t budget);
 
+/* Exactly 12 bytes, and that is the whole point.
+ *
+ * This was 36 bytes across 65536 slots -- 2.25 MB, indexed by a multiplicative
+ * hash, against a 2 MB L2 shared with the rest of the system. The hash was the
+ * worst part: PCs are dense and local, and hashing them deliberately destroys
+ * the locality that would have kept the live part of the table resident. Every
+ * block dispatch was a probable L2 miss before it even reached the code cache.
+ *
+ * That is the shape the measurements were describing all along. Raising
+ * coverage from 1% to 67% changed the frame rate not at all, and removing 970M
+ * bailed instructions changed it not at all; both are only possible if the
+ * cost is per-BLOCK rather than per-instruction, and at ~5.5 guest
+ * instructions per block a dispatch was costing more than interpreting the
+ * block it dispatched to.
+ *
+ * So the fields a dispatch actually touches live here, and everything that
+ * exists for reporting or for installing a link -- which happens once per edge,
+ * not once per execution -- moved to JitCold alongside. */
 typedef struct {
     uint32_t key;               /* PC | Thumb bit */
     uint32_t rx_off;
     uint16_t count;
     uint8_t  state;             /* 0 empty, 1 claimed, 2 compiled, 3 reject */
-    /* Why this block is not longer, and how much that costs.
-     *
-     * Blocks average 1.6 guest instructions, which is too short for the JIT to
-     * repay its own overhead, and the obvious explanation was wrong: lowering
-     * ARM loads added blocks without lengthening them. Rather than guess again,
-     * record the encoding that ended each block and weight it by how often the
-     * block actually runs -- a rejection in a block executed a million times
-     * matters, the same rejection in one executed twice does not. */
+    uint8_t  linked;            /* 1 also means "has no link slot to install" */
+} JitEntry;
+
+/* Same index as JitEntry, touched only when compiling, installing a link, or
+ * reporting. Kept out of the dispatch path entirely. */
+typedef struct {
     uint32_t execs;
     uint32_t end_insn;          /* 0 when the block ended on its own terms */
-    uint8_t  end_thumb;
-    /* Direct link to the successor block.
-     *
-     * A block that leaves on a known constant PC ends with a branch slot that
-     * initially falls through to its RET. Once the dispatcher has actually
-     * seen this block hand over to that successor, and the successor is
-     * compiled, the slot is patched to jump straight there -- no return to C,
-     * no hash lookup, no re-entry. link_word is the word index of the slot
-     * within the code cache, link_key the successor's PC|thumb. */
     uint32_t link_word;         /* 0 = block has no link slot */
     uint32_t link_key;
-    uint8_t  linked;
-} JitEntry;
+    uint8_t  end_thumb;
+} JitCold;
 
 /* One hotness counter. No PC is stored -- a 16-bit tag taken from bits of the
  * hash that the index does not use is enough to tell two PCs apart cheaply,
@@ -99,6 +106,7 @@ typedef struct {
     uint8_t *rw, *rx;
     uint32_t used;
     JitEntry *entry;
+    JitCold  *cold;
     JitCount *count;
     uint32_t enter_off;         /* trampoline that owns w19/w20 */
     JitEntry *last;             /* block executed on the previous dispatch */
@@ -1128,8 +1136,17 @@ static int jit_hot(JitContext *j, uint32_t key) {
     return c->hits >= JIT_HOT_COUNT;
 }
 
+/* Indexed by the PC itself, not a hash of it.
+ *
+ * A multiplicative hash is the right choice when keys are arbitrary; these are
+ * program counters, which are dense, local, and executed in runs. Hashing them
+ * spreads a hot loop's blocks uniformly across 65536 slots and guarantees the
+ * table behaves like its full size. Shifting off the Thumb bit and taking the
+ * low bits instead keeps neighbouring PCs in neighbouring slots, so a hot loop
+ * touches a handful of lines rather than a handful of pages. Linear probing is
+ * unchanged, so entries are still never displaced once claimed. */
 static JitEntry *lookup(JitContext *j, uint32_t key) {
-    uint32_t i = (key * 2654435761u) & (JIT_CACHE_SLOTS - 1u), n;
+    uint32_t i = (key >> 1) & (JIT_CACHE_SLOTS - 1u), n;
     for (n = 0; n < 16; n++, i = (i + 1u) & (JIT_CACHE_SLOTS - 1u)) {
         if (!j->entry[i].state || j->entry[i].key == key)
             return &j->entry[i];
@@ -1151,8 +1168,8 @@ static int compile_block(Guest *g, JitContext *j, JitEntry *e, uint32_t until) {
         e->state = 3;
         return 0;
     }
-    e->end_insn = end_insn;
-    e->end_thumb = (uint8_t)thumb;
+    j->cold[e - j->entry].end_insn = end_insn;
+    j->cold[e - j->entry].end_thumb = (uint8_t)thumb;
     /* A block that lowered nothing is worse than no block: it stays in the
      * cache as "compiled", so every visit to this PC pays an indirect call
      * into generated code that immediately returns zero, and the interpreter
@@ -1179,9 +1196,14 @@ static int compile_block(Guest *g, JitContext *j, JitEntry *e, uint32_t until) {
     e->count = count;
     e->state = 2;
     /* Word index of the chain slot within the cache, not within the block. */
-    e->link_word = a.link_word ? (off / 4u) + a.link_word : 0u;
-    e->link_key = a.link_key;
-    e->linked = 0;
+    {
+        JitCold *cd = &j->cold[e - j->entry];
+        cd->link_word = a.link_word ? (off / 4u) + a.link_word : 0u;
+        cd->link_key = a.link_key;
+        /* "linked" doubles as "nothing left to install", so a block with no
+         * link slot never costs the dispatcher a second look. */
+        e->linked = cd->link_word ? 0u : 1u;
+    }
     j->used = off + bytes;
     g->jit_blocks++;
     if (g->jit_blocks == 1 || g->jit_blocks == 100 ||
@@ -1221,8 +1243,9 @@ static uint32_t emit_enter(A64 *a) {
  * goes with them. Links are installed once per edge and there are only as many
  * edges as blocks, so the cost is bounded and paid during warm-up. */
 static void jit_link(JitContext *j, JitEntry *from, JitEntry *to) {
-    uint32_t *slot_rw = (uint32_t *)j->rw + from->link_word;
-    int32_t delta = (int32_t)(to->rx_off / 4u) - (int32_t)from->link_word;
+    uint32_t link_word = j->cold[from - j->entry].link_word;
+    uint32_t *slot_rw = (uint32_t *)j->rw + link_word;
+    int32_t delta = (int32_t)(to->rx_off / 4u) - (int32_t)link_word;
     Result rc;
     if (delta > 0x01FFFFFF || delta < -0x02000000)
         return;                         /* out of B range; leave it returning */
@@ -1234,7 +1257,7 @@ static void jit_link(JitContext *j, JitEntry *from, JitEntry *to) {
     rc = jitTransitionToExecutable(&j->code);
     if (R_FAILED(rc))
         return;
-    armICacheInvalidate((uint32_t *)j->rx + from->link_word, 4);
+    armICacheInvalidate((uint32_t *)j->rx + link_word, 4);
     from->linked = 1;
     j->links++;
 }
@@ -1247,12 +1270,14 @@ int guest_jit_init(Guest *g) {
     if (!j) return 0;
     j->entry = (JitEntry *)calloc(JIT_CACHE_SLOTS, sizeof *j->entry);
     if (!j->entry) { free(j); return 0; }
+    j->cold = (JitCold *)calloc(JIT_CACHE_SLOTS, sizeof *j->cold);
+    if (!j->cold) { free(j->entry); free(j); return 0; }
     j->count = (JitCount *)calloc(JIT_HOT_SLOTS, sizeof *j->count);
-    if (!j->count) { free(j->entry); free(j); return 0; }
+    if (!j->count) { free(j->cold); free(j->entry); free(j); return 0; }
     rc = jitCreate(&j->code, JIT_CODE_SIZE);
     if (R_FAILED(rc)) {
         printf("  [jit  ] unavailable (jitCreate=%08x), interpreter only\n", rc);
-        free(j->count); free(j->entry); free(j); return 0;
+        free(j->count); free(j->cold); free(j->entry); free(j); return 0;
     }
     j->rw = (uint8_t *)jitGetRwAddr(&j->code);
     j->rx = (uint8_t *)jitGetRxAddr(&j->code);
@@ -1318,7 +1343,7 @@ void guest_jit_close(Guest *g) {
     JitContext *j = (JitContext *)g->jit;
     if (!j) return;
     jitClose(&j->code);
-    free(j->count); free(j->entry); free(j); g->jit = NULL;
+    free(j->count); free(j->cold); free(j->entry); free(j); g->jit = NULL;
 }
 
 /* r16 hardware trial: enable the deliberately narrow tier automatically. */
@@ -1346,27 +1371,28 @@ void guest_jit_report_blockers(Guest *g) {
     memset(worst_insn, 0, sizeof worst_insn);
     for (i = 0; i < JIT_CACHE_SLOTS; i++) {
         JitEntry *e = &j->entry[i];
+        JitCold *cd = &j->cold[i];
         uint32_t idx;
-        if (e->state != 2 || !e->execs || !e->end_insn)
+        if (e->state != 2 || !cd->execs || !cd->end_insn)
             continue;
         /* Thumb encodes immediate bits in the top byte, so keying on it
          * splits one instruction class across eight rows and makes each look
          * small: STR is 0x60-0x67 and LDR is 0x68-0x6F. That is how "no Thumb
          * load/store lowering at all" hid behind a 20% row. Key on the major
          * opcode instead, and report it as a representative encoding. */
-        idx = e->end_thumb ? ((e->end_insn >> 11) & 0x1Fu)
-                           : (256u + ((e->end_insn >> 20) & 0xFFu));
-        weight[idx] += e->execs;
-        total += e->execs;
+        idx = cd->end_thumb ? ((cd->end_insn >> 11) & 0x1Fu)
+                            : (256u + ((cd->end_insn >> 20) & 0xFFu));
+        weight[idx] += cd->execs;
+        total += cd->execs;
         /* Keep the busiest block in each bucket. A bucket is four hex digits
          * of an encoding and several different instructions share one -- ADR
          * and a jump-table "ADD pc,rn,#imm" both land in ARM 0028 -- so the
          * bucket alone has repeatedly sent me lowering the wrong thing. An
          * address can just be disassembled. */
-        if (e->execs > worst_ex[idx]) {
-            worst_ex[idx] = e->execs;
+        if (cd->execs > worst_ex[idx]) {
+            worst_ex[idx] = cd->execs;
             worst_pc[idx] = e->key & ~1u;
-            worst_insn[idx] = e->end_insn;
+            worst_insn[idx] = cd->end_insn;
         }
     }
     g->jit_links = j->links;
@@ -1442,10 +1468,14 @@ int guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
      * link to a PC carrying a hook (an observe hook falls through to the JIT,
      * and a chain would silently skip it), and never while verifying, because
      * the verifier re-runs one block at a time and a chain is not one block. */
-    if (j->chain && j->last && !j->last->linked &&
-        j->last->link_word && j->last->link_key == key &&
-        !g->jit_verify && !has_hook(g, key & ~1u))
-        jit_link(j, j->last, e);
+    /* `linked` is the hot flag and is set for blocks with no slot too, so the
+     * common case costs one byte already in the line the dispatch just read.
+     * Only an unlinked block with something to install reaches the cold half. */
+    if (j->chain && j->last && !j->last->linked && !g->jit_verify) {
+        JitCold *lc = &j->cold[j->last - j->entry];
+        if (lc->link_key == key && !has_hook(g, key & ~1u))
+            jit_link(j, j->last, e);
+    }
     {
         JitEnterFn enter;
         void *blk = j->rx + e->rx_off;
@@ -1487,7 +1517,11 @@ int guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
         g->jit_bail_lost += e->count - n;
     }
     *retired = n;
-    e->execs++;
+    /* Per-execution counter, and it lives in the cold half: touching it on
+     * every dispatch would pull a second line in and undo the split. It exists
+     * only to weight the blocker report, so it is kept while profiling. */
+    if (g->pcprof)
+        j->cold[e - j->entry].execs++;
     g->jit_executed += n;
     return 1;
 }
