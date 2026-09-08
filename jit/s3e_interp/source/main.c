@@ -2374,6 +2374,12 @@ static uint64_t g_prof_slot_ticks[512];
 static uint32_t g_prof_slot_calls[512];
 static uint32_t g_prof_slot;
 
+/* The guest clock itself lives with hle_timer_ms far below; these two are
+ * up here because the frame report prints how often a frame the game asks
+ * the time, which is the number that made the clock a bug, not a detail. */
+static uint32_t g_clock_queries;
+static int g_clock_fixed;
+
 static void hle_profile(uint32_t slot, int enter) {
     uint64_t now = armGetSystemTick();
     if (enter) {
@@ -2425,6 +2431,7 @@ static void frame_profile_report(void) {
          * split came to report glClear 12% on its first print. */
         pc_profile_clear();
         i_profile_clear();
+        g_clock_queries = 0;
         return;
     }
     total = now - window_start;
@@ -2457,6 +2464,16 @@ static void frame_profile_report(void) {
                (unsigned long long)(bestv * 100ull / total),
                (unsigned)g_prof_slot_calls[best[b]]);
     }
+
+    /* Queries per frame is the whole diagnosis of the clock bug: at one per
+     * frame the fixed step ran slow, above about three it ran fast. Printed
+     * under either clock, so a fixed-step run can still be characterised. */
+    printf("  [clock] %s, %u queries/300f = %llu.%llu per frame\n",
+           g_clock_fixed ? "fixed 16 ms/query" : "real time",
+           (unsigned)g_clock_queries,
+           (unsigned long long)(g_clock_queries / 300u),
+           (unsigned long long)((g_clock_queries % 300u) * 10u / 300u));
+    g_clock_queries = 0;
 
     memset(g_prof_slot_ticks, 0, sizeof g_prof_slot_ticks);
     memset(g_prof_slot_calls, 0, sizeof g_prof_slot_calls);
@@ -2694,17 +2711,49 @@ static void hle_gl_getint(GuestCpu *cpu, GuestMem *mem, void *user) {
     cpu->r[0] = v;
 }
 
-/* A virtual clock, 16 ms per query, matching the Unicorn reference exactly.
- * Real time would make the run non-deterministic and destroy the differential;
- * but the stub that returned a constant 0 was worse than either, because any
- * "wait until N ms have elapsed" loop then never terminates -- that is what
- * pinned the run in a spin from 10M to 50M instructions. */
-static uint32_t g_ticks;
+/* The guest clock.
+ *
+ * This was a virtual clock: 16 ms added PER QUERY, matching the Unicorn
+ * reference exactly so a run stayed reproducible. The constant-0 stub it
+ * replaced was worse than either, because any "wait until N ms have elapsed"
+ * loop then never terminates -- that is what pinned the run in a spin from 10M
+ * to 50M instructions.
+ *
+ * But per query is not per frame. The game asks the time several times a frame,
+ * so the clock advanced several times 16 ms per frame and ran AHEAD of real
+ * time: game speed = 16 ms x queries-per-frame x fps / 1000. That is why
+ * zombies and NPCs moved too fast at 21 fps, and it is linear in frame rate --
+ * every optimisation made the game run faster rather than smoother, so 30 fps
+ * would have been 1.4x as fast again and 60 fps 2.8x. The natural guess, that a
+ * fixed step means slow motion, is only true at exactly one query per frame.
+ *
+ * Real elapsed time removes the coupling: the game plays at one speed whatever
+ * the frame rate. Two queries in the same millisecond now return the same
+ * value, which the fixed step never did -- but that is exactly what the game
+ * saw on the hardware it shipped on, so its own dt handling already covers it.
+ *
+ * Every query reads the tick afresh rather than returning a value latched once
+ * per frame, so an in-frame wait loop still terminates. The old counter stays
+ * one file away (fixedclock.txt) because reproducibility is what a comparison
+ * against the Unicorn reference needs; hostdiff keeps its own copy regardless. */
+static uint32_t g_ticks;              /* the fixed-step fallback's counter */
+static uint64_t g_clock_base;         /* tick at the first query */
 
 static void hle_timer_ms(GuestCpu *cpu, GuestMem *mem, void *user) {
     (void)mem; (void)user;
-    g_ticks += 16;
-    cpu->r[0] = g_ticks;
+    g_clock_queries++;
+    if (g_clock_fixed) {
+        g_ticks += 16;
+        cpu->r[0] = g_ticks;
+        return;
+    }
+    {
+        uint64_t now = armGetSystemTick();
+        if (!g_clock_base)
+            g_clock_base = now;
+        cpu->r[0] = (uint32_t)(((now - g_clock_base) * 1000ull)
+                               / armGetSystemTickFreq());
+    }
 }
 
 /* Log each unimplemented import once rather than the first N calls: the
@@ -3743,6 +3792,23 @@ static void run(void) {
             g.pcprof_buckets = 0;
         printf("profilers %s\n", want_prof ? "on (profile.txt)" : "off");
     }
+
+    /* Real time, or the old fixed 16 ms step; see hle_timer_ms. Real time
+     * is the default now -- the fixed step made game speed a function of
+     * frame rate. fixedclock.txt puts the reproducible clock back, which is
+     * what a run compared against the Unicorn reference needs. */
+    {
+        static const char *clk_paths[] = {
+            "sdmc:/switch/boz/fixedclock.txt", "sdmc:/fixedclock.txt" };
+        int k;
+        for (k = 0; k < 2; k++) {
+            FILE *f = fopen(clk_paths[k], "rb");
+            if (f) { fclose(f); g_clock_fixed = 1; }
+        }
+        printf("clock %s\n", g_clock_fixed
+               ? "fixed 16 ms/query (fixedclock.txt)" : "real time");
+    }
+
     g.hle.slot = g_slots;
     g.hle.count = n + 1;
     startup_stage_write("07 imports bound");
