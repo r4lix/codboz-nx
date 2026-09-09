@@ -16,12 +16,40 @@
 
 #include "guest.h"
 
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
+
+/* ---- JIT dispatch cost ------------------------------------------------
+ *
+ * The measurement the review asked for and this port never took. The ledger
+ * records the JIT as a net loss and blames per-block register round-tripping.
+ * The arithmetic does not support that: at 66% coverage a 5.5-instruction
+ * block costs something like 800-1100 cycles, and the emitted code can only
+ * account for 100-200 of them. The rest has the shape of L2 and TLB misses --
+ * a 768 KB entry table and an 8 MB code cache against a 2 MB shared L2 --
+ * which is a fixable problem, where register traffic is not.
+ *
+ * Two facts already in the ledger point the same way and nothing else explains
+ * them: shrinking the entry table 2.25 MB -> 768 KB gave +15.2% while altering
+ * no lowering, and the JIT configuration is the only one whose frame rate
+ * moves with the memory clock.
+ *
+ * Sampled one dispatch in 64 so the tick reads stay off the hot path -- at
+ * 19.2 MHz a paired read is a real cost if taken every time, and the mean over
+ * a few hundred thousand samples is what is wanted, not per-call precision.
+ *
+ * Read it with the EMC test: ~350-450 ns per dispatch that MOVES with memory
+ * clock confirms footprint and makes the L0 dispatch cache worth building.
+ * ~100 ns and flat kills the hypothesis, and the JIT stays off for good. */
+uint64_t g_jitprof_ticks, g_jitprof_samples, g_jitprof_ran;
+
 #ifndef __SWITCH__
 
 int guest_jit_init(Guest *g) { (void)g; return 0; }
 void guest_jit_close(Guest *g) { (void)g; }
-int guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
-                      uint32_t *retired) {
+static int jit_try_run_inner(Guest *g, uint32_t until, uint64_t remaining,
+                             uint32_t *retired) {
     (void)g; (void)until; (void)remaining;
     *retired = 0;
     return 0;
@@ -1465,8 +1493,8 @@ static int jit_wanted(void) {
     return 1;
 }
 
-int guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
-                      uint32_t *retired) {
+static int jit_try_run_inner(Guest *g, uint32_t until, uint64_t remaining,
+                             uint32_t *retired) {
     JitContext *j;
     JitEntry *e;
     uint32_t key, n;
@@ -1566,3 +1594,21 @@ int guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
 }
 
 #endif
+
+/* See the note on g_jitprof_ticks above. */
+int guest_jit_try_run(Guest *g, uint32_t until, uint64_t remaining,
+                      uint32_t *retired) {
+#ifdef __SWITCH__
+    static uint32_t seq;
+    if ((++seq & 63u) == 0u) {
+        uint64_t t0 = armGetSystemTick();
+        int r = jit_try_run_inner(g, until, remaining, retired);
+        g_jitprof_ticks += armGetSystemTick() - t0;
+        g_jitprof_samples++;
+        if (r && *retired)
+            g_jitprof_ran++;
+        return r;
+    }
+#endif
+    return jit_try_run_inner(g, until, remaining, retired);
+}
