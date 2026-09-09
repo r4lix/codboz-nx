@@ -156,6 +156,20 @@ typedef struct {
     int         undo_active;
     uint32_t    undo_n;
     uint32_t    undo_overflow;  /* writes past the log's capacity */
+    /* Page mode. The per-store log above is right for the JIT, whose
+     * blocks are about five instructions and so write a handful of
+     * words. It is the wrong shape for whole translated FUNCTIONS: one
+     * that calls out has to log every store its callees make too, and a
+     * list walk calling a method per element exhausts 256 entries in a
+     * few iterations.
+     *
+     * Page mode records the 4 KB page a store lands in, once, however
+     * many times that page is written. A loop hammering one structure
+     * costs one slot instead of overflowing, which is exactly the shape
+     * of the code the recompiler exists to handle. Selected per checked
+     * call, so the JIT keeps the behaviour proven over 107M blocks. */
+    int         undo_page_mode;
+    uint32_t    pgsnap_n;
     /* Slot tables for JIT-generated code (see GuestSlot). Pointers rather than
      * arrays for the same reason the undo log is external: 8 KB of table in
      * the middle of this struct would push the fields the interpreter reads on
@@ -220,6 +234,16 @@ void guest_slots_build(GuestMem *m);
  * entries in the middle of it would push cache_base and the region array onto
  * different lines. */
 extern GuestUndo guest_undo_log[GUEST_UNDO_MAX];
+
+#define GUEST_PGSNAP_MAX  32u
+#define GUEST_PGSNAP_SIZE 4096u
+extern uint32_t guest_pgsnap_base[GUEST_PGSNAP_MAX];
+extern uint8_t  guest_pgsnap_data[GUEST_PGSNAP_MAX][GUEST_PGSNAP_SIZE];
+
+/* Copy the recorded pages out to `out` (as they stand now), or put the
+ * recorded originals back. Both are no-ops when nothing was recorded. */
+void guest_pgsnap_save(GuestMem *m, uint8_t (*out)[GUEST_PGSNAP_SIZE]);
+void guest_pgsnap_restore(GuestMem *m);
 
 /* Record a store about to happen. Only called when undo_active. */
 void guest_undo_record(GuestMem *m, uint32_t addr, uint32_t size);

@@ -2318,6 +2318,63 @@ static int jit_verify_block(Guest *g, const GuestCpu *before, uint32_t retired) 
     return 1;
 }
 
+/* ---- T16 MOV high-register fast path (predecode spike) -----------------
+ *
+ * 0x46xx is 9% of the in-game instruction stream -- the single largest entry
+ * in the mix, ahead of LDR immediate at 7%. It is also one of the cheapest
+ * instructions in the ISA: copy one register to another, no flags, no memory.
+ * Which is the whole argument for predecoding: at ~105 cycles per guest
+ * instruction, essentially all of that is dispatch, not work.
+ *
+ * What the normal path costs for this instruction: a call into step_thumb
+ * (7.3 KB, not inlined), a reload of r15, the instruction fetch, a load from
+ * g_thumb_kind[], a 20-way switch through a jump table -- the worst-predicted
+ * branch in the loop -- and only then three lines of actual semantics.
+ *
+ * This spike skips all of it and keeps only the fetch. It deliberately does
+ * NOT build the predecode cache: the point is to find out whether removing
+ * the call, the kind load and the switch is worth anything on this core
+ * BEFORE committing weeks to a cache. Your ledger records that removing five
+ * to eight independent host instructions per guest instruction measured
+ * exactly 0.0%, because an out-of-order A57 hides them in stalls it takes
+ * anyway. Only shortening a dependency chain has ever paid here.
+ *
+ * The cost side is honest and measurable: every Thumb instruction that is NOT
+ * 0x46xx now pays one extra guest_ifetch16, because step_thumb fetches again.
+ * That is 91% of the stream paying a duplicated L1 load to save 9% a call and
+ * a mispredict. If the result is positive, the full cache -- which removes the
+ * duplicate fetch and covers the other formats -- is clearly worth building.
+ * If it is zero or negative, the approach is answered for a day's work rather
+ * than a month's.
+ *
+ * Semantics replicated exactly from TK_HIREG op 2: rd from bit 7 and bits 2-0,
+ * rm from bits 6-3, the value being pc+4 when rm is 15 (Align is not applied
+ * for MOV) and r[rm] otherwise, no flag update, pc advancing by 2.
+ *
+ * Excluded from the fast path, each falling through to step_thumb unchanged:
+ *   - rd == 15, which is a branch with interworking, not a move
+ *   - itstate != 0, so the IT machinery is never bypassed
+ *   - a failed fetch, which must fault through the normal path
+ */
+uint64_t g_fastpath_hits, g_fastpath_miss;
+
+/* Direct-mapped "could this PC be a hook" filter, and the hook_count it
+ * was built for. File scope rather than a Guest field to leave that
+ * struct's layout alone -- the fields the interpreter touches per access
+ * are on cache lines worth not disturbing for 256 bytes of table. */
+static uint8_t  g_hook_map[256];
+static uint32_t g_hook_map_for = 0xFFFFFFFFu;
+
+/* Off unless predecode.txt is on the card.
+ *
+ * The point of the flag is that both arms of a measurement then run the
+ * SAME BINARY. Comparing two builds left the frame counts free to differ --
+ * the control landed on 420 frames in the gameplay window where every other
+ * run gave 475 -- and a window whose frame count does not match its pair is
+ * not a comparison at all. With one binary the guest workload is identical
+ * by construction and the only variable is this flag. */
+int g_predecode;
+
 GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
     uint64_t start = g->executed;
     /* Reject non-hook PCs with one table lookup.
@@ -2370,7 +2427,10 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
     uint32_t pcprof_buckets = g->pcprof_buckets;
     uint32_t watch_addr = g->mem.watch_addr;
     uint32_t hook_count = g->hook_count;
-    uint8_t hook_map[256];
+    /* Hoisted for the run, as jitctx and pcprof are: set once at startup
+     * from the card, so a stale copy is at worst one guest_run late, and
+     * the hot path tests a register instead of reloading a global. */
+    int predecode = g_predecode;
     /* Once per guest_run, not once per instruction: this is entered every few
      * million instructions, so the guard costs nothing measurable and no call
      * site has to remember to initialise the interpreter. */
@@ -2379,11 +2439,26 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
         thumb_kind_init();
         kinds_ready = 1;
     }
-    if (hook_count) {
+    /* Built once, not once per guest_run.
+     *
+     * This was a 256-byte memset plus a loop over every hook on every entry to
+     * guest_run -- free when that happens once per 5M instructions, which is
+     * what it did when it was written. It stopped being free the moment
+     * recomp_call started re-entering guest_run for every outbound call a
+     * translated function makes: a list walk with a virtual call per element
+     * pays the whole setup per element, against the seven interpreted
+     * instructions the translation was supposed to save.
+     *
+     * Keyed on hook_count because hooks are installed once during startup and
+     * never move afterwards. The `observe` flag does change at runtime -- both
+     * hook_recomp and the fast-path decline path toggle it -- but observe is
+     * not part of this map, only the addresses are. */
+    if (hook_count && g_hook_map_for != hook_count) {
         uint32_t i;
-        memset(hook_map, 0, sizeof hook_map);
+        memset(g_hook_map, 0, sizeof g_hook_map);
         for (i = 0; i < hook_count; i++)
-            hook_map[((g->hook[i].addr & ~1u) >> 1) & 0xFFu] = 1;
+            g_hook_map[((g->hook[i].addr & ~1u) >> 1) & 0xFFu] = 1;
+        g_hook_map_for = hook_count;
     }
 
     while (g->executed - start < limit) {
@@ -2408,7 +2483,7 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
                 pcprof[off]++;
         }
 
-        if (hook_count && hook_map[(pc >> 1) & 0xFFu]) {
+        if (hook_count && g_hook_map[(pc >> 1) & 0xFFu]) {
             uint32_t hi;
             for (hi = 0; hi < hook_count; hi++) {
                 if ((g->hook[hi].addr & ~1u) != pc)
@@ -2471,10 +2546,31 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
         }
 #endif
 
-        if (guest_is_stub(pc))
+        if (guest_is_stub(pc)) {
             st = dispatch_stub(g);
-        else {
-            st = guest_is_thumb(&g->cpu) ? step_thumb(g) : step_arm(g);
+        } else if (guest_is_thumb(&g->cpu)) {
+            uint32_t hw;
+            if (predecode && !g->cpu.itstate &&
+                guest_ifetch16(&g->mem, pc, &hw) &&
+                (hw & 0xFF00u) == 0x4600u) {
+                uint32_t rd = ((hw >> 4) & 8u) | (hw & 7u);
+                if (rd != 15u) {
+                    uint32_t rm = (hw >> 3) & 0xFu;
+                    /* step_thumb would have counted this one; keep the mix
+                     * report honest rather than silently hiding 9% of it. */
+                    if (g->iprof)
+                        g->iprof[hw >> 8]++;
+                    g->cpu.r[rd] = (rm == 15u) ? (pc + 4u) : g->cpu.r[rm];
+                    g->cpu.r[15] = pc + 2u;
+                    g->executed++;
+                    g_fastpath_hits++;
+                    continue;
+                }
+            }
+            g_fastpath_miss++;
+            st = step_thumb(g);
+        } else {
+            st = step_arm(g);
         }
 
         if (st != GUEST_OK) {

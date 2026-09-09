@@ -71,12 +71,48 @@ CFLAGS	+=	-DBOZ_JIT
 # reintroduce the last-bit difference against real hardware.
 CFLAGS	+=	-ffp-contract=off
 
+# Profile-guided optimisation, the last item on the performance plan with a
+# plausible double-digit gain. Two passes:
+#
+#   make PGO=gen     instrumented; run the benchmark, then fetch the .gcda
+#                    files off the card with the control socket's GET
+#   make PGO=use     rebuilt using them
+#
+# BOZ_PGO also switches on the GCOV_PREFIX redirection and the explicit
+# __gcov_dump() in main.c -- nothing calls exit() on the normal path, so the
+# counters would never be flushed otherwise.
+#
+# -fprofile-correction because the guest runs on one thread but the profile is
+# gathered across a run that libnx may service from another; without it gcc
+# treats inconsistent counters as an error rather than smoothing them.
+ifeq ($(PGO),gen)
+CFLAGS	+=	-fprofile-generate -DBOZ_PGO
+LDFLAGS	+=	-fprofile-generate
+# -lgcov goes in LIBS, not LDFLAGS. devkitPro's link rule expands LDFLAGS
+# BEFORE the object files, and a static archive only resolves references the
+# linker has already seen -- so -lgcov placed there is scanned against nothing
+# and every __gcov_merge_* reference comes out undefined even though libgcov.a
+# defines all of them.
+endif
+ifeq ($(PGO),use)
+CFLAGS	+=	-fprofile-use -fprofile-correction -Wno-missing-profile
+endif
+
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions
 
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
 LIBS	:= -lGLESv1_CM -lEGL -lglapi -ldrm_nouveau -lstdc++ -lm -lnx
+
+# After the assignment above, not before it: LIBS is set with := further down
+# the file than the PGO block, so adding -lgcov up there was simply
+# overwritten. It has to be here, and it has to be in LIBS rather than LDFLAGS
+# because devkitPro expands LDFLAGS ahead of the object files and a static
+# archive only resolves references the linker has already seen.
+ifeq ($(PGO),gen)
+LIBS	:=	-lgcov $(LIBS)
+endif
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing

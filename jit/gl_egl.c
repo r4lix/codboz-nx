@@ -470,8 +470,18 @@ static void te_MakeCurrent(GuestCpu *c, GuestMem *m, void *u) {
 /* Tiny state-preserving 3x5 bitmap overlay. Drawing with scissored clears keeps
  * this GLES1-compatible and avoids shaders, textures, or vertex state owned by
  * the guest. */
+/* Set by main.c when a benchmark run reaches its instruction target. */
+extern int g_bench_done;
+
 static const char *fps_glyph(char ch) {
     switch (ch) {
+    case 'B': return "110101110101110";
+    case 'C': return "111100100100111";
+    case 'D': return "110101101101110";
+    case 'E': return "111100110100111";
+    case 'H': return "101101111101101";
+    case 'N': return "101111111101101";
+    case 'O': return "111101101101111";
     case 'F': return "111100110100100";
     case 'P': return "110101110100100";
     case 'S': return "111100111001111";
@@ -542,6 +552,36 @@ static void fps_overlay(EGLDisplay dpy, EGLSurface surface) {
                               y0 + (4 - row) * scale, scale, scale);
                     glClear(GL_COLOR_BUFFER_BIT);
                 }
+    }
+
+    /* A finished benchmark has to be unmistakable. EGL keeps the window
+     * after the run loop breaks, so the last frame stays on the panel --
+     * and a run that ends during loading looks exactly like a freeze on the
+     * loading screen. It was reported as one. Drawn with the same scissor
+     * and clear the digits use, so it needs no state of its own and is
+     * covered by the save/restore already around this function. */
+    if (g_bench_done) {
+        const char *msg = "BENCH DONE";
+        int bs = (int)surface_w / 200, bw, bx, by;
+        if (bs < 4)
+            bs = 4;
+        bw = (int)strlen(msg) * 4 * bs;
+        bx = ((int)surface_w - bw) / 2;
+        by = (int)surface_h / 2 - 3 * bs;
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glScissor(bx - 3 * bs, by - 3 * bs, bw + 6 * bs, 11 * bs);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glClearColor(0.2f, 1.0f, 0.2f, 1.0f);
+        for (ci = 0; msg[ci]; ci++) {
+            const char *bits = fps_glyph(msg[ci]);
+            for (row = 0; row < 5; row++)
+                for (col = 0; col < 3; col++)
+                    if (bits[row * 3 + col] == '1') {
+                        glScissor(bx + ci * 4 * bs + col * bs,
+                                  by + (4 - row) * bs, bs, bs);
+                        glClear(GL_COLOR_BUFFER_BIT);
+                    }
+        }
     }
 
     glClearColor(old_clear[0], old_clear[1], old_clear[2], old_clear[3]);

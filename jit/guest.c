@@ -149,6 +149,8 @@ void *guest_wptr_slow(GuestMem *m, uint32_t addr, uint32_t len) {
 }
 
 GuestUndo guest_undo_log[GUEST_UNDO_MAX];
+uint32_t guest_pgsnap_base[GUEST_PGSNAP_MAX];
+uint8_t  guest_pgsnap_data[GUEST_PGSNAP_MAX][GUEST_PGSNAP_SIZE];
 
 /* Capture the bytes a store is about to overwrite. Reads through the region
  * table directly rather than guest_ptr, because guest_ptr's cache is about to
@@ -157,6 +159,34 @@ GuestUndo guest_undo_log[GUEST_UNDO_MAX];
 void guest_undo_record(GuestMem *m, uint32_t addr, uint32_t size) {
     int i;
     GuestUndo *u;
+
+    /* Page mode: record the containing page once. See GuestMem. */
+    if (m->undo_page_mode) {
+        uint32_t base = addr & ~(GUEST_PGSNAP_SIZE - 1u);
+        uint32_t k;
+        for (k = 0; k < m->pgsnap_n; k++)
+            if (guest_pgsnap_base[k] == base)
+                return;                 /* already have this page */
+        if (m->pgsnap_n >= GUEST_PGSNAP_MAX) {
+            m->undo_overflow++;
+            return;
+        }
+        /* Only whole pages that sit inside one region. A store straddling
+         * a region end is rare and is counted as unverifiable rather than
+         * half-recorded -- the caller reports the count. */
+        i = find_index(m, base, GUEST_PGSNAP_SIZE);
+        if (i < 0) {
+            m->undo_overflow++;
+            return;
+        }
+        guest_pgsnap_base[m->pgsnap_n] = base;
+        memcpy(guest_pgsnap_data[m->pgsnap_n],
+               m->region[i].host + (base - m->region[i].base),
+               GUEST_PGSNAP_SIZE);
+        m->pgsnap_n++;
+        return;
+    }
+
     if (m->undo_n >= GUEST_UNDO_MAX) {
         m->undo_overflow++;     /* the block is too long to check; see caller */
         return;
@@ -169,6 +199,29 @@ void guest_undo_record(GuestMem *m, uint32_t addr, uint32_t size) {
     u->size = size;
     u->old = 0;
     memcpy(&u->old, m->region[i].host + (addr - m->region[i].base), size);
+}
+
+void guest_pgsnap_save(GuestMem *m, uint8_t (*out)[GUEST_PGSNAP_SIZE]) {
+    uint32_t k;
+    for (k = 0; k < m->pgsnap_n; k++) {
+        int i = find_index(m, guest_pgsnap_base[k], GUEST_PGSNAP_SIZE);
+        if (i < 0)
+            continue;
+        memcpy(out[k],
+               m->region[i].host + (guest_pgsnap_base[k] - m->region[i].base),
+               GUEST_PGSNAP_SIZE);
+    }
+}
+
+void guest_pgsnap_restore(GuestMem *m) {
+    uint32_t k;
+    for (k = 0; k < m->pgsnap_n; k++) {
+        int i = find_index(m, guest_pgsnap_base[k], GUEST_PGSNAP_SIZE);
+        if (i < 0)
+            continue;
+        memcpy(m->region[i].host + (guest_pgsnap_base[k] - m->region[i].base),
+               guest_pgsnap_data[k], GUEST_PGSNAP_SIZE);
+    }
 }
 
 const char *guest_status_str(GuestStatus s) {
