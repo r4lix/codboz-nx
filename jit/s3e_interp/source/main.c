@@ -22,6 +22,7 @@
 
 #include "guest.h"
 #include "dynarmic_glue.h"
+#include "audio.h"
 #include "recomp.h"
 #include "s3e_loader.h"
 #include "s3e_files.h"
@@ -1461,12 +1462,14 @@ static int cb_queue(const char *kind, uint32_t id, uint32_t sysdata) {
 }
 
 static void cb_pump(void);      /* defined after `g`, which it re-enters */
+static void snd_pump_finished(void);  /* defined with the sound state */
 
 static void hle_device_yield(GuestCpu *cpu, GuestMem *mem, void *user) {
     (void)mem; (void)user;
     g_yields++;
     if (g_yields <= 3 || (g_yields % 1000) == 0)
         printf("  [yield] #%d (%d callbacks registered)\n", g_yields, g_cb_n);
+    snd_pump_finished();   /* end-of-sample callbacks; see below */
     cb_pump();
     cpu->r[0] = 0;
 }
@@ -3051,10 +3054,95 @@ static void hle_memory_setint(GuestCpu *cpu, GuestMem *mem, void *user) {
  * LowMemoryDevice was found -- the defaults below are deliberately generous
  * because 0 is the answer that has caused every failure of this kind so far.
  */
+/* Trace the audio imports with their arguments.
+ *
+ * hle_sound_channel_play, _stop, _getfreechannel and hle_audio_ok were
+ * completely silent, so a session could drive the whole sound API and leave no
+ * evidence of it. That is what made "did this game play anything" unanswerable
+ * from a log -- and the stub call counts cannot answer it either, because that
+ * counter lives in hle_default and only ever sees imports with NO handler.
+ *
+ * The arguments matter more than the count. s3eSoundChannelPlay carries a PCM
+ * buffer and a sample count, while s3eAudioPlay carries a filename pointer;
+ * which of those the game uses is the difference between wiring an audout sink
+ * to buffers the game already mixed, and having to decode a stream. Four calls
+ * per import is enough to see the shape and cheap enough to leave on. */
 #define SND_CHANNELS 16
 
-static uint32_t g_snd_next_channel;
+static uint8_t g_snd_traced[512];
+
+static void snd_trace(void *user, const GuestCpu *cpu) {
+    uint32_t idx = (uint32_t)(uintptr_t)user;
+    if (idx >= 512 || g_snd_traced[idx] >= 40)
+        return;
+    g_snd_traced[idx]++;
+    printf("  [snd  ] %-26s r0=%08x r1=%08x r2=%08x r3=%08x\n",
+           slot_name(idx), (unsigned)cpu->r[0], (unsigned)cpu->r[1],
+           (unsigned)cpu->r[2], (unsigned)cpu->r[3]);
+}
+
 static uint8_t  g_snd_playing[SND_CHANNELS];
+
+/* Per-channel state. Recorded now for the trace, but this is the state a mixer
+ * has to keep regardless, so it is kept properly rather than printed and
+ * thrown away.
+ *
+ * s3eSoundChannelSetInt was bound to hle_audio_ok -- a bare "return success"
+ * -- so everything the game configured was being discarded, including the
+ * 22050 Hz it sets on every channel before playing. Nothing could have been
+ * mixed from that. */
+typedef struct {
+    uint32_t rate;              /* Hz, as set by the game */
+    uint32_t buf;               /* guest PCM pointer from Play */
+    uint32_t samples;           /* count from Play */
+    uint32_t repeat;
+    uint32_t prop[8];           /* whatever else it sets, by id */
+    uint32_t prop_seen;
+} SndChannel;
+
+static SndChannel g_snd[SND_CHANNELS];
+
+/* Whether real output came up. When it did, the mixer is the authority on
+ * which voices are still sounding; when it did not, the old bookkeeping stands
+ * so the game still sees a plausible device. */
+static int g_snd_live;
+static unsigned g_snd_free_shown;
+static unsigned g_snd_end_shown;
+static unsigned g_snd_stat_shown;
+
+/* Tell the game which sounds have finished.
+ *
+ * It registered two s3eSoundChannel callbacks and then never polled our
+ * channel status once -- so it tracks what is playing from its own
+ * bookkeeping, and that bookkeeping only advances when a callback fires.
+ * Without this it plays one sound, waits forever for the end of it, and goes
+ * quiet: which is exactly what happened.
+ *
+ * id 0 of the two registered is taken to be end-of-sample. If the game stays
+ * silent, the other is the next thing to try, and the log says which fired.
+ * Called from the yield handler rather than the mixer because the callback
+ * queue belongs to the guest thread. */
+static void snd_pump_finished(void) {
+    uint32_t done = snd_out_take_drained();
+    unsigned ch;
+    for (ch = 0; ch < SND_CHANNELS && done; ch++) {
+        if (!(done & (1u << ch)))
+            continue;
+        done &= ~(1u << ch);
+        g_snd_playing[ch] = 0;
+        if (g_snd_end_shown < 20) {
+            g_snd_end_shown++;
+            printf("  [snd  ] ch%u finished, firing end-of-sample\n", ch);
+        }
+        cb_queue("s3eSoundChannel", 0, ch);
+    }
+}
+
+static int snd_channel_busy(uint32_t ch) {
+    if (ch >= SND_CHANNELS)
+        return 0;
+    return g_snd_live ? snd_out_busy(ch) : (int)g_snd_playing[ch];
+}
 
 static void logprop(const char *who, uint32_t prop, uint32_t v,
                     uint32_t *seen) {
@@ -3110,30 +3198,141 @@ static void hle_audio_setint(GuestCpu *cpu, GuestMem *mem, void *user) {
 static void hle_sound_getfreechannel(GuestCpu *cpu, GuestMem *mem, void *user) {
     uint32_t i;
     (void)mem; (void)user;
+    snd_trace(user, cpu);
+    /* Lowest free channel, not a rotation.
+     *
+     * The rotation was mine and it cost the game its sound: it configured
+     * channel 0, played on it, and when the sound finished and it asked for a
+     * free channel again it was handed 1 -- because the cursor had moved on --
+     * whereupon it set no properties and played nothing. Marmalade returns the
+     * lowest channel that is not playing, so a game that keeps per-channel
+     * state of its own sees the same one back whenever it is idle. Spreading
+     * voices around was solving a problem nobody had. */
     for (i = 0; i < SND_CHANNELS; i++) {
-        uint32_t ch = (g_snd_next_channel + i) % SND_CHANNELS;
-        if (!g_snd_playing[ch]) {
-            g_snd_next_channel = (ch + 1) % SND_CHANNELS;
+        uint32_t ch = i;
+        if (!snd_channel_busy(ch)) {
+            if (g_snd_free_shown < 40) {
+                g_snd_free_shown++;
+                printf("  [snd  ]   GetFreeChannel -> %u\n", (unsigned)ch);
+            }
             cpu->r[0] = ch;
             return;
         }
     }
-    cpu->r[0] = 0;
+    /* Nothing free. Returning 0 here names a REAL channel, which tells the
+     * game to go and use one that is already sounding; Marmalade reports -1
+     * for this. Whether the game checks is exactly what the log will say. */
+    if (g_snd_free_shown < 40) {
+        g_snd_free_shown++;
+        printf("  [snd  ]   GetFreeChannel -> none free, reporting -1\n");
+    }
+    cpu->r[0] = 0xFFFFFFFFu;
 }
 
+/* s3eSoundChannelPlay(channel, start, numSamples, repeatCount, ...). */
 static void hle_sound_channel_play(GuestCpu *cpu, GuestMem *mem, void *user) {
     uint32_t ch = cpu->r[0];
-    (void)mem; (void)user;
-    if (ch < SND_CHANNELS)
+    static int peeked;
+    snd_trace(user, cpu);
+    if (ch < SND_CHANNELS) {
+        SndChannel *c = &g_snd[ch];
         g_snd_playing[ch] = 1;
+        c->buf = cpu->r[1];
+        c->samples = cpu->r[2];
+        c->repeat = cpu->r[3];
+        /* 16-bit mono, so samples*2 bytes; guest_ptr refuses a span that
+         * leaves the region, which is the check that matters before handing a
+         * length to memcpy. */
+        {
+            /* r2 counts compressed bytes in PAIRS, not samples: the descriptor
+             * gives 11264 bytes for an r2 of 5632, and 4608 for 2304. So the
+             * span to read is samples*2, which is also what the block count
+             * divides evenly. */
+            const uint32_t bytes = c->samples * 2u;
+            const void *src = guest_ptr(mem, c->buf, bytes);
+            uint32_t block = 512u;
+            if (c->prop[2])
+                guest_ld32(mem, c->prop[2] + 0x28u, &block);
+            if (block < 5u || block > 4096u)
+                block = 512u;
+            if (src)
+                snd_out_play(ch, src, bytes, block,
+                             c->rate ? c->rate : 22050u, c->prop[3]);
+        }
+        /* One look at the data, to settle 8- vs 16-bit and mono vs stereo.
+         *
+         * Read as int16, real audio is a smooth low-magnitude walk around
+         * zero; if the data were 8-bit, pairing bytes would produce wild
+         * neighbouring values instead. Twice is enough to see it, and it costs
+         * nothing after that. */
+        if (peeked < 2 && c->buf) {
+            peeked++;
+            printf("  [snd  ] ch%u play buf=%08x samples=%u rate=%u repeat=%u\n",
+                   (unsigned)ch, (unsigned)c->buf, (unsigned)c->samples,
+                   (unsigned)c->rate, (unsigned)c->repeat);
+            /* The 48 bytes property 2 points at, which sit immediately before
+             * the play buffer. A descriptor there would carry the channel
+             * count and sample width, and a RIFF/WAV header would announce
+             * itself in ASCII -- either settles the format outright, where
+             * eight samples of waveform only invited guessing. */
+            if (c->prop[2]) {
+                char hex[3 * 48 + 1], asc[49];
+                unsigned k, n = 0;
+                for (k = 0; k < 48; k++) {
+                    uint32_t b = 0;
+                    if (!guest_ld8(mem, c->prop[2] + k, &b))
+                        break;
+                    n += (unsigned)snprintf(hex + n, sizeof hex - n, "%02x ",
+                                            (unsigned)b);
+                    asc[k] = (b >= 32u && b < 127u) ? (char)b : '.';
+                }
+                asc[k] = 0;
+                if (k)
+                    printf("  [snd  ]   header@%08x: %s |%s|\n",
+                           (unsigned)c->prop[2], hex, asc);
+            }
+            /* And a shape summary of the payload rather than the payload:
+             * how loud, how often it swings hard, and whether every other
+             * byte is zero -- which is what 8-bit data widened to 16 looks
+             * like. Enough to identify a format, and not a copy of anything. */
+            {
+                unsigned k, n = c->samples < 512u ? c->samples : 512u;
+                unsigned loud = 0, lowzero = 0, got = 0;
+                long sum = 0;
+                int16_t mn = 32767, mx = -32768;
+                for (k = 0; k < n; k++) {
+                    uint32_t w = 0;
+                    int16_t v;
+                    if (!guest_ld16(mem, c->buf + k * 2u, &w))
+                        break;
+                    v = (int16_t)w;
+                    got++;
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                    sum += v < 0 ? -(long)v : (long)v;
+                    if (v > 16384 || v < -16384) loud++;
+                    if ((w & 0xFFu) == 0u) lowzero++;
+                }
+                if (got)
+                    printf("  [snd  ]   over %u int16: min=%d max=%d"
+                           " mean|v|=%ld, %u%% beyond half-scale,"
+                           " %u%% with a zero low byte\n",
+                           got, mn, mx, sum / (long)got,
+                           loud * 100u / got, lowzero * 100u / got);
+            }
+        }
+    }
     cpu->r[0] = 0;                          /* S3E_RESULT_SUCCESS */
 }
 
 static void hle_sound_channel_stop(GuestCpu *cpu, GuestMem *mem, void *user) {
     uint32_t ch = cpu->r[0];
-    (void)mem; (void)user;
-    if (ch < SND_CHANNELS)
+    (void)mem;
+    snd_trace(user, cpu);
+    if (ch < SND_CHANNELS) {
         g_snd_playing[ch] = 0;
+        snd_out_stop(ch);
+    }
     cpu->r[0] = 0;
 }
 
@@ -3142,15 +3341,59 @@ static void hle_sound_channel_stop(GuestCpu *cpu, GuestMem *mem, void *user) {
 static void hle_sound_channel_getint(GuestCpu *cpu, GuestMem *mem, void *user) {
     uint32_t ch = cpu->r[0], prop = cpu->r[1];
     (void)mem; (void)user;
+    /* Property 0 is STATUS. It has to drain by itself: nothing sends an
+     * end-of-sample event yet, so a channel that stays busy until an explicit
+     * Stop is a channel the game will never reuse -- and with sixteen of them
+     * that is silence a few seconds into a firefight. */
     if (prop == 0)
-        cpu->r[0] = (ch < SND_CHANNELS) ? g_snd_playing[ch] : 0;
+        cpu->r[0] = (uint32_t)snd_channel_busy(ch);
     else
         cpu->r[0] = 0;
+    if (g_snd_stat_shown < 40) {
+        g_snd_stat_shown++;
+        printf("  [snd  ]   ChannelGetInt(ch%u, %u) -> %u\n",
+               (unsigned)ch, (unsigned)prop, (unsigned)cpu->r[0]);
+    }
 }
 
 static void hle_audio_ok(GuestCpu *cpu, GuestMem *mem, void *user) {
-    (void)mem; (void)user;
+    (void)mem;
+    snd_trace(user, cpu);
     cpu->r[0] = 0;                          /* S3E_RESULT_SUCCESS */
+}
+
+/* s3eSoundChannelSetInt(channel, property, value). Every distinct property is
+ * reported once per channel rather than the first four calls overall, because
+ * the interesting ones are set once at setup and then never again -- a
+ * call-count cap hides exactly them. Property 1 carries 22050 in every trace
+ * so far, which is a sample rate; the others are recorded without being
+ * guessed at, which is how the ctype table and LowMemoryDevice were found. */
+static void hle_sound_channel_setint(GuestCpu *cpu, GuestMem *mem, void *user) {
+    uint32_t ch = cpu->r[0], prop = cpu->r[1], val = cpu->r[2];
+    (void)mem; (void)user;
+    if (ch < SND_CHANNELS) {
+        SndChannel *c = &g_snd[ch];
+        if (prop < 8) {
+            c->prop[prop] = val;
+            if (!(c->prop_seen & (1u << prop))) {
+                c->prop_seen |= 1u << prop;
+                printf("  [snd  ] ch%u property %u = %u (0x%x)\n",
+                       (unsigned)ch, (unsigned)prop, (unsigned)val,
+                       (unsigned)val);
+            }
+        }
+        /* 22050, 44100, 11025 and 8000 are the plausible rates; anything in
+         * that band is the sample rate whichever property id carries it. */
+        if (val >= 8000u && val <= 48000u)
+            c->rate = val;
+        /* Property 3 is the one the game sets to 128 before every sound, and
+         * it is the only small non-rate value it sets, so it is the volume.
+         * 256 is taken as unity; if everything turns out half as loud as it
+         * should be, this scale is where to look. */
+        if (prop == 3u)
+            snd_out_set_volume(ch, val);
+    }
+    cpu->r[0] = 0;
 }
 
 static void hle_default(GuestCpu *cpu, GuestMem *mem, void *user) {
@@ -3197,8 +3440,13 @@ static void dump_stub_calls(void) {
             total += g_stub_calls[i];
         }
     }
-    printf("\nstub call counts (%u imports called, %llu calls):\n",
-           named, total);
+    /* UNIMPLEMENTED, not "called": g_stub_calls is incremented in
+     * hle_default, so an import with a handler -- every audio entry point, for
+     * instance -- can be called constantly and never appear here. Reading this
+     * list as the set of imports the game uses is wrong, and I did exactly
+     * that once. */
+    printf("\nunimplemented imports reaching the default stub"
+           " (%u of them, %llu calls):\n", named, total);
     for (k = 0; k < 512; k++) {
         unsigned best = 0, bi = 0;
         for (i = 0; i < 512; i++)
@@ -3484,6 +3732,21 @@ static void cb_pump(void) {
         GuestStatus st;
         if (!cb->used || !cb->fn)
             continue;
+        /* Sound callbacks only. Whether these fire at all decides the
+         * mixer's shape: an end-of-sample notification is something we send
+         * when a buffer drains, while a generate callback is one the game
+         * expects us to PULL from at audio rate -- and that second kind runs
+         * guest code through the interpreter here, inside dynarmic, which is
+         * the one path that does not get the JIT's speedup. */
+        if (!strncmp(cb->kind, "s3eSound", 8) ||
+            !strncmp(cb->kind, "s3eAudio", 8)) {
+            static unsigned shown;
+            if (shown < 8) {
+                shown++;
+                printf("  [snd  ] callback %s id=%u fn=%08x fired\n",
+                       cb->kind, (unsigned)cb->id, (unsigned)cb->fn);
+            }
+        }
         st = guest_call(&g, cb->fn, g_cb_queue[i].sysdata, cb->user);
         if (st != GUEST_OK)
             printf("  [cb   ] %s id=%u stopped: %s\n", cb->kind,
@@ -3540,8 +3803,9 @@ static void bind_slot(uint32_t i, const char *nm) {
         g_slots[i].fn = hle_sound_channel_stop;
     else if (!strcmp(nm, "s3eSoundChannelGetInt"))
         g_slots[i].fn = hle_sound_channel_getint;
-    else if (!strcmp(nm, "s3eSoundChannelSetInt") ||
-             !strcmp(nm, "s3eSoundChannelPause") ||
+    else if (!strcmp(nm, "s3eSoundChannelSetInt"))
+        g_slots[i].fn = hle_sound_channel_setint;
+    else if (!strcmp(nm, "s3eSoundChannelPause") ||
              !strcmp(nm, "s3eSoundChannelResume"))
         g_slots[i].fn = hle_audio_ok;
     else if (!strcmp(nm, "s3eAudioGetInt"))
@@ -5050,6 +5314,14 @@ static void run(void) {
 
     g.hle.slot = g_slots;
     g.hle.count = n + 1;
+    /* Sound output. Failure is not fatal: every snd_out_* call becomes a
+     * no-op and the HLE handlers keep reporting the working-but-idle device
+     * they reported before there was any output at all. */
+    g_snd_live = snd_out_init();
+    if (g_snd_live)
+        printf("  [snd  ] audout up: 48 kHz stereo, %d voices\n", SND_OUT_CHANNELS);
+    else
+        printf("  [snd  ] no audio output; sound stays silent\n");
     startup_stage_write("07 imports bound");
 
     /* 24, not 16: ctype takes the count to 11, the divide block to 16, and
