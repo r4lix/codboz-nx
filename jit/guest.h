@@ -10,6 +10,12 @@
 #include <stdint.h>
 #include <string.h>     /* the inline accessors below use memcpy */
 
+/* The dynarmic glue is C++ and needs the declarations below to keep C
+ * linkage, or it links against mangled names that interp.c never emits. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ---------------------------------------------------------------- registers */
 
 enum { GUEST_SP = 13, GUEST_LR = 14, GUEST_PC = 15 };
@@ -506,5 +512,9 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit);
 GuestStatus guest_call(Guest *g, uint32_t fn, uint32_t r0, uint32_t r1);
 
 const char *guest_status_str(GuestStatus s);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* GUEST_H */

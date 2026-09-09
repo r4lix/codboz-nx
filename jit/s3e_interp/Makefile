@@ -71,6 +71,26 @@ CFLAGS	+=	-DBOZ_JIT
 # reintroduce the last-bit difference against real hardware.
 CFLAGS	+=	-ffp-contract=off
 
+# Dynarmic. Opt-in with `make DYNARMIC=1`, because the library is checked out
+# beside this repo rather than vendored into it -- it is 150 MB of archive and
+# carries its own externals -- and a build should not fail merely because a
+# sibling directory is missing.
+#
+# Both trees are patched for Horizon by jit/dynarmic_patches/*.py; see there
+# for what and why. Build the library first with:
+#
+#   CXXFLAGS=-D_GNU_SOURCE CFLAGS=-D_GNU_SOURCE cmake -S . -B build-nx -G Ninja #     -DCMAKE_TOOLCHAIN_FILE=$(DEVKITPRO)/cmake/Switch.cmake ...
+#
+# Note the flags go through the environment: passing -DCMAKE_CXX_FLAGS on the
+# command line REPLACES the devkitPro platform module's own flags and silently
+# drops -D__SWITCH__, which compiles every Horizon branch out and still
+# "succeeds".
+DYNARMIC_ROOT	?=	$(TOPDIR)/../../../dynarmic
+BOOST_ROOT	?=	$(TOPDIR)/../../../boost_hdr
+ifeq ($(DYNARMIC),1)
+CFLAGS	+=	-DBOZ_DYNARMIC 			-I$(DYNARMIC_ROOT)/src 			-I$(DYNARMIC_ROOT)/externals/mcl/include 			-I$(DYNARMIC_ROOT)/externals/oaknut/include 			-I$(DYNARMIC_ROOT)/externals/robin-map/include 			-I$(DYNARMIC_ROOT)/externals/fmt/include 			-I$(BOOST_ROOT)
+endif
+
 # Profile-guided optimisation, the last item on the performance plan with a
 # plausible double-digit gain. Two passes:
 #
@@ -112,6 +132,13 @@ LIBS	:= -lGLESv1_CM -lEGL -lglapi -ldrm_nouveau -lstdc++ -lm -lnx
 # archive only resolves references the linker has already seen.
 ifeq ($(PGO),gen)
 LIBS	:=	-lgcov $(LIBS)
+endif
+
+# Dynarmic and its externals, ahead of -lstdc++ because a static archive only
+# resolves what the linker has already seen and all three need the C++ runtime.
+# dynarmic before fmt and mcl for the same reason.
+ifeq ($(DYNARMIC),1)
+LIBS	:=	$(DYNARMIC_ROOT)/build-nx/src/dynarmic/libdynarmic.a 			$(DYNARMIC_ROOT)/build-nx/externals/fmt/libfmt.a 			$(DYNARMIC_ROOT)/build-nx/externals/mcl/src/libmcl.a 			$(LIBS)
 endif
 
 #---------------------------------------------------------------------------------
@@ -286,6 +313,13 @@ endif
 $(OUTPUT).elf	:	$(OFILES)
 
 $(OFILES_SRC)	: $(HFILES_BIN)
+
+# mcl's ASSERT throws, so every dynarmic header needs exceptions enabled. Only
+# this one translation unit includes them; the rest of the program keeps
+# -fno-exceptions. Nothing here throws, so the cost is the unwind tables for
+# one object file.
+dynarmic_glue.o: CXXFLAGS += -fexceptions
+
 
 #---------------------------------------------------------------------------------
 # you need a rule like this for each extension you use as binary data

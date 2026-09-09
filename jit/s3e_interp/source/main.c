@@ -21,6 +21,7 @@
 #include <dirent.h>
 
 #include "guest.h"
+#include "dynarmic_glue.h"
 #include "recomp.h"
 #include "s3e_loader.h"
 #include "s3e_files.h"
@@ -3631,6 +3632,9 @@ static uint32_t fnv1a32(const unsigned char *p, size_t n) {
     return h;
 }
 
+static int      g_want_dyn;         /* dynarmic.txt */
+static unsigned g_dyn_mb = 32;      /* code cache, MB; a number in the file */
+static int      g_dyn_live;         /* dyn_init actually succeeded */
 static int g_want_fastmem;
 static VirtmemReservation *g_fastmem_rv;
 
@@ -4227,6 +4231,20 @@ static void ctl_command(char *line) {
         }
         closedir(d);
         ctl_say(".\n");
+    } else if (!strcmp(line, "DIAG")) {
+        /* The one command that is useful precisely when nothing else is.
+         *
+         * This runs on the control socket's thread, which keeps being
+         * scheduled while the guest thread is wedged inside the JIT -- so it
+         * can report what the guest is doing when the guest has stopped saying
+         * anything. The output goes to the log rather than back down the
+         * socket because that is where the rest of the run is, and reading it
+         * next to the last few lines before the silence is the whole point.
+         *
+         * Ask twice and compare: counters that move mean a loop, counters that
+         * do not mean it is stuck in one place. */
+        dyn_diag();
+        ctl_say("OK\n");
     } else if (!strcmp(line, "GET") && arg && ctl_safe(arg)) {
         /* Added for PGO: the .gcda files a profiled run writes are useless on
          * the card and there was no way to read them back -- PUT, DEL and LS
@@ -4897,6 +4915,39 @@ static void run(void) {
                ? "fixed 16 ms/query (fixedclock.txt)" : "real time");
     }
 
+    /* Dynarmic, opt-in behind dynarmic.txt.
+     *
+     * A flag rather than a build switch because the whole point is to compare
+     * it against the interpreter on the same binary in the same scene: two
+     * builds is exactly the mistake that made the predecode spike look like a
+     * 6% win when it was worth nothing at all.
+     *
+     * A number in the file sets the code cache in MB. The default is far below
+     * dynarmic's own 128 MB: this is one game, the translations are bounded by
+     * how much of the image actually runs, and on this console that memory is
+     * taken from a heap the guest also needs.
+     *
+     * Failure here is not fatal and not even unusual -- executable memory
+     * depends on how the homebrew was launched -- so dyn_init reports and
+     * returns 0, and everything below carries on interpreting. */
+    {
+        static const char *dy_paths[] = {
+            "sdmc:/switch/boz/dynarmic.txt", "sdmc:/dynarmic.txt" };
+        int k;
+        for (k = 0; k < 2; k++) {
+            FILE *f = fopen(dy_paths[k], "rb");
+            if (f) {
+                unsigned mb = 0;
+                if (fscanf(f, "%u", &mb) == 1 && mb >= 4 && mb <= 256)
+                    g_dyn_mb = mb;
+                fclose(f);
+                g_want_dyn = 1;
+                break;
+            }
+        }
+        printf("cpu: %s\n", g_want_dyn ? "dynarmic (dynarmic.txt)" : "interpreter");
+    }
+
     /* Benchmark mode; see the comment on g_bench. Deliberately NOT combined
      * with anything else -- the point of the run is that one thing differs
      * between it and its pair, so the other switches stay where they are. */
@@ -4976,19 +5027,42 @@ static void run(void) {
      * way the disassembly said. Silence here means the game keeps running its
      * own tolower, which is slower but never wrong. */
     g_ctype_got = ctype_resolve_got(&g.mem, g_img.load_base);
-    if (g_ctype_got) {
+    /* Not under dynarmic; see the note on the divide block below. tolower is
+     * called per CHARACTER, and at 14M interceptions per 2000M instructions it
+     * was the single most frequent one measured. */
+    if (g_ctype_got && !g_want_dyn) {
         hooks[9].addr = g_img.load_base + RVA_TOLOWER;
         hooks[9].fn = hook_tolower;
         hooks[10].addr = g_img.load_base + RVA_TOUPPER;
         hooks[10].fn = hook_toupper;
         g.hook_count = 11;
         printf("  [fast ] ctype table slot at %08x\n", (unsigned)g_ctype_got);
+    } else if (g_ctype_got) {
+        printf("  [fast ] ctype hooks off under dynarmic\n");
     } else {
         printf("  [fast ] ctype hooks not installed (literals did not read)\n");
     }
 
-    {   /* Divide. Indices follow whatever the ctype block left hook_count at,
-         * so the two blocks stay independent. */
+    /* Every hook below -- the divides, the float guards, the vector helpers --
+     * exists only to make the INTERPRETER faster. Each replaces a small leaf
+     * function with native C because stepping that function one instruction at
+     * a time is slow.
+     *
+     * Dynarmic compiles those same leaves to native AArch64 by itself, so the
+     * hook swaps compiled code for compiled code and wins nothing -- while the
+     * interception costs a block termination, a register sync each way, and a
+     * trip through the dispatcher, none of which the interpreter pays. On a
+     * function as small as a NaN guard that is pure loss, and it is loss taken
+     * millions of times: the first full run measured 14M interceptions in
+     * 2000M instructions, one every 143, and the two most frequent were
+     * tolower and f32_guard.
+     *
+     * What stays under dynarmic is the hooks that are not optimisations:
+     * malloc, realloc and free, which stand in for an allocator whose vtable
+     * this image never populates, and memcpy/memset, whose cost is amortised
+     * over the bytes they move rather than paid per call. */
+    if (!g_want_dyn) {   /* Divide. Indices follow whatever the ctype block
+         * left hook_count at, so the two blocks stay independent. */
         uint32_t d = g.hook_count;
         hooks[d + 0].addr = g_img.load_base + RVA_UIDIV;
         hooks[d + 0].fn = hook_uidiv;
@@ -5082,6 +5156,14 @@ static void run(void) {
      * could never reach a single frame. It runs until it faults or + is
      * pressed, and the chunk boundary is where the applet gets its turn. */
     st = GUEST_STEP_LIMIT;
+    /* After the regions AND the hooks: the page table is built from the
+     * region list, and the interception filter from the hook table, so
+     * anything registered later would be invisible to one or the other. */
+    if (g_want_dyn) {
+        g_dyn_live = dyn_init(&g, g_dyn_mb);
+        if (!g_dyn_live)
+            printf("cpu: falling back to the interpreter\n");
+    }
     startup_stage_write("09 entering guest interpreter");
     {
         static const uint64_t delta[] = {
@@ -5098,7 +5180,7 @@ static void run(void) {
         };
         unsigned probe;
         for (probe = 0; probe < sizeof(delta) / sizeof(delta[0]); probe++) {
-            st = guest_run(&g, 0xFFFFFFFFu, delta[probe]);
+            st = dyn_run(&g, 0xFFFFFFFFu, delta[probe]);
             if (st != GUEST_STEP_LIMIT)
                 break;
             startup_stage_write(done[probe]);
@@ -5106,7 +5188,7 @@ static void run(void) {
         if (st == GUEST_STEP_LIMIT) {
             for (probe = 0; probe < 40; probe++) {
                 char detail[96];
-                st = guest_run(&g, 0xFFFFFFFFu, 100000);
+                st = dyn_run(&g, 0xFFFFFFFFu, 100000);
                 if (st != GUEST_STEP_LIMIT)
                     break;
                 snprintf(detail, sizeof detail,
@@ -5119,7 +5201,7 @@ static void run(void) {
     }
     g_bench_t0 = armGetSystemTick();
     while (!g_quit && st == GUEST_STEP_LIMIT) {
-        st = guest_run(&g, 0xFFFFFFFFu, 5000000ull);
+        st = dyn_run(&g, 0xFFFFFFFFu, 5000000ull);
         /* Stop the CLOCK at the target, but not the run: EGL owns the
          * window, so breaking out here leaves whatever frame happened to
          * be on screen sitting there forever, and a benchmark that ends
