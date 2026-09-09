@@ -1350,6 +1350,31 @@ static void cb_kind(const char *nm, char *out, size_t n) {
  * There is deliberately no find-by-event-alone any more: every previous use of
  * it picked an arbitrary listener out of several, which is how registrations
  * got overwritten and unregistrations unhooked the wrong subsystem. */
+/* s3eSoundChannelRegister and its UnRegister take a leading CHANNEL argument
+ * that the other Register imports do not, so every following argument sits one
+ * register higher. The generic handlers read r0/r1/r2 as (id, fn, userData),
+ * which for these two reads (channel, id, fn) instead -- and the log said so
+ * plainly, once anyone looked:
+ *
+ *     [cb   ] s3eSoundChannel  id=0  fn=00000000  user=008d8821
+ *     [cb   ] s3eSoundChannel  id=0  fn=00000001  user=008d76a9
+ *
+ * 0 and 1 are callback ids, not function pointers; the odd addresses in
+ * `user` are Thumb function pointers, and they are the handlers the game
+ * actually wants called. Registered as-is, `fn` holds 0 or 1 and dispatching
+ * one would branch to address 0. Nothing queues sound events yet, so this has
+ * been latent rather than fatal -- which is exactly why it needs fixing before
+ * audio starts generating callbacks rather than after.
+ *
+ * The channel number itself is dropped: cb_find_fn keys on (kind, id, fn), so
+ * two channels registering the SAME callback id and the same handler collapse
+ * to one registration. Only channel 0 has ever appeared here. If a second one
+ * shows up, the channel has to go into the key. */
+static int cb_arg_shift(const char *nm) {
+    return nm && (!strcmp(nm, "s3eSoundChannelRegister") ||
+                  !strcmp(nm, "s3eSoundChannelUnRegister"));
+}
+
 static int cb_find_fn(const char *kind, uint32_t id, uint32_t fn) {
     int i;
     for (i = 0; i < g_cb_n; i++)
@@ -1363,6 +1388,8 @@ static void hle_register(GuestCpu *cpu, GuestMem *mem, void *user) {
     uint32_t idx = (uint32_t)(uintptr_t)user;
     char kind[28];
     int i;
+    const uint32_t a = (uint32_t)cb_arg_shift(slot_name(idx));
+    const uint32_t r_id = cpu->r[a], r_fn = cpu->r[a + 1], r_ud = cpu->r[a + 2];
     (void)mem;
     cb_kind(slot_name(idx), kind, sizeof kind);
     /* Registrations accumulate. Only an identical (kind, id, fn) is treated as
@@ -1370,17 +1397,18 @@ static void hle_register(GuestCpu *cpu, GuestMem *mem, void *user) {
      * different function for the same event is an additional listener, not a
      * replacement. Overwriting here is what silently unhooked the engine's
      * pointer handler when the UI layer registered its own. */
-    i = cb_find_fn(kind, cpu->r[0], cpu->r[1]);
+    i = cb_find_fn(kind, r_id, r_fn);
     if (i < 0 && g_cb_n < MAX_CBS)
         i = g_cb_n++;
     if (i >= 0) {
         memcpy(g_cbs[i].kind, kind, sizeof kind);
-        g_cbs[i].id = cpu->r[0];
-        g_cbs[i].fn = cpu->r[1];
-        g_cbs[i].user = cpu->r[2];
+        g_cbs[i].id = r_id;
+        g_cbs[i].fn = r_fn;
+        g_cbs[i].user = r_ud;
         g_cbs[i].used = 1;
-        printf("  [cb   ] %-18s id=%-3u fn=%08x user=%08x\n", kind,
-               (unsigned)cpu->r[0], (unsigned)cpu->r[1], (unsigned)cpu->r[2]);
+        printf("  [cb   ] %-18s id=%-3u fn=%08x user=%08x%s\n", kind,
+               (unsigned)r_id, (unsigned)r_fn, (unsigned)r_ud,
+               a ? "  (channel-shifted)" : "");
     }
     cpu->r[0] = 0;                          /* S3E_RESULT_SUCCESS */
 }
@@ -1389,20 +1417,22 @@ static void hle_unregister(GuestCpu *cpu, GuestMem *mem, void *user) {
     uint32_t idx = (uint32_t)(uintptr_t)user;
     char kind[28];
     int i;
+    const uint32_t a = (uint32_t)cb_arg_shift(slot_name(idx));
+    const uint32_t r_id = cpu->r[a], r_fn = cpu->r[a + 1];
     (void)mem;
     cb_kind(slot_name(idx), kind, sizeof kind);
     /* Only ever remove the exact handler named. Falling back to "the first
      * registration for this event" is how input dies mid-session: the game
      * tears down a UI listener and we unhook the engine's instead, after which
      * events are still generated and delivered to nothing. */
-    i = cb_find_fn(kind, cpu->r[0], cpu->r[1]);
+    i = cb_find_fn(kind, r_id, r_fn);
     if (i >= 0) {
         g_cbs[i].used = 0;
         printf("  [cb   ] -%-17s id=%-3u fn=%08x\n", kind,
-               (unsigned)cpu->r[0], (unsigned)cpu->r[1]);
+               (unsigned)r_id, (unsigned)r_fn);
     } else {
         printf("  [cb   ] -%-17s id=%-3u fn=%08x NOT FOUND, keeping all\n",
-               kind, (unsigned)cpu->r[0], (unsigned)cpu->r[1]);
+               kind, (unsigned)r_id, (unsigned)r_fn);
     }
     cpu->r[0] = 0;
 }
@@ -3144,21 +3174,42 @@ static void hle_default(GuestCpu *cpu, GuestMem *mem, void *user) {
 }
 
 /* Ranked stub call counts: the cheapest way to see whether an experiment
- * changed the execution path at all, without diffing traces. */
+ * changed the execution path at all, without diffing traces.
+ *
+ * All of them, not the top 20. The cut-off hid exactly the imports worth
+ * finding: a subsystem that is set up once and then never used -- audio being
+ * the case in hand -- makes a handful of calls and never appears, so the list
+ * could not distinguish "never called" from "ranked 21st". Every import the
+ * game touches is at most a few hundred lines and it is printed once per run. */
+static unsigned g_stub_scratch[512];
+
+/* Non-destructive, because it is now asked for DURING a run as well as at the
+ * end of one. The ranking pass consumes what it prints, so it works on a copy;
+ * zeroing the real counters mid-session would silently reset the very history
+ * the next question depends on. */
 static void dump_stub_calls(void) {
-    unsigned i, k;
-    printf("\nstub call counts (top 20):\n");
-    for (k = 0; k < 20; k++) {
+    unsigned i, k, named = 0;
+    unsigned long long total = 0;
+    for (i = 0; i < 512; i++) {
+        g_stub_scratch[i] = g_stub_calls[i];
+        if (g_stub_calls[i]) {
+            named++;
+            total += g_stub_calls[i];
+        }
+    }
+    printf("\nstub call counts (%u imports called, %llu calls):\n",
+           named, total);
+    for (k = 0; k < 512; k++) {
         unsigned best = 0, bi = 0;
         for (i = 0; i < 512; i++)
-            if (g_stub_calls[i] > best) {
-                best = g_stub_calls[i];
+            if (g_stub_scratch[i] > best) {
+                best = g_stub_scratch[i];
                 bi = i;
             }
         if (!best)
             break;
         printf("  %-34s %u\n", slot_name(bi), best);
-        g_stub_calls[bi] = 0;       /* consumed, so the next pass ranks below */
+        g_stub_scratch[bi] = 0;     /* consumed, so the next pass ranks below */
     }
 }
 
@@ -4231,6 +4282,13 @@ static void ctl_command(char *line) {
         }
         closedir(d);
         ctl_say(".\n");
+    } else if (!strcmp(line, "STUBS")) {
+        /* The import call counts, on demand. They used to be available only on
+         * the way out, which is useless for a question like "does this game
+         * ever call s3eAudioPlay" -- answering it meant quitting, and quitting
+         * meant losing the state that would have produced the call. */
+        dump_stub_calls();
+        ctl_say("OK\n");
     } else if (!strcmp(line, "DIAG")) {
         /* The one command that is useful precisely when nothing else is.
          *
