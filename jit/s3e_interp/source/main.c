@@ -1592,6 +1592,11 @@ static GuestMem *g_memp;
 #define S3E_PTR_RELEASED  3
 
 static int g_tap_frame = -1;        /* resolved on first present */
+/* The live pointer position, tracked from real touch. Distinct from the
+ * action tap's fixed target (g_act_x/g_act_y) -- these two were briefly
+ * merged by a careless rename, and because C treats a tentative definition
+ * and an initialised one as the SAME object it compiled cleanly and simply
+ * made the action button tap wherever the last finger had been. */
 static int g_tap_x, g_tap_y;
 static int g_ptr_state = S3E_PTR_UP;
 static uint32_t g_ev_press, g_ev_release, g_ev_motion;
@@ -1664,10 +1669,11 @@ static void motion_fire(GuestMem *mem, int x, int y) {
  * analog path the Xperia Play used does not exist here. Giving the pad its own
  * slots rather than sharing means a thumb on the screen and a stick can be
  * used at the same time, which also makes this far easier to test. */
-#define MAX_TOUCH  6
-#define REAL_TOUCH 4          /* fingers claim 0..3; the pad owns 4 and 5 */
+#define MAX_TOUCH  7
+#define REAL_TOUCH 4          /* fingers claim 0..3; the pad owns 4, 5 and 6 */
 #define PAD_SLOT_MOVE 4
 #define PAD_SLOT_AIM  5
+#define PAD_SLOT_TAP  6
 
 typedef struct {
     int      active;
@@ -1912,6 +1918,29 @@ static int input_poll(int *px, int *py) {
  * So this reports which codes the game asks for; the mapping follows once the
  * list is known. The state answered stays 0 meanwhile, exactly as before, so
  * nothing changes behaviourally. */
+/* Where the action button taps.
+ *
+ * "TAP TO REPAIR BARRICADE" means exactly that: the action is a touch on the
+ * object in the world, not a key and not a fixed button. No key code does it
+ * -- 78 was sent, press and release, confirmed in the log, and nothing
+ * happened. A real finger doing the repair landed at guest (245,232): low and
+ * just right of centre, which is where a barricade sits when you are facing
+ * one, and the prompt only appears when you are.
+ *
+ * So it is a tap there, on its own slot so it cannot disturb a stick being
+ * held, and live-settable because buy prompts may want a different point.
+ *
+ * (245,232) worked for the prompt but ALSO fired the weapon whenever no
+ * prompt was up, because the game splits the screen at SCREEN_W/2 = 240:
+ * right half fires, left half is the floating movement stick. The action
+ * hitbox straddles that line, so there is no point in neither zone. 230 is
+ * one pixel-run to the left of the split -- it still repairs and buys, does
+ * not fire, and the only cost is the movement stick flashing on screen for
+ * the few frames the tap is held. That is the cheaper side effect, and it
+ * goes away entirely once the on-screen controls are hidden. */
+static int g_act_x = 230, g_act_y = 240;
+static int g_act_frames;
+
 static uint32_t g_key_state[512];
 
 /* How often the game asks about each code, and how often we have sent it.
@@ -1923,6 +1952,7 @@ static uint32_t g_key_state[512];
  * demand (KEYS on the control socket) so the set can be compared between the
  * menu and gameplay, which use different ones. */
 static uint32_t g_key_polls[512];
+static uint32_t g_key_pulse;   /* SND KEY: one code to send next update */
 static uint32_t g_key_sends[512];
 
 /* s3eKeyState: 0 up, 1 pressed this frame, 2 down, 3 released this frame --
@@ -1986,18 +2016,27 @@ static const struct { u64 button; uint32_t game, menu; const char *name; }
 g_key_map[] = {
     { HidNpadButton_ZR,      XKEY_SHOOT,            0,         "ZR shoot"    },
     { HidNpadButton_ZL,      XKEY_AIM,              0,         "ZL aim"      },
-    /* Y sent 126 and opened settings, so 126 is a menu key here rather than
-     * reload. Y keeps only its in-game code until the in-game census says
-     * which one reloads. */
-    { HidNpadButton_Y,       XKEY_RELOAD,           0,         "Y reload"    },
+    /* Y is where Square sits on a DualShock, so it is the action button:
+     * repair, buy, reload. It sends 78 AND taps the world at g_act_x/y,
+     * because 78 alone does nothing at a barricade -- the prompt really does
+     * mean "tap". 126 is not reload; it opens settings in play as well as in
+     * menus, so it is this build's settings key whatever the reference calls
+     * it. The codes still unidentified are 9 and 73; SND KEY <code> pulses
+     * one on demand rather than binding a third guess to a button. */
+    { HidNpadButton_Y,       XKEY_ACTION_SPRINT,    0,         "Y action"    },
     { HidNpadButton_X,       XKEY_CHANGE_WEAPON,    0,         "X weapon"    },
     /* No menu code on either. Sending both the in-game and the menu code on
      * one press was meant to save knowing which screen is up, and it does not
      * work: B crouched AND backed out at the same time, because 126 is live in
      * play as well as in menus. Menus are driven by touch here, so the face
      * buttons carry their in-game meaning only. */
-    { HidNpadButton_A,       XKEY_ACTION_SPRINT,    0, "A use"    },
-    { HidNpadButton_B,       XKEY_CROUCH_PRONE,     0, "B crouch" },
+    /* PlayStation positions, not Nintendo letters: A sits where Circle does
+     * (crouch) and B where Cross does (jump). */
+    { HidNpadButton_A,       XKEY_CROUCH_PRONE,     0, "A crouch" },
+    /* B is unbound: this port has no jump. Code 9 was the only unidentified
+     * candidate in the in-game scan set and pressing it does nothing at all,
+     * which fits a touch build that never had an on-screen jump control. */
+    { HidNpadButton_B,       0,                     0, "B unbound" },
     { HidNpadButton_R,       XKEY_THROW_GRENADE,    0,         "R grenade"   },
     { HidNpadButton_L,       XKEY_TACTICAL_GRENADE, 0,         "L tactical"  },
     { HidNpadButton_StickR,  XKEY_MELEE,            0,         "RS melee"    },
@@ -2011,7 +2050,20 @@ g_key_map[] = {
 
 #define KEY_MAP_N (sizeof g_key_map / sizeof g_key_map[0])
 
-/* s3eKeyState: 0 up, 1 pressed this frame, 2 down, 3 released this frame. */
+/* s3eKeyState is a set of BITFLAGS, not a sequence.
+ *
+ *     DOWN = 1, PRESSED = 2, RELEASED = 4
+ *
+ * DOWN persists while held; PRESSED and RELEASED are edges that last one
+ * update and are then cleared. This was encoded as 0/1/2/3 -- up, pressed,
+ * down, released -- which is wrong in the worst possible way: while a button
+ * was HELD it reported 2, meaning PRESSED, so the game saw a fresh press every
+ * frame. Settings opened and shut ~50 times a second and repeated presses
+ * crashed the process. And a real press reported 1, DOWN with no PRESSED bit,
+ * so anything triggered on an edge -- the grenades -- never fired at all.
+ *
+ * Encoding confirmed against the PortMaster loader rather than assumed again. */
+enum { KEY_DOWN = 1u, KEY_PRESSED = 2u, KEY_RELEASED = 4u };
 static void key_set(GuestMem *mem, unsigned i, uint32_t k, int now, int was) {
     /* One event buffer per (button, code): the queue is not drained until
      * s3eDeviceYield, so a shared one would let a second change overwrite the
@@ -2022,7 +2074,14 @@ static void key_set(GuestMem *mem, unsigned i, uint32_t k, int now, int was) {
     uint32_t *slot;
     if (!k || k >= 512)
         return;
-    g_key_state[k] = now ? (was ? 2u : 1u) : (was ? 3u : 0u);
+    /* The edge flags last exactly one update. */
+    g_key_state[k] &= ~(KEY_PRESSED | KEY_RELEASED);
+    if (now && !was)
+        g_key_state[k] |= KEY_DOWN | KEY_PRESSED;
+    else if (!now && was)
+        g_key_state[k] = (g_key_state[k] & ~KEY_DOWN) | KEY_RELEASED;
+    else if (now)
+        g_key_state[k] |= KEY_DOWN;
     if (now == was)
         return;
     slot = &ev[i][k == g_key_map[i].menu ? 1 : 0];
@@ -2046,6 +2105,8 @@ static void key_update(GuestMem *mem) {
     for (i = 0; i < KEY_MAP_N; i++) {
         int now = (held & g_key_map[i].button) != 0;
         int was = (prev & g_key_map[i].button) != 0;
+        if (now && !was && g_key_map[i].button == HidNpadButton_Y)
+            g_act_frames = 5;          /* ~80 ms, matching a real tap */
         key_set(mem, i, g_key_map[i].game, now, was);
         key_set(mem, i, g_key_map[i].menu, now, was);
         if (now != was && shown < 40u) {
@@ -2053,6 +2114,19 @@ static void key_update(GuestMem *mem) {
             printf("  [key  ] %-11s %s -> game %u / menu %u\n",
                    g_key_map[i].name, now ? "down" : "up  ",
                    (unsigned)g_key_map[i].game, (unsigned)g_key_map[i].menu);
+        }
+    }
+    /* A code asked for over the control socket, delivered as a real press and
+     * release so the game sees exactly what a button would produce. */
+    if (g_key_pulse) {
+        static uint32_t pulsing;
+        if (pulsing) {
+            key_set(mem, 0, pulsing, 0, 1);
+            pulsing = 0;
+            g_key_pulse = 0;
+        } else {
+            pulsing = g_key_pulse;
+            key_set(mem, 0, pulsing, 1, 0);
         }
     }
     prev = held;
@@ -2147,7 +2221,7 @@ static void hle_key_getstate(GuestCpu *cpu, GuestMem *mem, void *user) {
  * and rebuilding per attempt is how this kind of tuning gets abandoned
  * half-done. */
 static int g_aim_stick = 0;      /* 0 = drag and re-anchor, 1 = held stick */
-static int g_aim_speed = 7;      /* px per frame at full deflection */
+static int g_aim_speed = 20;     /* px per frame at full deflection */
 static int g_aim_radius = 95;    /* held-stick deflection, as for the left */
 
 static const int PAD_MOVE_AX = 110, PAD_MOVE_AY = 210;
@@ -2216,6 +2290,17 @@ static void pad_touch_update(GuestMem *mem) {
                   l.x * PAD_MOVE_R / 32767, -l.y * PAD_MOVE_R / 32767);
     } else {
         pad_contact(mem, PAD_SLOT_MOVE, 0, 0, 0);
+    }
+
+    /* The action tap, a few frames long so the game sees a real contact
+     * rather than a single-frame blip. */
+    if (g_act_frames > 0) {
+        g_act_frames--;
+        pad_contact(mem, PAD_SLOT_TAP, 1,
+                    clampi(g_act_x, 0, (int)SCREEN_W - 1),
+                    clampi(g_act_y, 0, (int)SCREEN_H - 1));
+    } else {
+        pad_contact(mem, PAD_SLOT_TAP, 0, 0, 0);
     }
 
     if ((rx > PAD_DEADZONE || ry > PAD_DEADZONE) && g_aim_stick) {
@@ -5064,6 +5149,29 @@ static void ctl_command(char *line) {
             printf("  [snd  ] s3eAudio handlers %s\n",
                    g_audio_hle ? "LIVE" : "stubbed (pre-music behaviour)");
             ctl_say("OK\n");
+        } else if (!strncmp(arg, "TAP ", 4)) {
+            int x = 0, y = 0;
+            if (sscanf(arg + 4, "%d %d", &x, &y) == 2 &&
+                x >= 0 && x < (int)SCREEN_W && y >= 0 && y < (int)SCREEN_H) {
+                g_act_x = x;
+                g_act_y = y;
+                printf("  [pad  ] action tap at (%d,%d)\n", x, y);
+                ctl_say("OK\n");
+            } else {
+                ctl_say("ERR use: SND TAP <x> <y>\n");
+            }
+        } else if (!strncmp(arg, "KEY ", 4)) {
+            /* Pulse one key code: down now, up on the next poll. The way to
+             * name a code is to send it and see what the game does, which
+             * beats a fourth round of guessing from someone else's table. */
+            int code = atoi(arg + 4);
+            if (code > 0 && code < 512) {
+                g_key_pulse = (uint32_t)code;
+                printf("  [key  ] pulsing code %d\n", code);
+                ctl_say("OK\n");
+            } else {
+                ctl_say("ERR use: SND KEY <1..511>\n");
+            }
         } else if (!strncmp(arg, "AIM ", 4)) {
             /* SND AIM <speed> [radius] -- px per frame, and the held-stick
              * deflection. Both are feel, and feel cannot be measured from
