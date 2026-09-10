@@ -9,7 +9,11 @@ Writes land immediately but take effect at the NEXT launch, because every flag
 is read once during startup -- a flag that changed under a running measurement
 would be worse than the problem it solves.
 
-  python boz_ctl.py <ip> ls
+Pass "auto" as the address to take the most recent one the console logged
+from, which is what the session headers in nxlog.txt record. Hardcoding it has
+now sent me chasing a stale address once, and the log already knows.
+
+  python boz_ctl.py <ip|auto> ls
   python boz_ctl.py <ip> put <name> [contents]
   python boz_ctl.py <ip> putfile <name> <local path>
   python boz_ctl.py <ip> get <name>
@@ -20,6 +24,25 @@ import socket
 import sys
 
 PORT = 28772
+
+
+LOG = "s3e_interp/nxlog.txt"
+
+
+def discover():
+    """The address of the last console that connected to the logger."""
+    import os
+    import re
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), LOG)
+    last = None
+    with io.open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = re.search(r"=== session .* from ([0-9.]+)", line)
+            if m:
+                last = m.group(1)
+    if not last:
+        raise SystemExit("no session in " + path + "; pass the address explicitly")
+    return last
 
 
 def connect(ip):
@@ -43,6 +66,9 @@ def drain(s):
 
 def main():
     ip, cmd = sys.argv[1], sys.argv[2].lower()
+    if ip == "auto":
+        ip = discover()
+        print("using %s (last seen in the log)" % ip)
     s = connect(ip)
     if cmd == "ls":
         s.sendall(b"LS\n")

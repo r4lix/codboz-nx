@@ -3108,6 +3108,25 @@ static SndChannel g_snd[SND_CHANNELS];
 static int g_snd_live;
 static unsigned g_snd_free_shown;
 static unsigned g_snd_end_shown;
+
+/* Whether a drained voice fires the game's end-of-sample callback. OFF, and
+ * the toggle is kept only so the question can be re-asked cheaply.
+ *
+ * It was added to fix "plays one sound then silence" and did NOT fix that --
+ * the channel allocator did, in the very next build -- and it turned out to be
+ * actively harmful. Measured by switching it off mid-session while a barricade
+ * sound was looping:
+ *
+ *   with it on    Play -> drained -> callback -> GetFreeChannel -> Play,
+ *                 the same buffer, back to back with no gaps: a feedback loop
+ *                 where our notification WAS the trigger for the replay.
+ *   with it off   sound continues normally, and every repeat now begins with
+ *                 the game calling Stop itself, at intervals of 0.8s, 12s,
+ *                 2.5s, 9.5s, 13s -- gameplay, not a loop.
+ *
+ * The game never polls channel status either, so it is not waiting on us for
+ * anything: it drives playback entirely from its own bookkeeping. */
+static int g_snd_endcb;
 static unsigned g_snd_stat_shown;
 
 /* Tell the game which sounds have finished.
@@ -3125,6 +3144,10 @@ static unsigned g_snd_stat_shown;
 static void snd_pump_finished(void) {
     uint32_t done = snd_out_take_drained();
     unsigned ch;
+    /* Taken unconditionally: leaving the mask standing while the callback is
+     * off would fire a burst of stale ones the moment it is switched back. */
+    if (!g_snd_endcb)
+        return;
     for (ch = 0; ch < SND_CHANNELS && done; ch++) {
         if (!(done & (1u << ch)))
             continue;
@@ -4546,6 +4569,25 @@ static void ctl_command(char *line) {
         }
         closedir(d);
         ctl_say(".\n");
+    } else if (!strcmp(line, "SND") && arg) {
+        /* SND ENDCB 0|1 -- fire the end-of-sample callback, or do not.
+         *
+         * Takes effect immediately, so both behaviours can be compared inside
+         * one session by ear, which is the only instrument that can judge it.
+         *
+         * Note the shape: ctl_command has ALREADY split the line at the first
+         * space, so the verb is `line` and everything after it is `arg`. The
+         * first version of this matched on "SND " with the space still in it
+         * and could never fire -- every other command here is written the
+         * right way, immediately above. */
+        if (!strcmp(arg, "ENDCB 0") || !strcmp(arg, "ENDCB 1")) {
+            g_snd_endcb = arg[6] == '1';
+            printf("  [snd  ] end-of-sample callback %s\n",
+                   g_snd_endcb ? "ON" : "OFF");
+            ctl_say(g_snd_endcb ? "OK endcb on\n" : "OK endcb off\n");
+        } else {
+            ctl_say("ERR use: SND ENDCB 0|1\n");
+        }
     } else if (!strcmp(line, "STUBS")) {
         /* The import call counts, on demand. They used to be available only on
          * the way out, which is useless for a question like "does this game
