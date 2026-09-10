@@ -56,3 +56,6 @@ loader/out/
 nxlink_out.txt
 jit/hostdiff/bb_tmp.bat
 jit/hostdiff/build_log.txt
+
+# Extracted game audio: yours, not ours to redistribute (see README).
+music_out/

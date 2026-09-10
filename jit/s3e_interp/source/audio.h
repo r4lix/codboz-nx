@@ -49,4 +49,24 @@ int  snd_out_busy(unsigned ch);
  * into a guest callback. */
 uint32_t snd_out_take_drained(void);
 
+/* ---- streamed music (music.c) ---------------------------------------
+ *
+ * A single voice, separate from the sample channels: the game plays one
+ * track at a time through s3eAudio, and it is an MP3 on the card rather
+ * than something handed to us in memory. Mixed into the same accumulator
+ * as the samples, in stereo, so a track keeps its own image. */
+int  snd_music_play(const char *path, int loop, uint32_t volume);
+void snd_music_stop(void);
+void snd_music_pause(int paused);
+void snd_music_set_volume(uint32_t volume);
+int  snd_music_playing(void);
+
+/* Mixer liveness and state, for the control socket. */
+uint64_t snd_out_mix_calls(void);
+unsigned snd_out_active_voices(void);
+void     snd_out_music_enable(int on);
+
+/* Called by the mixer with an interleaved L,R accumulator. */
+void snd_music_mix(int32_t *acc, unsigned frames);
+
 #endif /* AUDIO_H */

@@ -18,6 +18,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/stat.h>
 #include <dirent.h>
 
 #include "guest.h"
@@ -1463,6 +1464,7 @@ static int cb_queue(const char *kind, uint32_t id, uint32_t sysdata) {
 
 static void cb_pump(void);      /* defined after `g`, which it re-enters */
 static void snd_pump_finished(void);  /* defined with the sound state */
+static void snd_endinfo_readback(void);
 
 static void hle_device_yield(GuestCpu *cpu, GuestMem *mem, void *user) {
     (void)mem; (void)user;
@@ -1471,6 +1473,7 @@ static void hle_device_yield(GuestCpu *cpu, GuestMem *mem, void *user) {
         printf("  [yield] #%d (%d callbacks registered)\n", g_yields, g_cb_n);
     snd_pump_finished();   /* end-of-sample callbacks; see below */
     cb_pump();
+    snd_endinfo_readback();   /* what the handler wrote; defined below */
     cpu->r[0] = 0;
 }
 
@@ -1534,6 +1537,24 @@ static int      g_bench_presents;   /* presents AT the target, not at print time
 static int g_saw_real_input;         /* once true, the synthetic tap stands down */
 
 #define SURF_BASE    0x01800000u   /* ~16.3 MB, room to 0x04000000 */
+
+/* A page of guest-visible scratch for HLE structures the game writes into.
+ *
+ * s3eSoundChannel callbacks are handed a systemData POINTER and store through
+ * it -- the end-of-sample handler writes +8 and +12. A bare channel number was
+ * being passed instead, so every finished sound wrote into guest addresses 8
+ * and 12. Nothing faulted, which is worse than if it had: the writes landed
+ * somewhere real and quietly corrupted whatever lived there, with effects that
+ * varied by screen and looked like a dozen different bugs.
+ *
+ * Below the image and outside the fastmem window, so it resolves through the
+ * region path and anything out of range still fails cleanly. */
+/* Set once the regions exist; the sound handlers sit far above the Guest
+ * object in this file and cannot name it directly. */
+static GuestMem *g_memp;
+
+#define SCRATCH_BASE 0x00700000u
+#define SCRATCH_SIZE 0x1000u
 #define SCREEN_W     480u
 #define SCREEN_H     320u
 #define SURF_BPP     2u
@@ -3076,9 +3097,15 @@ static void snd_trace(void *user, const GuestCpu *cpu) {
     if (idx >= 512 || g_snd_traced[idx] >= 40)
         return;
     g_snd_traced[idx]++;
-    printf("  [snd  ] %-26s r0=%08x r1=%08x r2=%08x r3=%08x\n",
+    /* lr too: the game never calls s3eAudioPlay, so the question for music is
+     * which guest code decides that -- and the only audio entry points it does
+     * call (Resume, Stop, Pause) name their caller in lr. Disassembling around
+     * that address shows the condition, where guessing at what a config key
+     * named auEnabled means does not. */
+    printf("  [snd  ] %-26s r0=%08x r1=%08x r2=%08x r3=%08x lr=%08x\n",
            slot_name(idx), (unsigned)cpu->r[0], (unsigned)cpu->r[1],
-           (unsigned)cpu->r[2], (unsigned)cpu->r[3]);
+           (unsigned)cpu->r[2], (unsigned)cpu->r[3],
+           (unsigned)cpu->r[GUEST_LR]);
 }
 
 static uint8_t  g_snd_playing[SND_CHANNELS];
@@ -3106,27 +3133,48 @@ static SndChannel g_snd[SND_CHANNELS];
  * which voices are still sounding; when it did not, the old bookkeeping stands
  * so the game still sees a plausible device. */
 static int g_snd_live;
+static uint8_t g_scratch[SCRATCH_SIZE];
+
+/* One info block per channel, so one callback cannot scribble on another's.
+ * 32 bytes is well clear of the +12 the handler touches. */
+#define ENDINFO_STRIDE 32u
+#define ENDINFO_ADDR(ch) (SCRATCH_BASE + (uint32_t)(ch) * ENDINFO_STRIDE)
 static unsigned g_snd_free_shown;
 static unsigned g_snd_end_shown;
+static uint32_t g_endinfo_pending;
 
-/* Whether a drained voice fires the game's end-of-sample callback. OFF, and
- * the toggle is kept only so the question can be re-asked cheaply.
+/* Whether a drained voice fires the game's end-of-sample callback. ON: the
+ * game cannot repeat a sound without it.
  *
- * It was added to fix "plays one sound then silence" and did NOT fix that --
- * the channel allocator did, in the very next build -- and it turned out to be
- * actively harmful. Measured by switching it off mid-session while a barricade
- * sound was looping:
+ * This was off for a while, on the strength of an A/B that I misread. Turning
+ * it off mid-session appeared to stop a looping barricade sound -- but an NPC
+ * started firing at that instant and would have taken the channel regardless,
+ * which I noticed at the time and reasoned past. I then checked only that
+ * gunfire still worked, and gunfire works either way because every shot is a
+ * fresh request.
  *
- *   with it on    Play -> drained -> callback -> GetFreeChannel -> Play,
- *                 the same buffer, back to back with no gaps: a feedback loop
- *                 where our notification WAS the trigger for the replay.
- *   with it off   sound continues normally, and every repeat now begins with
- *                 the game calling Stop itself, at intervals of 0.8s, 12s,
- *                 2.5s, 9.5s, 13s -- gameplay, not a loop.
+ * What actually needs it is anything that plays the SAME sound again: menu
+ * clicks, footsteps, the knife. The game never polls channel status, so this
+ * notification is the only thing that tells it a sound finished; without it
+ * the first click plays and nothing is ever requested again. Measured with the
+ * toggle in a live session:
  *
- * The game never polls channel status either, so it is not waiting on us for
- * anything: it drives playback entirely from its own bookkeeping. */
-static int g_snd_endcb;
+ *     Play 04a0e320 -> firing end-of-sample -> Play 04a0e320 -> ...
+ *
+ * four times over, which is the menu working. With it off, one play and
+ * silence for the rest of the session. */
+static int g_snd_endcb = 1;
+
+/* Whether the s3eAudio imports do anything, or behave as they did before music
+ * existed -- report success and nothing else.
+ *
+ * Menu taps used to make a sound on every tap and now make one only on the
+ * first, and the music work is the only thing that changed between those two
+ * builds. The mixer is provably fine (it fills buffers at exactly 47 a second
+ * with voices draining), so the suspect is these handlers: six of them changed
+ * at once, and this switches all six back without a rebuild rather than
+ * bisecting by guesswork. */
+static int g_audio_hle = 1;
 static unsigned g_snd_stat_shown;
 
 /* Tell the game which sounds have finished.
@@ -3141,6 +3189,27 @@ static unsigned g_snd_stat_shown;
  * silent, the other is the next thing to try, and the log says which fired.
  * Called from the yield handler rather than the mixer because the callback
  * queue belongs to the guest thread. */
+/* What the end-of-sample handler stored into the info block. Read after the
+ * callback pump, which is where it actually runs. The layout is not documented
+ * anywhere we can consult, so it is reported rather than assumed: +8 and +12
+ * are the two the handler writes, and they are how the game asks for a sound
+ * to continue. */
+static void snd_endinfo_readback(void) {
+    static unsigned shown;
+    uint32_t a = 0, b = 0, c = 0;
+    if (!g_endinfo_pending || !g_memp)
+        return;
+    guest_ld32(g_memp, g_endinfo_pending + 4u, &a);
+    guest_ld32(g_memp, g_endinfo_pending + 8u, &b);
+    guest_ld32(g_memp, g_endinfo_pending + 12u, &c);
+    if (shown < 12u && (a || b || c)) {
+        shown++;
+        printf("  [snd  ] end-info wrote +4=%08x +8=%08x +12=%08x\n",
+               (unsigned)a, (unsigned)b, (unsigned)c);
+    }
+    g_endinfo_pending = 0;
+}
+
 static void snd_pump_finished(void) {
     uint32_t done = snd_out_take_drained();
     unsigned ch;
@@ -3157,7 +3226,21 @@ static void snd_pump_finished(void) {
             g_snd_end_shown++;
             printf("  [snd  ] ch%u finished, firing end-of-sample\n", ch);
         }
-        cb_queue("s3eSoundChannel", 0, ch);
+        /* A real, writable address rather than the channel number. The
+         * handler stores through this, and what it leaves at +8 and +12 is the
+         * game saying what to play next -- which is how a repeating or
+         * streamed sound continues. Reported rather than guessed at. */
+        if (!g_memp)
+            continue;
+        {
+            uint32_t info = ENDINFO_ADDR(ch);
+            unsigned k;
+            for (k = 0; k < ENDINFO_STRIDE; k += 4u)
+                guest_st32(g_memp, info + k, 0);
+            guest_st32(g_memp, info + 0u, ch);
+            g_endinfo_pending = info;
+            cb_queue("s3eSoundChannel", 0, info);
+        }
     }
 }
 
@@ -3203,7 +3286,7 @@ static void hle_audio_getint(GuestCpu *cpu, GuestMem *mem, void *user) {
     (void)mem; (void)user;
     switch (prop) {
     case 0:  v = 1;   break;                /* AVAILABLE  */
-    case 1:  v = 0;   break;                /* STATUS: not playing */
+    case 1:  v = g_audio_hle ? (uint32_t)snd_music_playing() : 0u; break;
     case 2:  v = 256; break;                /* VOLUME (S3E_AUDIO_MAX_VOLUME) */
     default: v = 1;   break;
     }
@@ -3212,8 +3295,75 @@ static void hle_audio_getint(GuestCpu *cpu, GuestMem *mem, void *user) {
 }
 
 static void hle_audio_setint(GuestCpu *cpu, GuestMem *mem, void *user) {
+    uint32_t prop = cpu->r[0], val = cpu->r[1];
     (void)mem; (void)user;
+    if (prop == 2u)                         /* VOLUME, same scale as GetInt */
+        snd_music_set_volume(val);
     cpu->r[0] = 0;
+}
+
+/* s3eAudioPlay(filename, repeatCount). The game names its tracks with paths
+ * relative to the asset root -- blackops-music/mus_gameover.mp3 -- which is
+ * where they now live on the card.
+ *
+ * repeatCount 0 is taken as looping: it is what the sample API uses for the
+ * same thing, and a track asked to play zero times is not a sensible request.
+ * The log says which it chose, so a wrong reading here is audible AND
+ * visible rather than merely puzzling. */
+static void hle_audio_play(GuestCpu *cpu, GuestMem *mem, void *user) {
+    if (!g_audio_hle) {
+        cpu->r[0] = 0;
+        return;
+    }
+    char name[192];
+    uint32_t repeat = cpu->r[1];
+    (void)user;
+    snd_trace(user, cpu);
+    gstr(mem, cpu->r[0], name, sizeof name);
+    printf("  [mus  ] s3eAudioPlay(%s, repeat=%u)\n", name, (unsigned)repeat);
+    cpu->r[0] = snd_music_play(name, repeat == 0u, 256u) ? 0u : 1u;
+}
+
+static void hle_audio_stop(GuestCpu *cpu, GuestMem *mem, void *user) {
+    if (!g_audio_hle) {
+        cpu->r[0] = 0;
+        return;
+    }
+    (void)mem;
+    snd_trace(user, cpu);
+    snd_music_stop();
+    cpu->r[0] = 0;
+}
+
+static void hle_audio_pause(GuestCpu *cpu, GuestMem *mem, void *user) {
+    if (!g_audio_hle) {
+        cpu->r[0] = 0;
+        return;
+    }
+    (void)mem;
+    snd_trace(user, cpu);
+    snd_music_pause(1);
+    cpu->r[0] = 0;
+}
+
+static void hle_audio_resume(GuestCpu *cpu, GuestMem *mem, void *user) {
+    if (!g_audio_hle) {
+        cpu->r[0] = 0;
+        return;
+    }
+    (void)mem;
+    snd_trace(user, cpu);
+    snd_music_pause(0);
+    cpu->r[0] = 0;
+}
+
+static void hle_audio_isplaying(GuestCpu *cpu, GuestMem *mem, void *user) {
+    if (!g_audio_hle) {
+        cpu->r[0] = 0;
+        return;
+    }
+    (void)mem; (void)user;
+    cpu->r[0] = (uint32_t)snd_music_playing();
 }
 
 /* A real free channel, not always 0 -- the game tracks them and would stack
@@ -3835,14 +3985,21 @@ static void bind_slot(uint32_t i, const char *nm) {
         g_slots[i].fn = hle_audio_getint;
     else if (!strcmp(nm, "s3eAudioSetInt"))
         g_slots[i].fn = hle_audio_setint;
-    else if (!strcmp(nm, "s3eAudioPlay") ||
-             !strcmp(nm, "s3eAudioPlayFromBuffer") ||
-             !strcmp(nm, "s3eAudioStop") ||
-             !strcmp(nm, "s3eAudioPause") ||
-             !strcmp(nm, "s3eAudioResume"))
+    else if (!strcmp(nm, "s3eAudioPlay"))
+        g_slots[i].fn = hle_audio_play;
+    else if (!strcmp(nm, "s3eAudioStop"))
+        g_slots[i].fn = hle_audio_stop;
+    else if (!strcmp(nm, "s3eAudioPause"))
+        g_slots[i].fn = hle_audio_pause;
+    else if (!strcmp(nm, "s3eAudioResume"))
+        g_slots[i].fn = hle_audio_resume;
+    /* PlayFromBuffer hands us the encoded data in guest memory instead of a
+     * filename. Nothing has been seen to call it, so it keeps the old
+     * stand-in rather than a decoder path that cannot be tested. */
+    else if (!strcmp(nm, "s3eAudioPlayFromBuffer"))
         g_slots[i].fn = hle_audio_ok;
     else if (!strcmp(nm, "s3eAudioIsPlaying"))
-        g_slots[i].fn = hle_audio_setint;   /* 0 = not playing */
+        g_slots[i].fn = hle_audio_isplaying;
     else if (!strcmp(nm, "s3eMemoryGetInt"))
         g_slots[i].fn = hle_memory_getint;
     else if (!strcmp(nm, "s3eMemorySetInt"))
@@ -4544,14 +4701,44 @@ static void ctl_drop(void) {
 /* A bare filename and nothing else. Rejecting separators outright is cruder
  * than resolving the path, and unlike resolving it there is nothing to get
  * subtly wrong. */
+/* Confined to CTL_DIR, now including subdirectories beneath it.
+ *
+ * The guard used to reject '/' outright, which made the channel useless for
+ * the game's own data: the assets live in directories (blackops-music/,
+ * data-etc/) and could only be put there by hand. Allowing a separator does
+ * not weaken the confinement as long as the path cannot climb out of it or
+ * start at the root, so those are what is checked -- no leading '/', no ".."
+ * anywhere, no empty component, no backslash, nothing below space.
+ *
+ * This is still an unauthenticated listener on the local network, and the
+ * confinement is still the whole security model. The worst a stranger on the
+ * LAN can now do is write a file into a subdirectory of this homebrew's own
+ * folder rather than only into the folder itself. */
 static int ctl_safe(const char *n) {
     const char *p;
-    if (!*n || strlen(n) > 64)
+    if (!*n || *n == '/' || strlen(n) > 96)
         return 0;
-    for (p = n; *p; p++)
-        if (*p == '/' || *p == '\\' || (unsigned char)*p < 32)
+    for (p = n; *p; p++) {
+        if (*p == '\\' || (unsigned char)*p < 32)
             return 0;
+        if (*p == '/' && (p[1] == '/' || p[1] == 0))
+            return 0;                   /* empty component */
+    }
     return strstr(n, "..") == NULL;
+}
+
+/* Create the directories leading to a path under CTL_DIR. Called only from
+ * PUT, and only on a name ctl_safe has already accepted. */
+static void ctl_mkparents(const char *rel) {
+    char path[224];
+    char *slash;
+    snprintf(path, sizeof path, CTL_DIR "/%s", rel);
+    for (slash = strchr(path + sizeof(CTL_DIR), '/'); slash;
+         slash = strchr(slash + 1, '/')) {
+        *slash = 0;
+        mkdir(path, 0777);              /* already-exists is the normal case */
+        *slash = '/';
+    }
 }
 
 static void ctl_command(char *line) {
@@ -4580,13 +4767,29 @@ static void ctl_command(char *line) {
          * first version of this matched on "SND " with the space still in it
          * and could never fire -- every other command here is written the
          * right way, immediately above. */
-        if (!strcmp(arg, "ENDCB 0") || !strcmp(arg, "ENDCB 1")) {
+        if (!strcmp(arg, "AUDIOHLE 0") || !strcmp(arg, "AUDIOHLE 1")) {
+            g_audio_hle = arg[9] == '1';
+            printf("  [snd  ] s3eAudio handlers %s\n",
+                   g_audio_hle ? "LIVE" : "stubbed (pre-music behaviour)");
+            ctl_say("OK\n");
+        } else if (!strcmp(arg, "STAT")) {
+            /* Is the mixer thread alive? Ask twice and compare the count. */
+            printf("  [snd  ] mix=%llu voices=%u music=%s\n",
+                   (unsigned long long)snd_out_mix_calls(),
+                   snd_out_active_voices(),
+                   snd_music_playing() ? "playing" : "idle");
+            ctl_say("OK\n");
+        } else if (!strcmp(arg, "MUSIC 0") || !strcmp(arg, "MUSIC 1")) {
+            snd_out_music_enable(arg[6] == '1');
+            printf("  [snd  ] music mixing %s\n", arg[6] == '1' ? "ON" : "OFF");
+            ctl_say("OK\n");
+        } else if (!strcmp(arg, "ENDCB 0") || !strcmp(arg, "ENDCB 1")) {
             g_snd_endcb = arg[6] == '1';
             printf("  [snd  ] end-of-sample callback %s\n",
                    g_snd_endcb ? "ON" : "OFF");
             ctl_say(g_snd_endcb ? "OK endcb on\n" : "OK endcb off\n");
         } else {
-            ctl_say("ERR use: SND ENDCB 0|1\n");
+            ctl_say("ERR use: SND STAT | MUSIC 0|1 | ENDCB 0|1 | AUDIOHLE 0|1\n");
         }
     } else if (!strcmp(line, "STUBS")) {
         /* The import call counts, on demand. They used to be available only on
@@ -4659,6 +4862,7 @@ static void ctl_command(char *line) {
         ctl_say(remove(path) == 0 ? "OK\n" : "ERR remove\n");
         printf("  [ctl  ] DEL %s\n", arg);
     } else if (!strcmp(line, "PUT") && arg) {
+        /* Subdirectories are allowed now, so they may need creating. */
         char *sp = strchr(arg, ' ');
         int len = 0;
         if (sp) { *sp++ = 0; len = atoi(sp); }
@@ -4667,8 +4871,9 @@ static void ctl_command(char *line) {
             return;
         }
         {
-            char path[160];
+            char path[224];
             snprintf(path, sizeof path, CTL_DIR "/%s", arg);
+            ctl_mkparents(arg);
             ctl_put_f = fopen(path, "wb");
             if (!ctl_put_f) { ctl_say("ERR open\n"); return; }
             ctl_put_left = len;
@@ -5208,6 +5413,8 @@ static void run(void) {
     guest_mem_add(&g.mem, STACK_BASE, STACK_SIZE, g_stack, 1);
     guest_mem_add(&g.mem, HEAP_BASE, HEAP_SIZE, g_heap, 1);
     guest_mem_add(&g.mem, SURF_BASE, SURF_BYTES, g_surf, 1);
+    guest_mem_add(&g.mem, SCRATCH_BASE, SCRATCH_SIZE, g_scratch, 1);
+    g_memp = &g.mem;
     if (g_want_fastmem) {
         fastmem_setup(&g.mem);   /* after the regions exist, not before */
         if (g.mem.fast_base) {

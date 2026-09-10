@@ -54,6 +54,13 @@ static volatile int    g_running;
  * collections still reports exactly once. */
 static uint32_t        g_drained;
 
+/* Mixer liveness. A dead mixer thread is indistinguishable from a broken one
+ * from the outside: voices never drain, so channels never come free, so the
+ * game stops asking for them -- silence that looks like the game's decision
+ * rather than ours. This counts buffers actually filled. */
+static uint64_t        g_mix_calls;
+static int             g_music_on = 1;
+
 
 /* ---- IMA ADPCM ---------------------------------------------------------
  *
@@ -136,7 +143,10 @@ static uint32_t ima_decode(const uint8_t *in, uint32_t bytes, uint32_t block,
  * is the better failure. */
 static void mix(int16_t *out) {
     unsigned i, f;
-    static int32_t acc[OUT_FRAMES];
+    /* Interleaved L,R. The sample voices are mono and land in both, but music
+     * is a stereo stream and would lose its image if everything were summed to
+     * one channel first. */
+    static int32_t acc[OUT_FRAMES * 2u];
 
     memset(acc, 0, sizeof acc);
     mutexLock(&g_lock);
@@ -165,19 +175,30 @@ static void mix(int16_t *out) {
                 uint32_t frac = pos & 0xFFFFu;
                 s = a + (((b - a) * (int32_t)frac) >> 16);
             }
-            acc[f] += (s * (int32_t)vol) >> 8;
+            {
+                const int32_t v = (s * (int32_t)vol) >> 8;
+                acc[f * 2u + 0u] += v;
+                acc[f * 2u + 1u] += v;
+            }
             pos += step;
         }
         v->pos = pos;
     }
     mutexUnlock(&g_lock);
 
-    for (f = 0; f < OUT_FRAMES; f++) {
+    /* Music on top, under its own lock -- it streams from a file and must not
+     * hold the sample lock while it decodes. Switchable so it can be taken out
+     * of the path without a rebuild, which is the only way to tell a mixer
+     * broken BY the music code from one broken beside it. */
+    if (g_music_on)
+        snd_music_mix(acc, OUT_FRAMES);
+    g_mix_calls++;
+
+    for (f = 0; f < OUT_FRAMES * 2u; f++) {
         int32_t s = acc[f];
         if (s > 32767) s = 32767;
         if (s < -32768) s = -32768;
-        out[f * 2u + 0u] = (int16_t)s;   /* mono source, both ears */
-        out[f * 2u + 1u] = (int16_t)s;
+        out[f] = (int16_t)s;
     }
 }
 
@@ -338,4 +359,24 @@ uint32_t snd_out_take_drained(void) {
     g_drained = 0;
     mutexUnlock(&g_lock);
     return m;
+}
+
+uint64_t snd_out_mix_calls(void) {
+    return g_mix_calls;
+}
+
+unsigned snd_out_active_voices(void) {
+    unsigned i, n = 0;
+    if (!g_live)
+        return 0;
+    mutexLock(&g_lock);
+    for (i = 0; i < SND_OUT_CHANNELS; i++)
+        if (g_ch[i].active)
+            n++;
+    mutexUnlock(&g_lock);
+    return n;
+}
+
+void snd_out_music_enable(int on) {
+    g_music_on = on ? 1 : 0;
 }
