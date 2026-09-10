@@ -59,3 +59,4 @@ jit/hostdiff/build_log.txt
 
 # Extracted game audio: yours, not ours to redistribute (see README).
 music_out/
+*.vpk
