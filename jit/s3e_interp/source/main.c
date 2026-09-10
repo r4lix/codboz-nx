@@ -1657,13 +1657,38 @@ static void motion_fire(GuestMem *mem, int x, int y) {
  *   id 2  S3E_POINTER_TOUCH_EVENT        { x, y, touchID, pressed }
  *   id 3  S3E_POINTER_TOUCH_MOTION_EVENT { x, y, touchID }
  */
-#define MAX_TOUCH 4
+/* Four slots for fingers, two more for the controller.
+ *
+ * The pad drives real touch contacts because that is the only input this build
+ * understands for movement and aiming: it imports no s3eTouchpad, so the
+ * analog path the Xperia Play used does not exist here. Giving the pad its own
+ * slots rather than sharing means a thumb on the screen and a stick can be
+ * used at the same time, which also makes this far easier to test. */
+#define MAX_TOUCH  6
+#define REAL_TOUCH 4          /* fingers claim 0..3; the pad owns 4 and 5 */
+#define PAD_SLOT_MOVE 4
+#define PAD_SLOT_AIM  5
 
 typedef struct {
     int      active;
     int      x, y;
     int      raw_x, raw_y;           /* panel coordinate, kept for the log */
     uint32_t fid;                    /* Switch finger id, to track identity */
+    /* ---- capture, for designing the controller mapping ----------------
+     *
+     * The virtual sticks float: the stick appears wherever a finger lands, so
+     * there are no fixed zones to find. What a stick mapping does need is how
+     * far a thumb actually travels from that anchor for full deflection --
+     * that is the number that turns an analog position into pixels, and
+     * guessing it gives controls that are subtly wrong in a way nobody can
+     * debug afterwards. So each contact records where it started and how far
+     * it got. */
+    int      ax, ay;                 /* anchor: where this contact went down */
+    int      max_r;                  /* furthest distance from the anchor */
+    int      min_dx, max_dx;
+    int      min_dy, max_dy;
+    uint64_t t_down;
+    int      samples;
 } Touch;
 
 static Touch g_touch[MAX_TOUCH];
@@ -1700,10 +1725,49 @@ static void touch_fire(GuestMem *mem, int slot, int pressed) {
            slot, pressed ? "DOWN" : "up  ", g_touch[slot].raw_x,
            g_touch[slot].raw_y, g_touch[slot].x, g_touch[slot].y, n,
            n == 1 ? "" : "s");
+    {
+        Touch *t = &g_touch[slot];
+        if (pressed) {
+            t->ax = t->x;
+            t->ay = t->y;
+            t->max_r = 0;
+            t->min_dx = t->max_dx = 0;
+            t->min_dy = t->max_dy = 0;
+            t->samples = 0;
+            t->t_down = armGetSystemTick();
+        } else {
+            uint64_t f = armGetSystemTickFreq();
+            unsigned ms = (unsigned)((armGetSystemTick() - t->t_down) * 1000ull /
+                                     (f ? f : 1ull));
+            printf("  [cap  ] id=%d anchor(%d,%d) %s  reach=%d"
+                   "  dx=[%+d,%+d] dy=[%+d,%+d]  %u ms, %d moves\n",
+                   slot, t->ax, t->ay,
+                   t->ax < (int)(SCREEN_W / 2) ? "LEFT " : "RIGHT",
+                   t->max_r, t->min_dx, t->max_dx, t->min_dy, t->max_dy,
+                   ms, t->samples);
+        }
+    }
 }
 
 static void touch_motion_fire(GuestMem *mem, int slot) {
     uint32_t *buf = &g_ev_touch_motion[slot];
+    {
+        Touch *t = &g_touch[slot];
+        int dx = t->x - t->ax, dy = t->y - t->ay;
+        int r = dx * dx + dy * dy;
+        t->samples++;
+        if (dx < t->min_dx) t->min_dx = dx;
+        if (dx > t->max_dx) t->max_dx = dx;
+        if (dy < t->min_dy) t->min_dy = dy;
+        if (dy > t->max_dy) t->max_dy = dy;
+        /* Compare squared, store the root once: the summary wants pixels. */
+        if (r > t->max_r * t->max_r) {
+            int g = 0;
+            while ((g + 1) * (g + 1) <= r)
+                g++;
+            t->max_r = g;
+        }
+    }
     if (!*buf)
         *buf = galloc(12);
     if (!*buf)
@@ -1822,21 +1886,18 @@ static int input_poll(int *px, int *py) {
         return 1;
     }
 
-    /* Docked: no touchscreen, so drive a cursor with the left stick. The
-     * divisor turns a full deflection into a few pixels per frame. */
-    padUpdate(&g_pad);
-    {
-        HidAnalogStickState st = padGetStickPos(&g_pad, 0);
-        if (st.x > 6000 || st.x < -6000)
-            g_cur_x = clampi(g_cur_x + st.x / 4000, 0, (int)SCREEN_W - 1);
-        if (st.y > 6000 || st.y < -6000)
-            /* Guest y is top-down, so pushing the stick up must decrease it. */
-            g_cur_y = clampi(g_cur_y - st.y / 4000, 0, (int)SCREEN_H - 1);
-    }
-    held = padGetButtons(&g_pad);
+    /* Docked, there is no pointer at all.
+     *
+     * A left stick nudging an invisible cursor that A then clicked was removed
+     * on purpose: nothing on screen showed where the cursor was, so it could
+     * only be used by guessing, and it occupied the very stick the game wants
+     * for movement. Controller support is being built properly instead --
+     * in-game first, then menus -- and a half-working stand-in would compete
+     * with it for the same inputs. */
+    (void)held;
     *px = g_cur_x;
     *py = g_cur_y;
-    return (held & HidNpadButton_A) ? 1 : 0;
+    return 0;
 }
 
 /* ---- keyboard ---------------------------------------------------------
@@ -1853,77 +1914,172 @@ static int input_poll(int *px, int *py) {
  * nothing changes behaviourally. */
 static uint32_t g_key_state[512];
 
-/* The codes this build polls, found by census: 5, 6, 99, 102. Rather than
- * guess which s3eKey constants they are, each is driven by a face button so
- * pressing one reveals what it does. Adjust once the semantics are known. */
-static const struct { u64 button; uint32_t key; const char *name; }
-g_key_map[] = {
-    /* The game is touch-driven -- the Vita port works from its front
-     * touchscreen alone -- so these are a convenience, not the main path.
-     * 5 proceeds and 126 goes back, observed; the rest are unidentified. */
-    { HidNpadButton_A,      5,   "A(confirm?)" },
-    { HidNpadButton_B,      126, "B(back?)"    },
-    { HidNpadButton_Up,     6,   "Up->6"       },
-    { HidNpadButton_Down,   99,  "Down->99"    },
-    { HidNpadButton_Left,   102, "Left->102"   },
-    { HidNpadButton_Right,  24,  "Right->24"   },
-};
+/* How often the game asks about each code, and how often we have sent it.
+ *
+ * The game echoes a poll straight after any key event it receives, so a code
+ * appearing once in the log means nothing. What identifies the codes this
+ * build actually uses is the ones it polls CONTINUOUSLY without being
+ * prompted -- its own scan set -- and that only shows up as a count. Dumped on
+ * demand (KEYS on the control socket) so the set can be compared between the
+ * menu and gameplay, which use different ones. */
+static uint32_t g_key_polls[512];
+static uint32_t g_key_sends[512];
 
 /* s3eKeyState: 0 up, 1 pressed this frame, 2 down, 3 released this frame --
  * the same shape as the pointer states, which is the SDK's convention. */
+/* The game speaks a gamepad protocol natively.
+ *
+ * It polls s3eKeyboardGetState thousands of times a session -- something this
+ * port noticed early and could not explain -- because the Android build ships
+ * Xperia Play support: a 2011 phone with physical controls. So buttons do not
+ * need synthetic touch at all; they are key codes the game already understands.
+ *
+ * The codes are from the PortMaster loader for this same game
+ * (github.com/Producdevity/cod-boz-port, MIT), which had already identified
+ * them. Guessing them is exactly what failed here before: an earlier table
+ * bound A and the d-pad to 5, 6, 99, 102 and 126 on the theory that pressing
+ * one would reveal its meaning, and a wrong mapping is indistinguishable from
+ * no mapping while being harder to reason about.
+ *
+ * Two codes per button, because the game uses different sets in menus and in
+ * play: the ABS_* group drives menu navigation, the Xperia group drives the
+ * game. Sending both on one press lets whichever is meaningful act and the
+ * other be ignored, rather than needing to know which screen is up. If that
+ * turns out to double-fire anywhere, splitting them by context is the fix. */
+enum {
+    XKEY_ALTERNATE_FIRE   = 9,
+    XKEY_TACTICAL_GRENADE = 10,
+    XKEY_CHANGE_WEAPON    = 11,
+    XKEY_CROUCH_PRONE     = 12,
+    XKEY_PAUSE            = 72,
+    XKEY_AIM              = 74,
+    XKEY_SHOOT            = 75,
+    XKEY_ACTION_SPRINT    = 78,
+    XKEY_MELEE            = 89,
+    XKEY_THROW_GRENADE    = 90,
+    XKEY_RELOAD           = 126,
+
+    /* The ABS_* group (204-210) is what the reference loader uses, and this
+     * build ignores it completely: a census showed those codes polled exactly
+     * once each, immediately after we sent them, which is the game echoing an
+     * event rather than scanning for one.
+     *
+     * What it DOES scan, continuously and unprompted, is these six -- 2148 to
+     * 4298 polls apiece in fifty seconds of sitting in the menu, with nothing
+     * mapped to them. Six codes is what a menu needs: four directions, a
+     * confirm and a back, and 126 is known to open settings because pressing
+     * it did.
+     *
+     * Which direction is which is the one thing the census cannot say, so the
+     * four are assigned in the obvious order and corrected by pressing them.
+     * That is a test, not a guess: the set is measured, only the order is
+     * open. */
+    MENU_KEY_CONFIRM = 5,
+    MENU_KEY_UP      = 6,
+    MENU_KEY_RIGHT   = 24,
+    MENU_KEY_DOWN    = 99,
+    MENU_KEY_LEFT    = 102,
+    MENU_KEY_BACK    = 126,
+};
+
+static const struct { u64 button; uint32_t game, menu; const char *name; }
+g_key_map[] = {
+    { HidNpadButton_ZR,      XKEY_SHOOT,            0,         "ZR shoot"    },
+    { HidNpadButton_ZL,      XKEY_AIM,              0,         "ZL aim"      },
+    /* Y sent 126 and opened settings, so 126 is a menu key here rather than
+     * reload. Y keeps only its in-game code until the in-game census says
+     * which one reloads. */
+    { HidNpadButton_Y,       XKEY_RELOAD,           0,         "Y reload"    },
+    { HidNpadButton_X,       XKEY_CHANGE_WEAPON,    0,         "X weapon"    },
+    /* No menu code on either. Sending both the in-game and the menu code on
+     * one press was meant to save knowing which screen is up, and it does not
+     * work: B crouched AND backed out at the same time, because 126 is live in
+     * play as well as in menus. Menus are driven by touch here, so the face
+     * buttons carry their in-game meaning only. */
+    { HidNpadButton_A,       XKEY_ACTION_SPRINT,    0, "A use"    },
+    { HidNpadButton_B,       XKEY_CROUCH_PRONE,     0, "B crouch" },
+    { HidNpadButton_R,       XKEY_THROW_GRENADE,    0,         "R grenade"   },
+    { HidNpadButton_L,       XKEY_TACTICAL_GRENADE, 0,         "L tactical"  },
+    { HidNpadButton_StickR,  XKEY_MELEE,            0,         "RS melee"    },
+    { HidNpadButton_StickL,  XKEY_ACTION_SPRINT,    0,         "LS sprint"   },
+    { HidNpadButton_Plus,    XKEY_PAUSE,            0,         "+ pause"     },
+    { HidNpadButton_Up,      0,                     MENU_KEY_UP,    "Up"     },
+    { HidNpadButton_Down,    0,                     MENU_KEY_DOWN,  "Down"   },
+    { HidNpadButton_Left,    0,                     MENU_KEY_LEFT,  "Left"   },
+    { HidNpadButton_Right,   0,                     MENU_KEY_RIGHT, "Right"  },
+};
+
+#define KEY_MAP_N (sizeof g_key_map / sizeof g_key_map[0])
+
+/* s3eKeyState: 0 up, 1 pressed this frame, 2 down, 3 released this frame. */
+static void key_set(GuestMem *mem, unsigned i, uint32_t k, int now, int was) {
+    /* One event buffer per (button, code): the queue is not drained until
+     * s3eDeviceYield, so a shared one would let a second change overwrite the
+     * first before either is delivered. The event is { m_Key, m_Pressed }
+     * passed BY ADDRESS -- handing the callback the code itself faulted the
+     * guest, which is how that was learned. */
+    static uint32_t ev[KEY_MAP_N][2];
+    uint32_t *slot;
+    if (!k || k >= 512)
+        return;
+    g_key_state[k] = now ? (was ? 2u : 1u) : (was ? 3u : 0u);
+    if (now == was)
+        return;
+    slot = &ev[i][k == g_key_map[i].menu ? 1 : 0];
+    if (!*slot)
+        *slot = galloc(8);
+    if (!*slot)
+        return;
+    g_key_sends[k]++;
+    guest_st32(mem, *slot + 0, k);
+    guest_st32(mem, *slot + 4, (uint32_t)now);
+    cb_queue("s3eKeyboard", 0, *slot);
+}
+
 static void key_update(GuestMem *mem) {
     static u64 prev;
+    static unsigned shown;
     u64 held;
     unsigned i;
     padUpdate(&g_pad);
     held = padGetButtons(&g_pad);
-
-    /* ZL+ZR cycles the touch Y convention live. Four combinations, and which
-     * one is right is an empirical question about the game's two input layers
-     * -- far quicker to feel than to reason about, and this avoids a reflash
-     * or editing a file on the card for each try. ZL/ZR are deliberately not
-     * mapped to any s3eKey, so the combo cannot collide with game input. */
-    {
-        static u64 prev_combo;
-        u64 combo = held & (HidNpadButton_ZL | HidNpadButton_ZR);
-        int both = combo == (HidNpadButton_ZL | HidNpadButton_ZR);
-        int was_both = prev_combo == (HidNpadButton_ZL | HidNpadButton_ZR);
-        (void)both; (void)was_both;
-        prev_combo = combo;
-    }
-
-    for (i = 0; i < sizeof g_key_map / sizeof g_key_map[0]; i++) {
-        uint32_t k = g_key_map[i].key;
+    for (i = 0; i < KEY_MAP_N; i++) {
         int now = (held & g_key_map[i].button) != 0;
         int was = (prev & g_key_map[i].button) != 0;
-        if (k >= 512)
-            continue;
-        g_key_state[k] = now ? (was ? 2u : 1u) : (was ? 3u : 0u);
-        if (now != was) {
-            /* s3eKeyboardEvent { m_Key, m_Pressed }, passed by address. The
-             * first version handed the callback the key code itself as its
-             * sysdata, so the game dereferenced address 5 and faulted. One
-             * buffer per mapped button, because the queue is not drained until
-             * s3eDeviceYield and two buttons can change in the same frame. */
-            static uint32_t ev[sizeof g_key_map / sizeof g_key_map[0]];
-            if (!ev[i])
-                ev[i] = galloc(8);
-            printf("  [key  ] %s %s -> s3eKey %u state %u\n",
-                   g_key_map[i].name, now ? "down" : "up", (unsigned)k,
-                   (unsigned)g_key_state[k]);
-            if (ev[i]) {
-                guest_st32(mem, ev[i] + 0, k);
-                guest_st32(mem, ev[i] + 4, (uint32_t)now);
-                cb_queue("s3eKeyboard", 0, ev[i]);
-            }
+        key_set(mem, i, g_key_map[i].game, now, was);
+        key_set(mem, i, g_key_map[i].menu, now, was);
+        if (now != was && shown < 40u) {
+            shown++;
+            printf("  [key  ] %-11s %s -> game %u / menu %u\n",
+                   g_key_map[i].name, now ? "down" : "up  ",
+                   (unsigned)g_key_map[i].game, (unsigned)g_key_map[i].menu);
         }
     }
     prev = held;
-    (void)mem;
 }
 
 /* The game calls this once a frame, which is the natural place to sample the
  * pad -- the same contract s3ePointerUpdate has. */
+/* s3eKeyboardGetInt(property). The game asks once at startup, and until now
+ * that fell through to the default stub and answered 0 -- which for a
+ * "is there a keyboard" style property means no, and would leave every key
+ * ignored no matter how well mapped.
+ *
+ * Answering 1 is provisional: the property ids are not known here, so each is
+ * reported on first sight rather than assumed. If the game misbehaves, the log
+ * says exactly which property it asked about and the answer can be narrowed to
+ * that one. */
+static void hle_key_getint(GuestCpu *cpu, GuestMem *mem, void *user) {
+    static uint32_t seen;
+    uint32_t prop = cpu->r[0];
+    (void)mem; (void)user;
+    if (prop < 32u && !(seen & (1u << prop))) {
+        seen |= 1u << prop;
+        printf("  [key  ] s3eKeyboardGetInt(%u) -> 1\n", (unsigned)prop);
+    }
+    cpu->r[0] = 1;
+}
+
 static void hle_key_update(GuestCpu *cpu, GuestMem *mem, void *user) {
     (void)user;
     key_update(mem);
@@ -1946,6 +2102,8 @@ static void hle_key_getstate(GuestCpu *cpu, GuestMem *mem, void *user) {
                    (unsigned)key);
         }
     }
+    if (key < 512)
+        g_key_polls[key]++;
     cpu->r[0] = (key < 512) ? g_key_state[key] : 0u;
 }
 
@@ -1957,14 +2115,145 @@ static void hle_key_getstate(GuestCpu *cpu, GuestMem *mem, void *user) {
  * keeps its touchID for its whole life, which is what the game tracks a stick
  * by -- reindexing them each frame would look like every finger lifting and
  * new ones landing elsewhere. */
+/* ---- controller as touch ----------------------------------------------
+ *
+ * Both sticks become contacts, using the shape the capture measured rather
+ * than a guessed one. The virtual sticks FLOAT -- they appear wherever a
+ * finger lands -- so there are no fixed zones to hit, only an anchor to pick.
+ *
+ * Left is a stick: press at an anchor, hold the contact at anchor + deflection
+ * scaled to PAD_MOVE_R. 95 px comes from the measurement -- sustained drags
+ * clustered at 90-135 px from the anchor on a 480x320 screen.
+ *
+ * Right is NOT a stick. Aiming was repeated horizontal drags of 60-140 px over
+ * 250-450 ms, so a held offset would turn once and then stop. It is a drag
+ * that re-anchors: the contact walks in the deflection direction and, when it
+ * nears an edge, lifts and starts again from the middle, which is what turning
+ * continuously actually looks like to the game. */
+#define PAD_DEADZONE  6000
+#define PAD_MOVE_R    95
+#define PAD_AIM_EDGE  40
+
+/* The right stick has to work two ways, because the GAME has two schemes.
+ *
+ * In swipe-aim mode the right side of the screen is dragged to turn, so the
+ * contact walks and re-anchors -- which is what it does below. In dual-stick
+ * mode the right side is a held stick, and re-anchoring is actively wrong:
+ * measured at 7 px a frame the contact reached the edge and lifted every
+ * 283 ms, so the stick the game was drawing kept vanishing and reappearing.
+ *
+ * Live-settable rather than compiled in, because which is right depends on a
+ * setting inside the game and the speed is a matter of feel. Guessing either
+ * and rebuilding per attempt is how this kind of tuning gets abandoned
+ * half-done. */
+static int g_aim_stick = 0;      /* 0 = drag and re-anchor, 1 = held stick */
+static int g_aim_speed = 7;      /* px per frame at full deflection */
+static int g_aim_radius = 95;    /* held-stick deflection, as for the left */
+
+static const int PAD_MOVE_AX = 110, PAD_MOVE_AY = 210;
+static const int PAD_AIM_CX  = 340, PAD_AIM_CY  = 160;
+
+static void pad_contact(GuestMem *mem, int slot, int want, int x, int y);
+
+/* Touch down at the ANCHOR, then move.
+ *
+ * The game's virtual sticks float: whatever position a contact goes down at
+ * becomes the stick's centre, and everything after is read as an offset from
+ * it. Pressing straight to anchor+deflection therefore anchored the stick
+ * wherever the thumb happened to be at that instant, so it landed somewhere
+ * different every time and the on-screen control wandered around -- which is
+ * exactly what it looked like.
+ *
+ * So the press is always at the anchor and the offset is applied from the next
+ * frame on. One frame of delay, and the stick stays where it is put. */
+static void pad_stick(GuestMem *mem, int slot, int ax, int ay, int dx, int dy) {
+    Touch *t = &g_touch[slot];
+    int first = !t->active;
+    pad_contact(mem, slot, 1,
+                clampi(first ? ax : ax + dx, 0, (int)SCREEN_W - 1),
+                clampi(first ? ay : ay + dy, 0, (int)SCREEN_H - 1));
+}
+
+static void pad_contact(GuestMem *mem, int slot, int want, int x, int y) {
+    Touch *t = &g_touch[slot];
+    if (!want) {
+        if (t->active) {
+            touch_fire(mem, slot, 0);
+            t->active = 0;
+        }
+        return;
+    }
+    t->raw_x = x;
+    t->raw_y = y;
+    if (!t->active) {
+        t->active = 1;
+        t->fid = 0xF000u + (uint32_t)slot;   /* cannot collide with a finger */
+        t->x = x;
+        t->y = y;
+        touch_fire(mem, slot, 1);
+    } else if (t->x != x || t->y != y) {
+        t->x = x;
+        t->y = y;
+        touch_motion_fire(mem, slot);
+    }
+}
+
+static void pad_touch_update(GuestMem *mem) {
+    static int aim_x, aim_y, aim_down;
+    HidAnalogStickState l, r;
+    int lx, ly, rx, ry;
+    padUpdate(&g_pad);
+    l = padGetStickPos(&g_pad, 0);
+    r = padGetStickPos(&g_pad, 1);
+    lx = l.x < 0 ? -l.x : l.x;
+    ly = l.y < 0 ? -l.y : l.y;
+    rx = r.x < 0 ? -r.x : r.x;
+    ry = r.y < 0 ? -r.y : r.y;
+
+    if (lx > PAD_DEADZONE || ly > PAD_DEADZONE) {
+        /* Guest y is top-down, so pushing the stick up must decrease it. */
+        pad_stick(mem, PAD_SLOT_MOVE, PAD_MOVE_AX, PAD_MOVE_AY,
+                  l.x * PAD_MOVE_R / 32767, -l.y * PAD_MOVE_R / 32767);
+    } else {
+        pad_contact(mem, PAD_SLOT_MOVE, 0, 0, 0);
+    }
+
+    if ((rx > PAD_DEADZONE || ry > PAD_DEADZONE) && g_aim_stick) {
+        /* Dual-stick: a floating stick, exactly like the left one. */
+        aim_down = 1;
+        pad_stick(mem, PAD_SLOT_AIM, PAD_AIM_CX, PAD_AIM_CY,
+                  r.x * g_aim_radius / 32767, -r.y * g_aim_radius / 32767);
+    } else if (rx > PAD_DEADZONE || ry > PAD_DEADZONE) {
+        if (!aim_down) {
+            aim_x = PAD_AIM_CX;
+            aim_y = PAD_AIM_CY;
+            aim_down = 1;
+        }
+        aim_x += r.x * g_aim_speed / 32767;
+        aim_y -= r.y * g_aim_speed / 32767;
+        /* Off the edge: lift and start again from the middle, so a held stick
+         * keeps turning instead of stopping at the screen border. */
+        if (aim_x < PAD_AIM_EDGE || aim_x > (int)SCREEN_W - PAD_AIM_EDGE ||
+            aim_y < PAD_AIM_EDGE || aim_y > (int)SCREEN_H - PAD_AIM_EDGE) {
+            pad_contact(mem, PAD_SLOT_AIM, 0, 0, 0);
+            aim_x = PAD_AIM_CX;
+            aim_y = PAD_AIM_CY;
+        }
+        pad_contact(mem, PAD_SLOT_AIM, 1, aim_x, aim_y);
+    } else if (aim_down) {
+        pad_contact(mem, PAD_SLOT_AIM, 0, 0, 0);
+        aim_down = 0;
+    }
+}
+
 static void touch_update(GuestMem *mem) {
     HidTouchScreenState ts;
-    Touch now[MAX_TOUCH];
+    Touch now[REAL_TOUCH];
     int i, j, n = 0;
 
     memset(now, 0, sizeof now);
     if (g_touch_ready && hidGetTouchScreenStates(&ts, 1)) {
-        for (i = 0; i < (int)ts.count && n < MAX_TOUCH; i++) {
+        for (i = 0; i < (int)ts.count && n < REAL_TOUCH; i++) {
             /* Ignore anything outside the rendered viewport. Clamping instead
              * turned a palm resting on the left letterbox into a permanent
              * contact pinned to x=0 -- it took slot 0 and never lifted, so the
@@ -2003,7 +2292,7 @@ static void touch_update(GuestMem *mem) {
     }
 
     /* Releases first: a slot whose finger id is no longer present. */
-    for (i = 0; i < MAX_TOUCH; i++) {
+    for (i = 0; i < REAL_TOUCH; i++) {
         int still = 0;
         if (!g_touch[i].active)
             continue;
@@ -2019,7 +2308,7 @@ static void touch_update(GuestMem *mem) {
     /* Then moves and presses, each finger keeping or claiming a slot. */
     for (j = 0; j < n; j++) {
         int slot = -1;
-        for (i = 0; i < MAX_TOUCH; i++)
+        for (i = 0; i < REAL_TOUCH; i++)
             if (g_touch[i].active && g_touch[i].fid == now[j].fid)
                 slot = i;
         if (slot >= 0) {
@@ -2030,7 +2319,7 @@ static void touch_update(GuestMem *mem) {
             }
             continue;
         }
-        for (i = 0; i < MAX_TOUCH && slot < 0; i++)
+        for (i = 0; i < REAL_TOUCH && slot < 0; i++)
             if (!g_touch[i].active)
                 slot = i;
         if (slot < 0)
@@ -2066,6 +2355,7 @@ static void hle_ptr_update_body(GuestCpu *cpu, GuestMem *mem, void *user) {
 
     down = input_poll(&x, &y);
     touch_update(mem);
+    pad_touch_update(mem);   /* the sticks, as two more contacts */
     /* The polled getters must agree with the tracked contacts. input_poll only
      * looks at ts.touches[0] and gives up if that contact is outside the
      * viewport, so a palm on the bezel taking that index left g_tap_x/y frozen
@@ -4026,6 +4316,8 @@ static void bind_slot(uint32_t i, const char *nm) {
         g_slots[i].fn = hle_key_getstate;
     else if (!strcmp(nm, "s3eKeyboardUpdate"))
         g_slots[i].fn = hle_key_update;
+    else if (!strcmp(nm, "s3eKeyboardGetInt"))
+        g_slots[i].fn = hle_key_getint;
     else if (!strcmp(nm, "s3ePointerGetInt"))
         g_slots[i].fn = hle_ptr_getint;
     else if (ends_with(nm, "UnRegister"))
@@ -4772,6 +5064,44 @@ static void ctl_command(char *line) {
             printf("  [snd  ] s3eAudio handlers %s\n",
                    g_audio_hle ? "LIVE" : "stubbed (pre-music behaviour)");
             ctl_say("OK\n");
+        } else if (!strncmp(arg, "AIM ", 4)) {
+            /* SND AIM <speed> [radius] -- px per frame, and the held-stick
+             * deflection. Both are feel, and feel cannot be measured from
+             * here. */
+            int sp = 0, rad = 0;
+            if (sscanf(arg + 4, "%d %d", &sp, &rad) >= 1 && sp > 0 && sp < 64) {
+                g_aim_speed = sp;
+                if (rad > 8 && rad < 200)
+                    g_aim_radius = rad;
+                printf("  [pad  ] aim speed %d, radius %d\n",
+                       g_aim_speed, g_aim_radius);
+                ctl_say("OK\n");
+            } else {
+                ctl_say("ERR use: SND AIM <speed> [radius]\n");
+            }
+        } else if (!strcmp(arg, "AIMMODE 0") || !strcmp(arg, "AIMMODE 1")) {
+            g_aim_stick = arg[8] == '1';
+            printf("  [pad  ] right stick: %s\n",
+                   g_aim_stick ? "held stick (dual-stick mode)"
+                               : "drag and re-anchor (swipe-aim mode)");
+            ctl_say("OK\n");
+        } else if (!strcmp(arg, "KEYS")) {
+            /* Codes ranked by how often the game asked, with how often we
+             * sent them alongside. A high poll count and a zero send count is
+             * a code this build cares about that nothing is mapped to yet. */
+            unsigned k, shown = 0;
+            printf("  [key  ] code  polled   sent\n");
+            for (; shown < 16u; shown++) {
+                unsigned best = 0, bi = 0;
+                for (k = 0; k < 512u; k++)
+                    if (g_key_polls[k] > best) { best = g_key_polls[k]; bi = k; }
+                if (!best)
+                    break;
+                printf("  [key  ] %4u  %7u  %5u\n",
+                       bi, best, (unsigned)g_key_sends[bi]);
+                g_key_polls[bi] = 0;   /* consumed for the ranking pass */
+            }
+            ctl_say("OK\n");
         } else if (!strcmp(arg, "STAT")) {
             /* Is the mixer thread alive? Ask twice and compare the count. */
             printf("  [snd  ] mix=%llu voices=%u music=%s\n",
@@ -4789,7 +5119,7 @@ static void ctl_command(char *line) {
                    g_snd_endcb ? "ON" : "OFF");
             ctl_say(g_snd_endcb ? "OK endcb on\n" : "OK endcb off\n");
         } else {
-            ctl_say("ERR use: SND STAT | MUSIC 0|1 | ENDCB 0|1 | AUDIOHLE 0|1\n");
+            ctl_say("ERR use: SND STAT|KEYS|AIM n|AIMMODE 0|1|MUSIC 0|1\n");
         }
     } else if (!strcmp(line, "STUBS")) {
         /* The import call counts, on demand. They used to be available only on
