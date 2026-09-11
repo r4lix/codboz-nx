@@ -693,9 +693,9 @@ static void te_GetProcAddress(GuestCpu *c, GuestMem *m, void *u) {
  * must be scaled identically or clipping cuts the wrong region.
  *
  * GL measures both from the bottom left, so y needs no flip. */
-#define VP_W 480
-#define VP_H 320
-#define VP_DST_W 1080
+#define VP_W 1280
+#define VP_H 720
+#define VP_DST_W 1280
 #define VP_DST_H 720
 #define VP_X0 ((1280 - VP_DST_W) / 2)
 

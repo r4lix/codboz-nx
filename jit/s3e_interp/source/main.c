@@ -1490,7 +1490,7 @@ static void hle_device_yield(GuestCpu *cpu, GuestMem *mem, void *user) {
  * well before the framebuffer is created. */
 #define FB_W 1280u
 #define FB_H 720u
-#define VIEW_W 1080u
+#define VIEW_W 1280u
 #define VIEW_X ((FB_W - VIEW_W) / 2u)
 
 static PadState g_pad;
@@ -1557,13 +1557,23 @@ static GuestMem *g_memp;
 
 #define SCRATCH_BASE 0x00700000u
 #define SCRATCH_SIZE 0x1000u
-#define SCREEN_W     480u
-#define SCREEN_H     320u
+#define SCREEN_W     1280u
+#define SCREEN_H     720u
 #define SURF_BPP     2u
 #define SURF_PIXTYPE 0x422u
 #define SURF_FRAME   (SCREEN_W * SCREEN_H * SURF_BPP)
 #define SURF_BYTES   (((SURF_FRAME + 0xFFFu) & ~0xFFFu) + (16u << 20))
 
+/* Every pixel figure in the pad-to-touch code below was MEASURED against a
+ * 480x320 surface -- stick radii, anchors, the action tap. They are only
+ * meaningful as a fraction of the screen, so say so, rather than leaving a
+ * pile of bare integers that silently mean something else the moment the
+ * reported surface size changes. Both reduce to the original number while
+ * SCREEN_W/H are 480x320. */
+#define PAD_BASE_W   480
+#define PAD_BASE_H   320
+#define PX_W(v)      ((int)(v) * (int)SCREEN_W / PAD_BASE_W)
+#define PX_H(v)      ((int)(v) * (int)SCREEN_H / PAD_BASE_H)
 
 /* ---- synthetic input --------------------------------------------------
  * The game both POLLS (s3ePointerGetState/GetX/GetY each frame) and registered
@@ -1941,7 +1951,7 @@ static int input_poll(int *px, int *py) {
  * not fire, and the only cost is the movement stick flashing on screen for
  * the few frames the tap is held. That is the cheaper side effect, and it
  * goes away entirely once the on-screen controls are hidden. */
-static int g_act_x = 230, g_act_y = 240;
+static int g_act_x = PX_W(230), g_act_y = PX_H(240);
 static int g_act_frames;
 
 static uint32_t g_key_state[512];
@@ -2208,8 +2218,8 @@ static void hle_key_getstate(GuestCpu *cpu, GuestMem *mem, void *user) {
  * nears an edge, lifts and starts again from the middle, which is what turning
  * continuously actually looks like to the game. */
 #define PAD_DEADZONE  6000
-#define PAD_MOVE_R    95
-#define PAD_AIM_EDGE  40
+#define PAD_MOVE_R    PX_W(95)
+#define PAD_AIM_EDGE  PX_W(40)
 
 /* The right stick has to work two ways, because the GAME has two schemes.
  *
@@ -2224,11 +2234,11 @@ static void hle_key_getstate(GuestCpu *cpu, GuestMem *mem, void *user) {
  * and rebuilding per attempt is how this kind of tuning gets abandoned
  * half-done. */
 static int g_aim_stick = 0;      /* 0 = drag and re-anchor, 1 = held stick */
-static int g_aim_speed = 20;     /* px per frame at full deflection */
-static int g_aim_radius = 95;    /* held-stick deflection, as for the left */
+static int g_aim_speed = PX_W(20);  /* px per frame at full deflection */
+static int g_aim_radius = PX_W(95); /* held-stick deflection, as for the left */
 
-static const int PAD_MOVE_AX = 110, PAD_MOVE_AY = 210;
-static const int PAD_AIM_CX  = 340, PAD_AIM_CY  = 160;
+static const int PAD_MOVE_AX = PX_W(110), PAD_MOVE_AY = PX_H(210);
+static const int PAD_AIM_CX  = PX_W(340), PAD_AIM_CY  = PX_H(160);
 
 static void pad_contact(GuestMem *mem, int slot, int want, int x, int y);
 
@@ -3135,7 +3145,7 @@ void *egl_take_window(void) {
     g_native_stage = win ? 130 : 131;
     return win;
 }
-static uint32_t g_xmap[1080];
+static uint32_t g_xmap[VIEW_W];
 
 static void fb_open(void) {
     Result rc;
