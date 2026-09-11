@@ -18,6 +18,8 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/iosupport.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <dirent.h>
 
@@ -1562,6 +1564,7 @@ static GuestMem *g_memp;
 #define SURF_FRAME   (SCREEN_W * SCREEN_H * SURF_BPP)
 #define SURF_BYTES   (((SURF_FRAME + 0xFFFu) & ~0xFFFu) + (16u << 20))
 
+
 /* ---- synthetic input --------------------------------------------------
  * The game both POLLS (s3ePointerGetState/GetX/GetY each frame) and registered
  * a pointer callback, so a tap has to arrive on both paths -- driving only the
@@ -2816,10 +2819,46 @@ typedef enum { WIN_NONE, WIN_CONSOLE, WIN_FB, WIN_EGL } WinOwner;
 static WinOwner g_win = WIN_CONSOLE;    /* consoleInit(NULL) runs in main() */
 extern volatile uint32_t g_native_stage;
 
+/* A sink for stdout once the console is gone.
+ *
+ * consoleExit() tears the console down, and libnx leaves its device installed
+ * on STD_OUT -- so the next printf stores into a buffer that is no longer
+ * there. That is a NULL write, and it is exactly where the game died when
+ * launched with no PC to log to: native_stage 123, one statement after
+ * win_release(), on the printf announcing the handover.
+ *
+ * It never happened with nxlink connected because nxlinkStdio replaces the
+ * STD_OUT device with its socket, so the console is not in the path at all.
+ * The offline case is the only one that writes to a dead console, which is
+ * why "works here, crashes for you" was the shape of it.
+ *
+ * Swapping the DEVICE rather than the FILE matters: stdout is per-thread in
+ * newlib, but the mixer and control threads print too, and they all resolve
+ * through this one table. */
+static int g_nxlink_up;
+
+static ssize_t null_write(struct _reent *r, void *fd, const char *p, size_t n) {
+    (void)r; (void)fd; (void)p;
+    return (ssize_t)n;
+}
+
+static const devoptab_t g_dev_null = {
+    .name = "boznull", .structSize = 0, .write_r = null_write
+};
+
+static void log_drop_console(void) {
+    if (g_nxlink_up)            /* nxlink owns STD_OUT; leave it alone */
+        return;
+    devoptab_list[STD_OUT] = &g_dev_null;
+    devoptab_list[STD_ERR] = &g_dev_null;
+}
+
+
 static void win_release(void) {
     switch (g_win) {
     case WIN_CONSOLE:
         g_native_stage = 121;
+        log_drop_console();   /* before the buffer goes away */
         consoleExit(NULL);
         g_native_stage = 122;
         break;
@@ -4475,6 +4514,17 @@ static void startup_stage_write(const char *stage) {
     if (g_win == WIN_CONSOLE)
         consoleUpdate(NULL);
 }
+
+/* The breadcrumb has done its job once the game is actually running, and
+ * leaving it on the card makes the next launch stop and ask to be
+ * acknowledged -- every launch, forever, because nothing ever removed it.
+ * It should only speak up when the previous run died BEFORE it got going. */
+static void startup_stage_clear(void) {
+    unsigned i;
+    for (i = 0; i < sizeof(g_stage_paths) / sizeof(g_stage_paths[0]); i++)
+        remove(g_stage_paths[i]);
+}
+
 
 static int startup_stage_read(char *out, size_t cap) {
     unsigned i;
@@ -6217,8 +6267,16 @@ static void run(void) {
         }
     }
     g_bench_t0 = armGetSystemTick();
+    uint64_t quit_held = 0;   /* tick the escape combo went held, 0 if not */
+    int stage_cleared = 0;    /* the breadcrumb, dropped once we are live */
     while (!g_quit && st == GUEST_STEP_LIMIT) {
         st = dyn_run(&g, 0xFFFFFFFFu, 5000000ull);
+        /* Sixty-odd frames on screen is past every early death the
+         * breadcrumb exists to catch. */
+        if (!stage_cleared && g_presents > 60) {
+            startup_stage_clear();
+            stage_cleared = 1;
+        }
         /* Stop the CLOCK at the target, but not the run: EGL owns the
          * window, so breaking out here leaves whatever frame happened to
          * be on screen sitting there forever, and a benchmark that ends
@@ -6252,10 +6310,32 @@ static void run(void) {
             break;
         if (!appletMainLoop())
             break;
+        /* The harness escape hatch. A single press of + was fine while this
+         * was only ever a benchmark and nothing else read the pad. Now + is
+         * the game's pause key, so that binding did two things at once: the
+         * press opened settings AND stopped the run, and the next press hit
+         * "Press + to exit" below and dropped to HorizonOS. On repeated
+         * presses it looked exactly like a crash.
+         *
+         * It was also intermittent, which is what sent the diagnosis after
+         * the key encoding instead. padGetButtonsDown reports the delta since
+         * the LAST padUpdate, and key_update and pad_touch_update each call
+         * one per frame -- so whichever ran first usually ate the edge and
+         * this check saw nothing. Pressing + repeatedly was buying tickets in
+         * that race.
+         *
+         * So: a button the game does not use, held for a second, and read
+         * from the held state rather than an edge, which cannot race. */
         padUpdate(&g_pad);
-        if (padGetButtonsDown(&g_pad) & HidNpadButton_Plus) {
-            printf("  ... stopped by +\n");
-            break;
+        if (padGetButtons(&g_pad) & HidNpadButton_Minus) {
+            if (!quit_held)
+                quit_held = armGetSystemTick();
+            else if (armGetSystemTick() - quit_held > armGetSystemTickFreq()) {
+                printf("  ... stopped by - held\n");
+                break;
+            }
+        } else {
+            quit_held = 0;
         }
         printf("  ... %lluM instructions, pc=%06x, %d presents\n",
                (unsigned long long)(g.executed / 1000000ull),
@@ -6332,6 +6412,59 @@ static void run(void) {
  * This removes netloader from the loop entirely, which matters because
  * netloading writes the NRO to the SD, and that write is what has been
  * failing. */
+/* Is anything actually listening on the nxlink host?
+ *
+ * nxlinkConnectToHost does a BLOCKING connect to __nxlink_host:28771, on the
+ * main thread, before run() is ever reached. That is fine when the PC is
+ * there. With the PC off -- which is the normal state for simply PLAYING the
+ * game -- it blocks for the full TCP SYN timeout and the game looks like it
+ * does not start at all. A nxlink_host.txt on the card makes that the
+ * guaranteed path rather than a rare one, because the file is what supplies
+ * an address to hang on; without it __nxlink_host is zero and the call fails
+ * immediately, which is why this never showed up while netloading.
+ *
+ * So probe first, non-blocking, with a deadline a host on the same LAN beats
+ * by three orders of magnitude, and only hand over if the probe connects. */
+static int nxlink_reachable(void) {
+    struct sockaddr_in sa;
+    struct timeval tv;
+    fd_set wr;
+    socklen_t len = sizeof(int);
+    int fd, flags, err = 0, ret;
+
+    if (!__nxlink_host.s_addr)
+        return 0;
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return 0;
+    flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(NXLINK_CLIENT_PORT);
+    sa.sin_addr = __nxlink_host;
+    ret = connect(fd, (struct sockaddr *)&sa, sizeof sa);
+    if (ret == 0) {
+        close(fd);
+        return 1;
+    }
+    if (errno != EINPROGRESS) {
+        close(fd);
+        return 0;
+    }
+    FD_ZERO(&wr);
+    FD_SET(fd, &wr);
+    tv.tv_sec = 0;
+    tv.tv_usec = 400000;              /* a host on the LAN answers in ~1 ms */
+    ret = select(fd + 1, NULL, &wr, NULL, &tv);
+    if (ret > 0 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && !err) {
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    return 0;
+}
+
 static int nxlink_host_from_file(void) {
     static const char *paths[] = {"sdmc:/switch/boz/nxlink_host.txt",
                                   "sdmc:/nxlink_host.txt"};
@@ -6408,10 +6541,13 @@ int main(int argc, char **argv) {
     if (R_SUCCEEDED(socketInitializeDefault())) {
         sockets_up = 1;
         ctl_init();
-        nxfd = nxlinkStdio();
+        /* Probe before each connect, so an absent host costs 400 ms once
+         * instead of a full TCP timeout twice. */
+        if (nxlink_reachable())
+            nxfd = nxlinkStdio();
         if (nxfd < 0) {                 /* not netloaded: try the card */
             consoleUpdate(NULL);
-            if (nxlink_host_from_file())
+            if (nxlink_host_from_file() && nxlink_reachable())
                 nxfd = nxlinkStdio();
         }
         if (nxfd < 0) {
@@ -6422,6 +6558,9 @@ int main(int argc, char **argv) {
         printf("socket init failed; logging on screen\n");
         consoleUpdate(NULL);
     }
+    /* Whether the console is still in the output path decides if it is
+     * safe to print after the window changes hands. */
+    g_nxlink_up = (nxfd >= 0);
     setvbuf(stdout, NULL, _IONBF, 0);   /* stream lines as they happen */
 
     printf("s3e interpreter test - %s\n\n", BOZ_BUILD_LABEL);
