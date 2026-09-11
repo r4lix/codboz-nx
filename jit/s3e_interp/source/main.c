@@ -80,6 +80,8 @@ static S3eImage g_img;
 static int g_calls, g_shown;
 static int g_hook_hits[3];
 static uint32_t g_ext_stub;          /* guest addr of a "return 0" stub */
+static uint32_t g_tp_stub[5];        /* s3eTouchpad function table, as guest
+                                      * addresses the game can actually call */
 
 static void gstr(const GuestMem *m, uint32_t addr, char *out, size_t n) {
     size_t i = 0;
@@ -325,9 +327,31 @@ static void hle_free(GuestCpu *cpu, GuestMem *mem, void *user) {
 /* s3eExtGetHash(hash, out_table, bytes): a zero return makes the caller take
  * the "extension missing" path and then call the table entries anyway, so the
  * table has to be filled with something callable. */
+#define S3E_TOUCHPAD_HASH 0x1dbd7ce8u
+
 static void hle_extgethash(GuestCpu *cpu, GuestMem *mem, void *user) {
     uint32_t i;
     (void)user;
+    /* The Xperia Play analog pads.
+     *
+     * This is an Xperia Play title and it asks for s3eTouchpad by hash at
+     * startup -- "error loading extension: s3eTouchpad" in the log is the game
+     * being told no. That refusal is precisely why it falls back to drawing
+     * virtual sticks on the screen, and why the pad had to be faked as touch.
+     * Hand over a real table and the sticks can be delivered as sticks.
+     *
+     * Both the PortMaster port and, judging by its 960x544 pad geometry, the
+     * Vita one do exactly this. */
+    if (cpu->r[0] == S3E_TOUCHPAD_HASH && cpu->r[1] &&
+        cpu->r[2] == sizeof g_tp_stub) {
+        for (i = 0; i < 5; i++)
+            guest_st32(mem, cpu->r[1] + 4 * i, g_tp_stub[i]);
+        printf("  [tpad ] s3eTouchpad handed over\n");
+        cpu->r[0] = 0;                  /* S3E_RESULT_SUCCESS */
+        return;
+    }
+    /* A zero return makes the caller take the "extension missing" path and
+     * then call the table entries anyway, so they still have to be callable. */
     for (i = 0; i + 4 <= cpu->r[2]; i += 4)
         guest_st32(mem, cpu->r[1] + i, g_ext_stub);
     cpu->r[0] = 1;
@@ -1571,12 +1595,12 @@ static GuestMem *g_memp;
  * reported surface size changes.
  *
  * The basis is the size they were measured at, so each reduces to the number
- * actually observed. It moved to 1280x720 with the surface, and that
- * re-measurement was not optional: scaling the old numbers by the new aspect
- * put the left stick deflection at 253 px when the largest drag a hand
- * actually makes is 242, so the contact was being pushed clean out of the zone
- * the stick lives in. The game pins its controls to the screen; where they
- * land is not something a ratio can be trusted to predict. */
+ * actually observed. It moved from 480x320 to 1280x720 when the surface did,
+ * and that re-measurement was not optional: scaling the old numbers by the new
+ * aspect put the left stick's deflection at 253 px when the largest drag a
+ * hand actually makes is 242, so the contact was being pushed clean out of the
+ * zone the stick lives in. The game pins its controls to the screen; where
+ * they land is not something a ratio can be trusted to predict. */
 #define PAD_BASE_W   1280
 #define PAD_BASE_H   720
 #define PX_W(v)      ((int)(v) * (int)SCREEN_W / PAD_BASE_W)
@@ -1972,6 +1996,25 @@ static uint32_t g_key_state[512];
  * demand (KEYS on the control socket) so the set can be compared between the
  * menu and gameplay, which use different ones. */
 static uint32_t g_key_polls[512];
+
+/* Minimum hold, in frames, for codes that want to be held rather than tapped.
+ *
+ * Reload (126) does not fire on a quick tap: the game either wants the key
+ * held, or is waiting out its own double-tap window to see whether this is a
+ * weapon swap instead. Those look identical from outside, and the ICF has no
+ * timing key to tell them apart -- 17319 bytes of it and nothing about taps or
+ * reload. So stretch a tap into a hold and let the game answer: if reload goes
+ * instant, it wanted a hold; if it still lags, it is the double-tap window and
+ * nothing here can shorten it.
+ *
+ * Live-settable, because the answer is one number and rebuilding per guess is
+ * how this kind of thing gets abandoned half-done. */
+static uint16_t g_min_hold[512];
+static int      g_reload_hold = 12;      /* SND HOLD <frames>, ~200 ms at 60 */
+/* How long B may be held before the game would read it as sprint. Six
+ * frames is a hundred milliseconds: unmistakably a tap, and still long
+ * enough for buy and repair, which worked on ordinary presses. */
+static int      g_use_cap = 6;           /* SND TAPMAX <frames> */
 static uint32_t g_key_pulse;   /* SND KEY: one code to send next update */
 static uint32_t g_key_sends[512];
 
@@ -2002,6 +2045,11 @@ enum {
     XKEY_CHANGE_WEAPON    = 11,
     XKEY_CROUCH_PRONE     = 12,
     XKEY_PAUSE            = 72,
+    /* Unnamed in the reference Xperia table, which jumps 72 -> 74, but
+     * very much real: a census in gamepad mode has the game polling it
+     * 66834 times against 73589 for pause and 19956 for use, and never
+     * once receiving it. A key scanned that hard is not vestigial. */
+    XKEY_UNKNOWN_73       = 73,
     XKEY_AIM              = 74,
     XKEY_SHOOT            = 75,
     XKEY_ACTION_SPRINT    = 78,
@@ -2032,40 +2080,87 @@ enum {
     MENU_KEY_BACK    = 126,
 };
 
-static const struct { u64 button; uint32_t game, menu; const char *name; }
+/* Defined with the touchpad code below; the key map needs to know whether
+ * the game is in gamepad mode. */
+static int tp_engaged(void);
+
+/* Black Ops on a console, as closely as this game allows.
+ *
+ * Nintendo letters sit where the PlayStation shapes do: A is Circle, B is
+ * Cross, X is Triangle, Y is Square. So the console roles land as crouch on A,
+ * swap on X and use/reload on Y, which is what this maps.
+ *
+ * The codes come from playing rather than from the reference header, and one
+ * of them disagrees with it. 126 is named RELOAD there, but in this build a
+ * single press SWAPS WEAPON and a double press reloads -- the combined button
+ * the phone version shipped. It is also what opens settings in menus, which is
+ * how it got mis-filed as a settings key earlier. So 126 goes on X, where the
+ * console puts weapon swap, and it brings reload along with it.
+ *
+ * 78 is use: buy, repair, revive. It is on Y, where Square lives, and again on
+ * B because that is the button the on-screen prompt points at while the game
+ * is in Xperia gamepad mode. Two buttons on one code is safe now that state is
+ * aggregated per code rather than per button -- before, the second entry
+ * silently wiped the first one edge flags, which is why half of these
+ * appeared dead no matter which code they were given.
+ *
+ * The D-pad keeps the reference actions. Nothing on the console maps there, so
+ * it costs nothing and leaves 9 and 11 reachable for testing: 9 is alternate
+ * fire, 11 the reference name for change weapon, which may or may not differ
+ * from 126 in practice. */
+/* `cap` is a maximum hold in frames, 0 for none.
+ *
+ * 78 is use AND sprint, and the game tells them apart the same way it tells
+ * reload from weapon-swap: by how long the key is held. A tap uses, a hold
+ * runs. Reload proved that model -- stretching a tap into a hold made it fire
+ * instantly -- so the inverse applies here. Cap B so it can never read as a
+ * hold, and leave L3 uncapped so sprint still has a home. One code, two
+ * buttons, two behaviours, which only works at all because key state is
+ * aggregated per code now. */
+static const struct { u64 button; uint32_t game, alt; const char *name; int cap; }
 g_key_map[] = {
-    { HidNpadButton_ZR,      XKEY_SHOOT,            0,         "ZR shoot"    },
-    { HidNpadButton_ZL,      XKEY_AIM,              0,         "ZL aim"      },
-    /* Y is where Square sits on a DualShock, so it is the action button:
-     * repair, buy, reload. It sends 78 AND taps the world at g_act_x/y,
-     * because 78 alone does nothing at a barricade -- the prompt really does
-     * mean "tap". 126 is not reload; it opens settings in play as well as in
-     * menus, so it is this build's settings key whatever the reference calls
-     * it. The codes still unidentified are 9 and 73; SND KEY <code> pulses
-     * one on demand rather than binding a third guess to a button. */
-    { HidNpadButton_Y,       XKEY_ACTION_SPRINT,    0,         "Y action"    },
-    { HidNpadButton_X,       XKEY_CHANGE_WEAPON,    0,         "X weapon"    },
-    /* No menu code on either. Sending both the in-game and the menu code on
-     * one press was meant to save knowing which screen is up, and it does not
-     * work: B crouched AND backed out at the same time, because 126 is live in
-     * play as well as in menus. Menus are driven by touch here, so the face
-     * buttons carry their in-game meaning only. */
-    /* PlayStation positions, not Nintendo letters: A sits where Circle does
-     * (crouch) and B where Cross does (jump). */
-    { HidNpadButton_A,       XKEY_CROUCH_PRONE,     0, "A crouch" },
-    /* B is unbound: this port has no jump. Code 9 was the only unidentified
-     * candidate in the in-game scan set and pressing it does nothing at all,
-     * which fits a touch build that never had an on-screen jump control. */
-    { HidNpadButton_B,       0,                     0, "B unbound" },
-    { HidNpadButton_R,       XKEY_THROW_GRENADE,    0,         "R grenade"   },
-    { HidNpadButton_L,       XKEY_TACTICAL_GRENADE, 0,         "L tactical"  },
-    { HidNpadButton_StickR,  XKEY_MELEE,            0,         "RS melee"    },
-    { HidNpadButton_StickL,  XKEY_ACTION_SPRINT,    0,         "LS sprint"   },
-    { HidNpadButton_Plus,    XKEY_PAUSE,            0,         "+ pause"     },
-    { HidNpadButton_Up,      0,                     MENU_KEY_UP,    "Up"     },
-    { HidNpadButton_Down,    0,                     MENU_KEY_DOWN,  "Down"   },
-    { HidNpadButton_Left,    0,                     MENU_KEY_LEFT,  "Left"   },
-    { HidNpadButton_Right,   0,                     MENU_KEY_RIGHT, "Right"  },
+    { HidNpadButton_ZR,      XKEY_SHOOT,            0, "ZR shoot"    , 0 },
+    { HidNpadButton_ZL,      XKEY_AIM,              0, "ZL aim"      , 0 },
+
+    /* Square on a PlayStation pad is BOTH use and reload, and this game splits
+     * those across two codes -- 78 use, 126 reload -- so Y sends both.
+     *
+     * They need opposite timing, which is the whole reason this works. 78 is
+     * capped so it stays a tap and never becomes sprint; 126 gets the minimum
+     * hold that makes reload instant. One press, both behaviours, each with
+     * the duration the game wants to see. */
+    { HidNpadButton_Y,       XKEY_ACTION_SPRINT, XKEY_RELOAD, "Y use/reload", 0 },
+    /* B is left FREE on purpose, held for a jump if one can be found.
+     *
+     * Cross is jump on a PlayStation pad, and nothing here does that yet. The
+     * key census makes the odds look poor rather than open: every code the
+     * game polls is now accounted for -- 9 alternate fire, 10 tactical, 11
+     * change weapon, 12 crouch, 72 pause, 74 aim, 75 shoot, 78 use/sprint,
+     * 89 melee, 90 grenade, 126 reload/swap, 5/6/24/99/102 menu directions,
+     * and 73 which is scanned 66834 times a session and does nothing in any
+     * state worth trying. None of them jumps.
+     *
+     * So if this build can jump at all, it is not through s3eKeyboard, and
+     * binding a guess here would only hide that. Left empty until there is
+     * something real to put in it. */
+    { HidNpadButton_B,       0,                     0, "B free"      , 0 },
+    /* Triangle swaps weapon on a console in ONE press, which 126 will not do.
+     * 11 is the reference name for change-weapon and has never once been sent
+     * in any session here, so this is the test as much as the binding. If it
+     * does nothing, swap stays a double-tap of Y and this goes back to 126. */
+    { HidNpadButton_X,       XKEY_CHANGE_WEAPON,    0, "X weapon"    , 0 },
+    { HidNpadButton_A,       XKEY_CROUCH_PRONE,     0, "A crouch"    , 0 },
+
+    { HidNpadButton_R,       XKEY_THROW_GRENADE,    0, "R grenade"   , 0 },
+    { HidNpadButton_L,       XKEY_TACTICAL_GRENADE, 0, "L tactical"  , 0 },
+    { HidNpadButton_StickR,  XKEY_MELEE,            0, "RS melee"    , 0 },
+    { HidNpadButton_StickL,  XKEY_ACTION_SPRINT,    0, "LS sprint"   , 0 },
+    { HidNpadButton_Plus,    XKEY_PAUSE,            0, "+ pause"     , 0 },
+
+    { HidNpadButton_Up,      XKEY_TACTICAL_GRENADE, 0, "Up tactical" , 0 },
+    { HidNpadButton_Down,    XKEY_CROUCH_PRONE,     0, "Down crouch" , 0 },
+    { HidNpadButton_Left,    XKEY_ALTERNATE_FIRE,   0, "Left altfire", 0 },
+    { HidNpadButton_Right,   XKEY_RELOAD,           0, "Right reload", 0 },
 };
 
 #define KEY_MAP_N (sizeof g_key_map / sizeof g_key_map[0])
@@ -2084,18 +2179,30 @@ g_key_map[] = {
  *
  * Encoding confirmed against the PortMaster loader rather than assumed again. */
 enum { KEY_DOWN = 1u, KEY_PRESSED = 2u, KEY_RELEASED = 4u };
-static void key_set(GuestMem *mem, unsigned i, uint32_t k, int now, int was) {
-    /* One event buffer per (button, code): the queue is not drained until
-     * s3eDeviceYield, so a shared one would let a second change overwrite the
+/* Drive one CODE, not one button.
+ *
+ * The state array is indexed by key code, but several buttons deliberately
+ * send the same one -- B and L3 are both ACTION, X and R are both GRENADE.
+ * Scanning per button and clearing the edge flags on each call meant the LAST
+ * entry for a code overwrote whatever an earlier one had just set: press B,
+ * index 2 sets PRESSED, then index 13 (L3, not held) clears it again, and the
+ * game polls a key that is DOWN with no edge. Press L3 and nothing follows it,
+ * so the edge survives.
+ *
+ * That is the whole reason L3 rebuilt a barricade and B, sending the identical
+ * code, did nothing -- and why Y appeared dead earlier for exactly the same
+ * reason. The codes were right the entire time; the scan order was eating
+ * them. So edges are cleared once per update, before anything is set, and a
+ * code is down if ANY button bound to it is down. */
+static void key_set_code(GuestMem *mem, uint32_t k, int now, int was) {
+    /* One event buffer per code. The queue is not drained until
+     * s3eDeviceYield, so sharing one would let a second change overwrite the
      * first before either is delivered. The event is { m_Key, m_Pressed }
      * passed BY ADDRESS -- handing the callback the code itself faulted the
      * guest, which is how that was learned. */
-    static uint32_t ev[KEY_MAP_N][2];
-    uint32_t *slot;
+    static uint32_t ev[512];
     if (!k || k >= 512)
         return;
-    /* The edge flags last exactly one update. */
-    g_key_state[k] &= ~(KEY_PRESSED | KEY_RELEASED);
     if (now && !was)
         g_key_state[k] |= KEY_DOWN | KEY_PRESSED;
     else if (!now && was)
@@ -2104,49 +2211,110 @@ static void key_set(GuestMem *mem, unsigned i, uint32_t k, int now, int was) {
         g_key_state[k] |= KEY_DOWN;
     if (now == was)
         return;
-    slot = &ev[i][k == g_key_map[i].menu ? 1 : 0];
-    if (!*slot)
-        *slot = galloc(8);
-    if (!*slot)
+    if (!ev[k])
+        ev[k] = galloc(8);
+    if (!ev[k])
         return;
     g_key_sends[k]++;
-    guest_st32(mem, *slot + 0, k);
-    guest_st32(mem, *slot + 4, (uint32_t)now);
-    cb_queue("s3eKeyboard", 0, *slot);
+    guest_st32(mem, ev[k] + 0, k);
+    guest_st32(mem, ev[k] + 4, (uint32_t)now);
+    cb_queue("s3eKeyboard", 0, ev[k]);
 }
+
 
 static void key_update(GuestMem *mem) {
     static u64 prev;
     static unsigned shown;
+    static uint8_t was_down[512];
+    static unsigned press_frames[KEY_MAP_N];
+    uint8_t now_down[512];
     u64 held;
-    unsigned i;
+    unsigned i, k;
+
     padUpdate(&g_pad);
     held = padGetButtons(&g_pad);
+
+    /* Which CODES are down, from every button bound to them. */
+    memset(now_down, 0, sizeof now_down);
+    for (i = 0; i < KEY_MAP_N; i++) {
+        int cap;
+        if (!(held & g_key_map[i].button)) {
+            press_frames[i] = 0;
+            continue;
+        }
+        if (press_frames[i] < 0xFFFFu)
+            press_frames[i]++;
+        /* Past its cap the PRIMARY code stops contributing, so a long squeeze
+         * still reaches the game as a short tap. The second code is not
+         * capped: Y carries use and reload together, and they want opposite
+         * treatment -- use must stay a tap so it never reads as sprint, while
+         * reload wants the hold that makes it fire instantly. */
+        cap = g_key_map[i].button == HidNpadButton_Y ? g_use_cap
+                                                    : g_key_map[i].cap;
+        if (!(cap > 0 && press_frames[i] > (unsigned)cap) &&
+            g_key_map[i].game && g_key_map[i].game < 512)
+            now_down[g_key_map[i].game] = 1;
+        if (g_key_map[i].alt && g_key_map[i].alt < 512)
+            now_down[g_key_map[i].alt] = 1;
+    }
+
+    /* Stretch a tap into a hold for any code that asks for one. The key stays
+     * down for the remainder of its window even after the button is released,
+     * so a quick press reads as a deliberate one. */
+    g_min_hold[XKEY_RELOAD] = (uint16_t)(g_reload_hold > 0 ? g_reload_hold : 0);
+    {
+        static uint16_t hold_left[512];
+        for (k = 1; k < 512; k++) {
+            if (now_down[k]) {
+                if (g_min_hold[k])
+                    hold_left[k] = g_min_hold[k];
+            } else if (hold_left[k]) {
+                hold_left[k]--;
+                now_down[k] = 1;
+            }
+        }
+    }
+
+    /* Edges last exactly one update, and are cleared before anything sets
+     * them so two buttons sharing a code cannot wipe each other. */
+    for (k = 1; k < 512; k++)
+        g_key_state[k] &= ~(KEY_PRESSED | KEY_RELEASED);
+
+    /* Per-button work: the log line, and the fallback action tap. */
     for (i = 0; i < KEY_MAP_N; i++) {
         int now = (held & g_key_map[i].button) != 0;
         int was = (prev & g_key_map[i].button) != 0;
-        if (now && !was && g_key_map[i].button == HidNpadButton_Y)
+        /* Only worth doing when the game does NOT know it has a pad. With the
+         * touchpad answered the action is a real button, and an extra screen
+         * tap is just a stray touch -- one that fires the weapon if it lands
+         * on the right half. */
+        if (now && !was && g_key_map[i].button == HidNpadButton_B &&
+            !tp_engaged())
             g_act_frames = 5;          /* ~80 ms, matching a real tap */
-        key_set(mem, i, g_key_map[i].game, now, was);
-        key_set(mem, i, g_key_map[i].menu, now, was);
         if (now != was && shown < 40u) {
             shown++;
-            printf("  [key  ] %-11s %s -> game %u / menu %u\n",
+            printf("  [key  ] %-11s %s -> game %u / alt %u\n",
                    g_key_map[i].name, now ? "down" : "up  ",
-                   (unsigned)g_key_map[i].game, (unsigned)g_key_map[i].menu);
+                   (unsigned)g_key_map[i].game, (unsigned)g_key_map[i].alt);
         }
     }
+
+    for (k = 1; k < 512; k++)
+        if (now_down[k] || was_down[k])
+            key_set_code(mem, k, now_down[k], was_down[k]);
+    memcpy(was_down, now_down, sizeof was_down);
+
     /* A code asked for over the control socket, delivered as a real press and
      * release so the game sees exactly what a button would produce. */
     if (g_key_pulse) {
         static uint32_t pulsing;
         if (pulsing) {
-            key_set(mem, 0, pulsing, 0, 1);
+            key_set_code(mem, pulsing, 0, 1);
             pulsing = 0;
             g_key_pulse = 0;
         } else {
             pulsing = g_key_pulse;
-            key_set(mem, 0, pulsing, 1, 0);
+            key_set_code(mem, pulsing, 1, 0);
         }
     }
     prev = held;
@@ -2209,6 +2377,171 @@ static void hle_key_getstate(GuestCpu *cpu, GuestMem *mem, void *user) {
  * keeps its touchID for its whole life, which is what the game tracks a stick
  * by -- reindexing them each frame would look like every finger lifting and
  * new ones landing elsewhere. */
+/* ---- s3eTouchpad: the sticks as sticks ---------------------------------
+ *
+ * The Xperia Play has two analog pads and this game was built for it. The
+ * geometry below is the reference port, which reads like it came from the Vita
+ * one: a 960x544 pad, the move stick centred a fifth of the way across with a
+ * radius to match, and the look stick centred four fifths across with a much
+ * smaller radius, which is what sets turn sensitivity.
+ *
+ * This is a different input DEVICE from the screen, which is the entire point.
+ * Faking the pad as touch means living with the screen split the game applies
+ * to touches -- left half moves, right half fires -- so the action button
+ * could not be pressed without shooting, and a floating stick had to be
+ * anchored somewhere and stayed visible. None of that applies to a pad the
+ * game knows is a pad. */
+/* The Xperia axis deadzone, which the reference keeps separate from the one
+ * it uses for ordinary buttons. Same value as PAD_DEADZONE, declared here
+ * because that one belongs to the synthetic-touch code further down. */
+#define TP_DEADZONE 6000
+#define TP_W      960
+#define TP_H      544
+#define TP_COUNT  2
+
+static int      g_tp_active[TP_COUNT];
+static int      g_tp_x[TP_COUNT], g_tp_y[TP_COUNT];
+static uint32_t g_ev_tp_btn[TP_COUNT], g_ev_tp_mot[TP_COUNT];
+static int      g_tp_on = 1;        /* SND TPAD 0|1 */
+/* Look sensitivity is the pad RADIUS, not a speed: the game turns at a rate
+ * set by how far from centre the contact sits, so a bigger radius turns
+ * faster. The reference uses width/8; live-settable because it is pure feel
+ * and rebuilding once per guess is how tuning gets abandoned half-done. */
+static int      g_tp_look_r = TP_W / 8;   /* SND TPLOOK <radius> */
+
+/* How many touchpad handlers the game has actually installed. Zero means it
+ * ignored the extension, and the synthetic-touch path has to stay in charge:
+ * offering the extension is not the same as the game choosing to use it. */
+static int tp_listeners(void) {
+    int i, n = 0;
+    for (i = 0; i < g_cb_n; i++)
+        if (g_cbs[i].used && !strcmp(g_cbs[i].kind, "s3eTouchpad"))
+            n++;
+    return n;
+}
+
+static int tp_engaged(void) {
+    return g_tp_on && tp_listeners() > 0;
+}
+
+static void hle_tp_register(GuestCpu *cpu, GuestMem *mem, void *user) {
+    int i;
+    (void)mem; (void)user;
+    i = cb_find_fn("s3eTouchpad", cpu->r[0], cpu->r[1]);
+    if (i < 0 && g_cb_n < MAX_CBS)
+        i = g_cb_n++;
+    if (i >= 0) {
+        snprintf(g_cbs[i].kind, sizeof g_cbs[i].kind, "s3eTouchpad");
+        g_cbs[i].id = cpu->r[0];
+        g_cbs[i].fn = cpu->r[1];
+        g_cbs[i].user = cpu->r[2];
+        g_cbs[i].used = 1;
+        printf("  [tpad ] register id=%u fn=%08x user=%08x  (%d listeners)\n",
+               (unsigned)cpu->r[0], (unsigned)cpu->r[1], (unsigned)cpu->r[2],
+               tp_listeners());
+    }
+    cpu->r[0] = 0;
+}
+
+static void hle_tp_unregister(GuestCpu *cpu, GuestMem *mem, void *user) {
+    int i;
+    (void)mem; (void)user;
+    i = cb_find_fn("s3eTouchpad", cpu->r[0], cpu->r[1]);
+    if (i >= 0) {
+        g_cbs[i].used = 0;
+        printf("  [tpad ] unregister id=%u\n", (unsigned)cpu->r[0]);
+    }
+    cpu->r[0] = 0;
+}
+
+static void hle_tp_getint(GuestCpu *cpu, GuestMem *mem, void *user) {
+    static unsigned shown;
+    uint32_t k = cpu->r[0];
+    (void)mem; (void)user;
+    cpu->r[0] = k == 0 ? 1u                     /* the pad exists */
+              : k == 1 ? (uint32_t)TP_W
+              : k == 2 ? (uint32_t)TP_H
+              : (uint32_t)-1;
+    if (shown < 8) {
+        shown++;
+        printf("  [tpad ] GetInt(%u) -> %d\n", (unsigned)k, (int)cpu->r[0]);
+    }
+}
+
+static void tp_button(GuestMem *mem, int id, int pressed) {
+    uint32_t *buf = &g_ev_tp_btn[id];
+    if (!*buf)
+        *buf = galloc(16);
+    if (!*buf)
+        return;
+    guest_st32(mem, *buf +  0, (uint32_t)id);
+    guest_st32(mem, *buf +  4, (uint32_t)pressed);
+    guest_st32(mem, *buf +  8, (uint32_t)g_tp_x[id]);
+    guest_st32(mem, *buf + 12, (uint32_t)g_tp_y[id]);
+    cb_queue("s3eTouchpad", 0, *buf);
+}
+
+static void tp_motion(GuestMem *mem, int id) {
+    uint32_t *buf = &g_ev_tp_mot[id];
+    if (!*buf)
+        *buf = galloc(12);
+    if (!*buf)
+        return;
+    guest_st32(mem, *buf + 0, (uint32_t)id);
+    guest_st32(mem, *buf + 4, (uint32_t)g_tp_x[id]);
+    guest_st32(mem, *buf + 8, (uint32_t)g_tp_y[id]);
+    cb_queue("s3eTouchpad", 1, *buf);
+}
+
+/* One pad, from one stick. Centre plus deflection, pressed while off-centre
+ * and released when it returns -- the pad is touched exactly while the stick
+ * is held, which is what the hardware being emulated would report.
+ *
+ * SDL measures a stick y downward and libnx measures it upward, so the sign
+ * flips here; the reference port needs no such flip because SDL already agrees
+ * with the pad coordinate system. */
+static void tp_stick(GuestMem *mem, int id, int ax, int ay,
+                     int cx, int cy, int rx, int ry) {
+    int x, y;
+    int mx = ax < 0 ? -ax : ax, my = ay < 0 ? -ay : ay;
+
+    if (mx <= TP_DEADZONE && my <= TP_DEADZONE) {
+        if (g_tp_active[id]) {
+            g_tp_active[id] = 0;
+            tp_button(mem, id, 0);
+        }
+        return;
+    }
+    x = clampi(cx + ax * rx / 32767, 0, TP_W - 1);
+    y = clampi(cy - ay * ry / 32767, 0, TP_H - 1);
+    if (!g_tp_active[id]) {
+        g_tp_active[id] = 1;
+        g_tp_x[id] = x;
+        g_tp_y[id] = y;
+        tp_motion(mem, id);
+        tp_button(mem, id, 1);
+        return;
+    }
+    if (g_tp_x[id] != x || g_tp_y[id] != y) {
+        g_tp_x[id] = x;
+        g_tp_y[id] = y;
+        tp_motion(mem, id);
+    }
+}
+
+static void tp_update(GuestMem *mem) {
+    HidAnalogStickState l, r;
+    if (!tp_engaged()) {
+        if (g_tp_active[0]) { g_tp_active[0] = 0; tp_button(mem, 0, 0); }
+        if (g_tp_active[1]) { g_tp_active[1] = 0; tp_button(mem, 1, 0); }
+        return;
+    }
+    l = padGetStickPos(&g_pad, 0);
+    r = padGetStickPos(&g_pad, 1);
+    tp_stick(mem, 0, l.x, l.y, TP_W / 5,     TP_H / 2, TP_W / 5, TP_H / 2);
+    tp_stick(mem, 1, r.x, r.y, TP_W * 4 / 5, TP_H / 2, g_tp_look_r, g_tp_look_r);
+}
+
 /* ---- controller as touch ----------------------------------------------
  *
  * Both sticks become contacts, using the shape the capture measured rather
@@ -2297,12 +2630,23 @@ static void pad_touch_update(GuestMem *mem) {
     HidAnalogStickState l, r;
     int lx, ly, rx, ry;
     padUpdate(&g_pad);
+    tp_update(mem);
     l = padGetStickPos(&g_pad, 0);
     r = padGetStickPos(&g_pad, 1);
     lx = l.x < 0 ? -l.x : l.x;
     ly = l.y < 0 ? -l.y : l.y;
     rx = r.x < 0 ? -r.x : r.x;
     ry = r.y < 0 ? -r.y : r.y;
+
+    /* With a real touchpad in play the sticks are delivered there instead;
+     * doing both would move the player twice. The action tap below still
+     * goes through as touch, because that IS a screen tap. */
+    if (tp_engaged()) {
+        pad_contact(mem, PAD_SLOT_MOVE, 0, 0, 0);
+        pad_contact(mem, PAD_SLOT_AIM, 0, 0, 0);
+        aim_down = 0;
+        lx = ly = rx = ry = 0;
+    }
 
     if (lx > PAD_DEADZONE || ly > PAD_DEADZONE) {
         /* Guest y is top-down, so pushing the stick up must decrease it. */
@@ -5254,6 +5598,39 @@ static void ctl_command(char *line) {
             } else {
                 ctl_say("ERR use: SND AIM <speed> [radius]\n");
             }
+        } else if (!strncmp(arg, "TAPMAX ", 7)) {
+            int f = atoi(arg + 7);
+            if (f >= 0 && f <= 120) {
+                g_use_cap = f;
+                printf("  [key  ] use cap %d frames\n", f);
+                ctl_say("OK\n");
+            } else {
+                ctl_say("ERR use: SND TAPMAX <0..120>\n");
+            }
+        } else if (!strncmp(arg, "HOLD ", 5)) {
+            int f = atoi(arg + 5);
+            if (f >= 0 && f <= 120) {
+                g_reload_hold = f;
+                printf("  [key  ] reload min hold %d frames\n", f);
+                ctl_say("OK\n");
+            } else {
+                ctl_say("ERR use: SND HOLD <0..120>\n");
+            }
+        } else if (!strncmp(arg, "TPLOOK ", 7)) {
+            int r = atoi(arg + 7);
+            if (r > 0 && r <= TP_W / 2) {
+                g_tp_look_r = r;
+                printf("  [tpad ] look radius %d\n", g_tp_look_r);
+                ctl_say("OK\n");
+            } else {
+                ctl_say("ERR use: SND TPLOOK <1..480>\n");
+            }
+        } else if (!strcmp(arg, "TPAD 0") || !strcmp(arg, "TPAD 1")) {
+            g_tp_on = arg[5] == '1';
+            printf("  [tpad ] %s (%d listener(s))\n", g_tp_on
+                   ? "analog pad" : "off, synthetic touch instead",
+                   tp_listeners());
+            ctl_say("OK\n");
         } else if (!strcmp(arg, "AIMMODE 0") || !strcmp(arg, "AIMMODE 1")) {
             g_aim_stick = arg[8] == '1';
             printf("  [pad  ] right stick: %s\n",
@@ -5941,6 +6318,23 @@ static void run(void) {
     g_slots[n].name = "<ext stub>";
     g_slots[n].fn = hle_zero;
     g_ext_stub = GUEST_STUB_BASE + 4 * n;
+    /* Five more spares for the s3eTouchpad table. The game CALLS these, so
+     * each needs its own guest address rather than sharing the ext stub. */
+    {
+        static const struct { const char *nm; GuestHleFn fn; } tp[5] = {
+            { "<s3eTouchpadRegister>",   hle_tp_register   },
+            { "<s3eTouchpadUnRegister>", hle_tp_unregister },
+            { "<s3eTouchpad spare0>",    hle_zero          },
+            { "<s3eTouchpad spare1>",    hle_zero          },
+            { "<s3eTouchpadGetInt>",     hle_tp_getint     },
+        };
+        unsigned k;
+        for (k = 0; k < 5 && n + 1 + (int)k < 512; k++) {
+            g_slots[n + 1 + k].name = tp[k].nm;
+            g_slots[n + 1 + k].fn = tp[k].fn;
+            g_tp_stub[k] = GUEST_STUB_BASE + 4 * (n + 1 + (int)k);
+        }
+    }
     g.prof = hle_profile;       /* frame-time split; see frame_profile_report */
     /* Guest-PC histogram. Sized to the loaded image, so a PC outside it (stub
      * page, callback trampolines) falls out on the bounds test rather than
@@ -6067,7 +6461,11 @@ static void run(void) {
     report_clocks("start");
 
     g.hle.slot = g_slots;
-    g.hle.count = n + 1;
+    /* imports, the ext stub, and the five s3eTouchpad table entries.
+     * The dispatcher bounds-checks against this, so a slot past it is
+     * not called at all and the guest returns into nothing -- which is
+     * a black screen about four seconds in. */
+    g.hle.count = n + 1 + 5;
     /* Sound output. Failure is not fatal: every snd_out_* call becomes a
      * no-op and the HLE handlers keep reporting the working-but-idle device
      * they reported before there was any output at all. */
