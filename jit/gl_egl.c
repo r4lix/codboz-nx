@@ -628,14 +628,418 @@ static void touch_overlay(void) {
         glDisable(GL_SCISSOR_TEST);
 }
 
+/* ------------------------------------------------ texture bisection ----
+ *
+ * The on-screen virtual sticks have no config switch: the ICF has no key for
+ * them, and the one lead -- [TRACE] TOUCHPAD_VERBOSE -- is dead, because this
+ * is a release build and not a single [TRACE] key is ever queried. So the only
+ * handle left is the draw itself.
+ *
+ * Rather than guess which texture the sticks use, count draws per texture and
+ * let one be dropped live over the control socket. Someone looking at the
+ * screen says what vanished; the texture is found by bisection in minutes,
+ * which is how every other measured number in this port was found.
+ *
+ * Attribution is to texture unit 0 and only while GL_TEXTURE_2D is enabled
+ * there, so an untextured draw is never blamed on a stale binding -- skipping
+ * a texture must not also delete whatever flat geometry happens to follow it.
+ *
+ * Caveat worth knowing up front: HUD art is often one atlas. If the sticks
+ * share a texture with the ammo counter or crosshair, skipping it hides all
+ * of them, and the next step would be to discriminate by texture coordinates
+ * within that atlas rather than by texture name. */
+#define TEXI_MAX 4096u
+
+static struct {
+    uint16_t w, h;
+    uint32_t draws;          /* since the last TEXLIST */
+    uint32_t last_frame;
+} g_texi[TEXI_MAX];
+static uint8_t  g_tex_skip[TEXI_MAX];
+static GLuint   g_bound_tex[8];
+static uint8_t  g_tex2d_on[8];
+static unsigned g_active_unit;
+static uint32_t g_tex_frame;
+
+/* A live GPU readback, armed from the control thread and actually run from
+ * te_SwapBuffers below (see gl_tex_dump's own comment for why: no EGL
+ * context is current on the control thread, only on this one). Forward
+ * declared here so te_SwapBuffers -- defined well above the readback code
+ * itself -- can call it. */
+static volatile unsigned g_dumptex_pending;
+static int dumptex_readback(unsigned id);
+
+/* The client-side vertex array, tracked at the point glVertexPointer is
+ * called (further below, but g_buf_array it copies from is declared later
+ * still, near array_arg -- that ordering is fine, since only the assignment
+ * in te_VertexPointer touches g_buf_array, not any use of these here) so a
+ * later draw call in this section can read the actual position data. Only
+ * meaningful when g_vtx_buf is 0 -- a VBO-backed array is a numeric offset
+ * on the driver side, not something readable from here without keeping a
+ * shadow copy of every buffer upload, and nothing that matters for this
+ * (the two floating touch sticks) uses one. */
+static const void *g_vtx_ptr;
+static uint32_t    g_vtx_buf;
+static int         g_vtx_size;
+static GLenum      g_vtx_type;
+static GLsizei     g_vtx_stride;
+static uint32_t g_skipped_draws;
+
+static void te_ActiveTexture(GuestCpu *c, GuestMem *m, void *u) {
+    GLenum unit = (GLenum)ga(c, m, 0);
+    (void)u;
+    if (unit >= 0x84C0u && unit < 0x84C0u + 8u)
+        g_active_unit = unit - 0x84C0u;
+    glActiveTexture(unit);
+}
+
+static void te_BindTexture(GuestCpu *c, GuestMem *m, void *u) {
+    GLenum target = (GLenum)ga(c, m, 0);
+    GLuint name = (GLuint)ga(c, m, 1);
+    (void)u;
+    if (target == 0x0DE1u)                          /* GL_TEXTURE_2D */
+        g_bound_tex[g_active_unit & 7u] = name;
+    glBindTexture(target, name);
+}
+
+static void te_Enable(GuestCpu *c, GuestMem *m, void *u) {
+    GLenum cap = (GLenum)ga(c, m, 0);
+    (void)u;
+    if (cap == 0x0DE1u)
+        g_tex2d_on[g_active_unit & 7u] = 1;
+    glEnable(cap);
+}
+
+static void te_Disable(GuestCpu *c, GuestMem *m, void *u) {
+    GLenum cap = (GLenum)ga(c, m, 0);
+    (void)u;
+    if (cap == 0x0DE1u)
+        g_tex2d_on[g_active_unit & 7u] = 0;
+    glDisable(cap);
+}
+
+/* Record the size of whatever is bound when level 0 is defined. */
+static void tex_dims(uint32_t w, uint32_t h) {
+    GLuint t = g_bound_tex[g_active_unit & 7u];
+    if (t && t < TEXI_MAX) {
+        g_texi[t].w = (uint16_t)w;
+        g_texi[t].h = (uint16_t)h;
+    }
+}
+
+/* One vertex's position from the tracked client-side array. False if it
+ * cannot be read (no array, a VBO, or a type this does not decode). */
+static int read_vertex(unsigned idx, float *x, float *y, float *z) {
+    size_t stride, tsz;
+    const unsigned char *base;
+    if (g_vtx_buf || !g_vtx_ptr || g_vtx_size < 2)
+        return 0;
+    tsz = g_vtx_type == GL_FLOAT ? 4u :
+          g_vtx_type == GL_SHORT ? 2u :
+          g_vtx_type == GL_BYTE  ? 1u :
+          g_vtx_type == 0x140Cu  ? 4u : 0u;   /* 0x140C = GL_FIXED */
+    if (!tsz)
+        return 0;
+    stride = g_vtx_stride ? (size_t)g_vtx_stride : tsz * (size_t)g_vtx_size;
+    base = (const unsigned char *)g_vtx_ptr + stride * (size_t)idx;
+    *z = 0.0f;
+    if (g_vtx_type == GL_FLOAT) {
+        const float *f = (const float *)base;
+        *x = f[0]; *y = f[1];
+        if (g_vtx_size >= 3) *z = f[2];
+    } else if (g_vtx_type == GL_SHORT) {
+        const short *sp = (const short *)base;
+        *x = (float)sp[0]; *y = (float)sp[1];
+        if (g_vtx_size >= 3) *z = (float)sp[2];
+    } else if (g_vtx_type == GL_BYTE) {
+        const signed char *bp = (const signed char *)base;
+        *x = (float)bp[0]; *y = (float)bp[1];
+        if (g_vtx_size >= 3) *z = (float)bp[2];
+    } else {                                   /* GL_FIXED, 16.16 */
+        const int32_t *fp = (const int32_t *)base;
+        *x = (float)fp[0] / 65536.0f; *y = (float)fp[1] / 65536.0f;
+        if (g_vtx_size >= 3) *z = (float)fp[2] / 65536.0f;
+    }
+    return 1;
+}
+
+/* out = a * b, both column-major 4x4, GL's own convention. */
+static void mat4_mul(const GLfloat *a, const GLfloat *b, GLfloat *out) {
+    int col, r;
+    for (col = 0; col < 4; col++)
+        for (r = 0; r < 4; r++)
+            out[col * 4 + r] = a[0 * 4 + r] * b[col * 4 + 0] +
+                               a[1 * 4 + r] * b[col * 4 + 1] +
+                               a[2 * 4 + r] * b[col * 4 + 2] +
+                               a[3 * 4 + r] * b[col * 4 + 3];
+}
+
+/* Boxes around the two floating sticks at 1280x720, INCLUDING their faint
+ * outer rings (~155 px across, centred near (152,553) and (871,553)), which
+ * only became visible with the world textures skipped. The first boxes hugged
+ * the inner knob and so never contained a whole stick quad. The pause button
+ * and splat that share the sticks' atlas sit in the top-left corner, far
+ * outside both. */
+static int in_stick_region(float sx, float sy) {
+    if (sx >= 55.0f && sx <= 250.0f && sy >= 455.0f && sy <= 652.0f)
+        return 1;                                          /* left stick */
+    if (sx >= 775.0f && sx <= 968.0f && sy >= 455.0f && sy <= 652.0f)
+        return 1;                                          /* right stick */
+    return 0;
+}
+
+static int g_hide_sticks = 1;      /* SND HIDESTICKS 0|1 */
+static uint32_t g_hidden_draws;
+
+/* The sticks, found by live SKIPTEX bisection (2026-09-15): texture 587, the
+ * 1024x512 HUD atlas that also holds the pause button and the top-left splat.
+ * The earlier gate watched texture 56 -- in-game that is only the top-left
+ * counter -- and hid whole draws only when EVERY vertex was in a box, so it
+ * never fired once. This works per TRIANGLE instead: any triangle of a 587
+ * draw whose three vertices all land in a stick box is removed and the rest
+ * is still drawn, which is correct whether the game draws each stick alone or
+ * batches them with the other HUD pieces from that atlas. */
+#define STICK_TEX 587u
+static uint16_t g_stick_idx[65535];
+
+/* One vertex to screenshot coordinates, using the REAL live MODELVIEW,
+ * PROJECTION and VIEWPORT rather than an assumed convention. */
+static int vtx_to_screen(unsigned vidx, const GLfloat *mvp, const GLint *vp,
+                         float *sx, float *sy) {
+    float x, y, z, cx, cy, cw;
+    if (!read_vertex(vidx, &x, &y, &z))
+        return 0;
+    cx = mvp[0] * x + mvp[4] * y + mvp[8]  * z + mvp[12];
+    cy = mvp[1] * x + mvp[5] * y + mvp[9]  * z + mvp[13];
+    cw = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
+    if (cw == 0.0f)
+        return 0;
+    *sx = (float)vp[0] + ((cx / cw) * 0.5f + 0.5f) * (float)vp[2];
+    /* GL's NDC y=-1 is the viewport bottom; a screenshot's y=0 is the top. */
+    *sy = (float)vp[1] + (1.0f - ((cy / cw) * 0.5f + 0.5f)) * (float)vp[3];
+    return 1;
+}
+
+/* -1: draw untouched. 0: drop the whole draw. n > 0: draw the n indices left
+ * in g_stick_idx instead. Declines (-1) whenever real vertex positions cannot
+ * be read, so nothing is ever hidden on a guess. */
+static int stick_filter(GLenum mode, int is_indexed, unsigned first, unsigned count,
+                        const uint16_t *idx16, const uint8_t *idx8) {
+    GLfloat mv[16], proj[16], mvp[16];
+    GLint vp[4];
+    unsigned i, k, kept = 0, removed = 0;
+
+    if (!g_hide_sticks || !g_tex2d_on[0] || g_bound_tex[0] != STICK_TEX)
+        return -1;
+    if (g_vtx_buf || !g_vtx_ptr || count > 65535u)
+        return -1;
+    if (is_indexed ? (!idx16 && !idx8) : first + count > 65535u)
+        return -1;
+    if (mode != GL_TRIANGLES && !(mode == GL_TRIANGLE_STRIP && count == 4))
+        return -1;
+    glGetFloatv(GL_MODELVIEW_MATRIX, mv);
+    glGetFloatv(GL_PROJECTION_MATRIX, proj);
+    glGetIntegerv(GL_VIEWPORT, vp);
+    mat4_mul(proj, mv, mvp);
+
+    if (mode == GL_TRIANGLE_STRIP) {            /* a lone quad: all or nothing */
+        for (i = 0; i < 4; i++) {
+            unsigned v = is_indexed ? (idx16 ? idx16[i] : idx8[i]) : first + i;
+            float sx, sy;
+            if (!vtx_to_screen(v, mvp, vp, &sx, &sy) || !in_stick_region(sx, sy))
+                return -1;
+        }
+        g_hidden_draws++;
+        return 0;
+    }
+    for (i = 0; i + 2 < count; i += 3) {
+        unsigned tri[3], in = 0;
+        for (k = 0; k < 3; k++) {
+            float sx, sy;
+            tri[k] = is_indexed ? (idx16 ? idx16[i + k] : idx8[i + k]) : first + i + k;
+            if (!vtx_to_screen(tri[k], mvp, vp, &sx, &sy))
+                return -1;
+            in += (unsigned)in_stick_region(sx, sy);
+        }
+        if (in == 3) {
+            removed++;
+            continue;
+        }
+        for (k = 0; k < 3; k++)
+            g_stick_idx[kept++] = (uint16_t)tri[k];
+    }
+    if (!removed)
+        return -1;
+    g_hidden_draws++;
+    return (int)kept;
+}
+
+/* SND STICKPROBE <n>: log the next n texture-56 draws in full.
+ *
+ * The position gate hid 0 draws all session while 56 was drawn ~6000 times a
+ * second, so one of its assumptions is wrong -- unreadable vertices (a VBO or
+ * unresolvable indices), a projection that lands elsewhere, or draws that mix
+ * stick and non-stick geometry. This prints exactly the facts that decide it
+ * instead of guessing a fourth time. */
+static int g_stick_probe;
+
+static void stick_probe(GLuint t, int tex_on, int is_indexed, unsigned first,
+                        unsigned count, const uint16_t *idx16, const uint8_t *idx8) {
+    GLfloat mv[16], proj[16], mvp[16];
+    GLint vp[4];
+    unsigned i, n_read = 0, n_in = 0;
+    float minx = 1e9f, miny = 1e9f, maxx = -1e9f, maxy = -1e9f;
+    const char *why = "ok";
+
+    glGetFloatv(GL_MODELVIEW_MATRIX, mv);
+    glGetFloatv(GL_PROJECTION_MATRIX, proj);
+    glGetIntegerv(GL_VIEWPORT, vp);
+    mat4_mul(proj, mv, mvp);
+    if (is_indexed && !idx16 && !idx8)
+        why = "indices-in-buffer";
+    else if (g_vtx_buf)
+        why = "vertices-in-vbo";
+    else if (!g_vtx_ptr)
+        why = "no-vertex-pointer";
+    else {
+        for (i = 0; i < count; i++) {
+            unsigned vidx = is_indexed ? (idx16 ? idx16[i] : idx8[i]) : first + i;
+            float x, y, z, cx, cy, cw, sx, sy;
+            if (!read_vertex(vidx, &x, &y, &z)) { why = "vertex-type"; break; }
+            cx = mvp[0] * x + mvp[4] * y + mvp[8]  * z + mvp[12];
+            cy = mvp[1] * x + mvp[5] * y + mvp[9]  * z + mvp[13];
+            cw = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
+            if (cw == 0.0f) { why = "w=0"; break; }
+            sx = (float)vp[0] + ((cx / cw) * 0.5f + 0.5f) * (float)vp[2];
+            sy = (float)vp[1] + (1.0f - ((cy / cw) * 0.5f + 0.5f)) * (float)vp[3];
+            n_read++;
+            if (in_stick_region(sx, sy)) n_in++;
+            if (sx < minx) minx = sx;
+            if (sy < miny) miny = sy;
+            if (sx > maxx) maxx = sx;
+            if (sy > maxy) maxy = sy;
+        }
+    }
+    /* First run showed every texture-56 draw is top-left HUD, so the sticks
+     * are some OTHER texture (or untextured). Now every draw is checked and
+     * only the ones landing wholly inside a stick box -- or unreadable ones,
+     * which could be hiding them -- are printed, with what they are bound to. */
+    if (t != STICK_TEX && (n_read == 0 ? !strcmp(why, "ok") : n_in != n_read))
+        return;
+    printf("  [stick] tex=%u on=%d %s cnt=%u %s vtx=%d/0x%x/%d read=%u in=%u "
+           "bbox=(%.0f,%.0f)-(%.0f,%.0f) vp=%d,%d,%d,%d\n",
+           (unsigned)t, tex_on,
+           is_indexed ? (idx16 ? "elem16" : idx8 ? "elem8" : "elemVBO") : "arrays",
+           count, why, g_vtx_size, (unsigned)g_vtx_type, (int)g_vtx_stride,
+           n_read, n_in, minx, miny, maxx, maxy, vp[0], vp[1], vp[2], vp[3]);
+}
+
+/* Account one draw; returns 0 if it should be dropped. */
+static int tex_draw_gate(int is_indexed, unsigned first, unsigned count,
+                         const uint16_t *idx16, const uint8_t *idx8) {
+    GLuint t;
+    if (g_stick_probe > 0) {
+        g_stick_probe--;
+        stick_probe(g_bound_tex[0], g_tex2d_on[0], is_indexed, first, count, idx16, idx8);
+    }
+    if (!g_tex2d_on[0])
+        return 1;
+    t = g_bound_tex[0];
+    if (!t || t >= TEXI_MAX)
+        return 1;
+    g_texi[t].draws++;
+    g_texi[t].last_frame = g_tex_frame;
+    if (g_tex_skip[t]) {
+        g_skipped_draws++;
+        return 0;
+    }
+    return 1;
+}
+
+static void te_DrawArrays(GuestCpu *c, GuestMem *m, void *u) {
+    GLenum mode = (GLenum)ga(c, m, 0);
+    GLint first = (GLint)ga(c, m, 1);
+    GLsizei count = (GLsizei)ga(c, m, 2);
+    int n;
+    (void)u;
+    if (!tex_draw_gate(0, (unsigned)first, (unsigned)count, NULL, NULL))
+        return;
+    n = stick_filter(mode, 0, (unsigned)first, (unsigned)count, NULL, NULL);
+    if (n == 0)
+        return;
+    if (n > 0) {
+        /* Client-side indices only mean a pointer with no element buffer
+         * bound, so park any binding around this one draw. */
+        GLint elem = 0;
+        glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &elem);
+        if (elem)
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glDrawElements(mode, n, GL_UNSIGNED_SHORT, g_stick_idx);
+        if (elem)
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)elem);
+        return;
+    }
+    glDrawArrays(mode, first, count);
+}
+
+/* SND TEXLIST: textures drawn in the last two seconds, busiest first. */
+void gl_tex_list(void) {
+    unsigned i, j, n = 0;
+    static unsigned order[TEXI_MAX];
+    for (i = 1; i < TEXI_MAX; i++)
+        if (g_texi[i].draws && g_tex_frame - g_texi[i].last_frame < 120u)
+            order[n++] = i;
+    for (i = 1; i < n; i++) {                       /* insertion sort, tiny n */
+        unsigned k = order[i];
+        for (j = i; j > 0 && g_texi[order[j - 1]].draws < g_texi[k].draws; j--)
+            order[j] = order[j - 1];
+        order[j] = k;
+    }
+    printf("  [tex  ] %u textures drawn recently (frame %u, %u draws skipped)\n",
+           n, (unsigned)g_tex_frame, (unsigned)g_skipped_draws);
+    printf("  [tex  ]   id    size       draws  skip\n");
+    for (i = 0; i < n && i < 60u; i++) {
+        unsigned t = order[i];
+        printf("  [tex  ] %4u  %4ux%-4u  %7u  %s\n", t,
+               (unsigned)g_texi[t].w, (unsigned)g_texi[t].h,
+               (unsigned)g_texi[t].draws, g_tex_skip[t] ? "SKIP" : "");
+    }
+    for (i = 1; i < TEXI_MAX; i++)
+        g_texi[i].draws = 0;
+    g_skipped_draws = 0;
+}
+
+/* SND SKIPTEX <id>: toggle one texture; 0 clears every skip. */
+int gl_tex_skip(unsigned id) {
+    unsigned i;
+    if (id == 0) {
+        for (i = 0; i < TEXI_MAX; i++)
+            g_tex_skip[i] = 0;
+        printf("  [tex  ] all skips cleared\n");
+        return 0;
+    }
+    if (id >= TEXI_MAX)
+        return -1;
+    g_tex_skip[id] = (uint8_t)!g_tex_skip[id];
+    printf("  [tex  ] texture %u (%ux%u) %s\n", id,
+           (unsigned)g_texi[id].w, (unsigned)g_texi[id].h,
+           g_tex_skip[id] ? "SKIPPED" : "restored");
+    return g_tex_skip[id];
+}
+
 static void te_SwapBuffers(GuestCpu *c, GuestMem *m, void *u) {
     void *dpy, *s;
     static int shown;
     (void)u;
     if (!tok_in(ga(c, m, 0), &dpy, K_DPY) || !tok_in(ga(c, m, 1), &s, K_SFC))
         BAD_HANDLE("SwapBuffers");
+    if (g_dumptex_pending) {
+        dumptex_readback(g_dumptex_pending);
+        g_dumptex_pending = 0;
+    }
     fps_overlay((EGLDisplay)dpy, (EGLSurface)s);
     touch_overlay();
+    g_tex_frame++;
     c->r[0] = (uint32_t)eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)s);
     if (c->r[0])
         egl_frame_presented();
@@ -826,9 +1230,14 @@ static const void *array_arg(GuestMem *m, uint32_t v) {
 }
 
 static void te_VertexPointer(GuestCpu *c, GuestMem *m, void *u) {
+    uint32_t v = ga(c, m, 3);
     (void)u;
-    glVertexPointer((GLint)ga(c, m, 0), (GLenum)ga(c, m, 1),
-                    (GLsizei)ga(c, m, 2), array_arg(m, ga(c, m, 3)));
+    g_vtx_size   = (int)ga(c, m, 0);
+    g_vtx_type   = (GLenum)ga(c, m, 1);
+    g_vtx_stride = (GLsizei)ga(c, m, 2);
+    g_vtx_buf    = g_buf_array;
+    g_vtx_ptr    = g_buf_array ? NULL : gp(m, v);
+    glVertexPointer(g_vtx_size, g_vtx_type, g_vtx_stride, array_arg(m, v));
 }
 
 static void te_ColorPointer(GuestCpu *c, GuestMem *m, void *u) {
@@ -853,6 +1262,8 @@ static void te_DrawElements(GuestCpu *c, GuestMem *m, void *u) {
     uint32_t count = (uint32_t)ga(c, m, 1), type = (uint32_t)ga(c, m, 2);
     uint32_t idx = (uint32_t)ga(c, m, 3);
     const void *p;
+    const uint16_t *idx16 = NULL;
+    const uint8_t  *idx8  = NULL;
     (void)u;
     if (g_buf_elem) {
         p = (const void *)(uintptr_t)idx;           /* an offset, not a pointer */
@@ -861,6 +1272,24 @@ static void te_DrawElements(GuestCpu *c, GuestMem *m, void *u) {
         p = gpn(m, idx, (uint64_t)count * isz, "glDrawElements");
         if (!p && idx)
             return;                                 /* short buffer: do not draw */
+        if (type == 0x1401u)
+            idx8 = (const uint8_t *)p;
+        else
+            idx16 = (const uint16_t *)p;
+    }
+    if (!tex_draw_gate(1, 0, count, idx16, idx8))
+        return;
+    {
+        /* idx16/idx8 are only set when no element buffer is bound, so the
+         * filtered client-side index list below is safe to pass as-is. */
+        GLenum mode = (GLenum)ga(c, m, 0);
+        int n = stick_filter(mode, 1, 0, count, idx16, idx8);
+        if (n == 0)
+            return;
+        if (n > 0) {
+            glDrawElements(mode, n, GL_UNSIGNED_SHORT, g_stick_idx);
+            return;
+        }
     }
     glDrawElements((GLenum)ga(c, m, 0), (GLsizei)count, (GLenum)type, p);
 }
@@ -1023,6 +1452,8 @@ static void te_CompressedTexImage2D(GuestCpu *c, GuestMem *m, void *u) {
     }
     calls++;
     tex_note((uint32_t)ga(c, m, 3), (uint32_t)ga(c, m, 4), f, 1);
+    if ((int)ga(c, m, 1) == 0)
+        tex_dims((uint32_t)ga(c, m, 3), (uint32_t)ga(c, m, 4));
     {   /* imageSize is given explicitly for a compressed upload, so the extent
          * is exactly known and needs no format table. */
         uint32_t bytes = (uint32_t)ga(c, m, 6);
@@ -1051,11 +1482,166 @@ static void te_CompressedTexImage2D(GuestCpu *c, GuestMem *m, void *u) {
     }
 }
 
+/* Read a texture's CURRENT live content straight off the GPU, on demand.
+ *
+ * The upload-time dump above caught the wrong generation of texture 56:
+ * GL object ids get recycled, and the font atlas uploaded at boot and the
+ * HUD/stick atlas confirmed live during gameplay (by SKIPTEX bisection) both
+ * happened to land on id 56 at different points in the same run. Rather than
+ * guess which upload event was the right one, read back whatever is actually
+ * resident right now via an FBO -- GLES1 has no glGetTexImage, but attaching
+ * the texture to a framebuffer and reading THAT gets the same answer and
+ * works at any moment, independent of upload history.
+ *
+ * GLES/gl.h (ES1 core) declares neither the FBO functions nor their enums, so
+ * both are resolved once via eglGetProcAddress -- the same mechanism the guest
+ * ProcAddress stub already uses, just kept on the host side this time instead
+ * of being handed to a 32-bit guest that could not call it anyway. */
+typedef void (*PFNGLGENFRAMEBUFFERSOES)(GLsizei, GLuint *);
+typedef void (*PFNGLBINDFRAMEBUFFEROES)(GLenum, GLuint);
+typedef void (*PFNGLFRAMEBUFFERTEXTURE2DOES)(GLenum, GLenum, GLenum, GLuint, GLint);
+typedef GLenum (*PFNGLCHECKFRAMEBUFFERSTATUSOES)(GLenum);
+typedef void (*PFNGLDELETEFRAMEBUFFERSOES)(GLsizei, const GLuint *);
+
+#define GL_FRAMEBUFFER_OES         0x8D40u
+#define GL_COLOR_ATTACHMENT0_OES   0x8CE0u
+#define GL_FRAMEBUFFER_COMPLETE_OES 0x8CD5u
+
+static int dumptex_readback(unsigned id) {
+    static PFNGLGENFRAMEBUFFERSOES        pGenFB;
+    static PFNGLBINDFRAMEBUFFEROES        pBindFB;
+    static PFNGLFRAMEBUFFERTEXTURE2DOES   pFBTex2D;
+    static PFNGLCHECKFRAMEBUFFERSTATUSOES pCheckFB;
+    static PFNGLDELETEFRAMEBUFFERSOES     pDelFB;
+    static int resolved, ok;
+    GLuint fbo;
+    GLenum status;
+    int w, h;
+    unsigned char *pixels;
+    FILE *f;
+
+    if (!resolved) {
+        resolved = 1;
+        pGenFB   = (PFNGLGENFRAMEBUFFERSOES)eglGetProcAddress("glGenFramebuffersOES");
+        pBindFB  = (PFNGLBINDFRAMEBUFFEROES)eglGetProcAddress("glBindFramebufferOES");
+        pFBTex2D = (PFNGLFRAMEBUFFERTEXTURE2DOES)eglGetProcAddress("glFramebufferTexture2DOES");
+        pCheckFB = (PFNGLCHECKFRAMEBUFFERSTATUSOES)eglGetProcAddress("glCheckFramebufferStatusOES");
+        pDelFB   = (PFNGLDELETEFRAMEBUFFERSOES)eglGetProcAddress("glDeleteFramebuffersOES");
+        ok = pGenFB && pBindFB && pFBTex2D && pCheckFB && pDelFB;
+        printf("  [tex  ] FBO readback functions resolved: %d\n", ok);
+    }
+    if (!ok || id >= TEXI_MAX || !g_texi[id].w || !g_texi[id].h)
+        return -1;
+    w = g_texi[id].w;
+    h = g_texi[id].h;
+
+    pGenFB(1, &fbo);
+    pBindFB(GL_FRAMEBUFFER_OES, fbo);
+    pFBTex2D(GL_FRAMEBUFFER_OES, GL_COLOR_ATTACHMENT0_OES, GL_TEXTURE_2D, id, 0);
+    status = pCheckFB(GL_FRAMEBUFFER_OES);
+    if (status != GL_FRAMEBUFFER_COMPLETE_OES) {
+        printf("  [tex  ] FBO incomplete for texture %u: 0x%04x\n",
+               id, (unsigned)status);
+        pBindFB(GL_FRAMEBUFFER_OES, 0);
+        pDelFB(1, &fbo);
+        return -2;
+    }
+
+    pixels = (unsigned char *)malloc((size_t)w * (size_t)h * 4u);
+    if (!pixels) {
+        pBindFB(GL_FRAMEBUFFER_OES, 0);
+        pDelFB(1, &fbo);
+        return -3;
+    }
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    pBindFB(GL_FRAMEBUFFER_OES, 0);
+    pDelFB(1, &fbo);
+
+    f = fopen("sdmc:/switch/boz/atlasN.hdr", "w");
+    if (f) {
+        fprintf(f, "id=%u w=%d h=%d format=RGBA8 (readback)\n", id, w, h);
+        fclose(f);
+    }
+    f = fopen("sdmc:/switch/boz/atlasN.bin", "wb");
+    if (f) {
+        fwrite(pixels, 1, (size_t)w * (size_t)h * 4u, f);
+        fclose(f);
+    }
+    free(pixels);
+    printf("  [tex  ] read back texture %u: %dx%d RGBA8\n", id, w, h);
+    return 0;
+}
+
+/* SND DUMPTEX <id>: read that texture back live and write it to the card.
+ *
+ * ctl_command runs on the control socket's own thread (see ctl_thread_start),
+ * which has never called eglMakeCurrent -- there is no EGL context current
+ * there at all. gl_tex_skip/gl_tex_list get away with running on that thread
+ * because they only touch plain arrays; this is the first of the bunch that
+ * makes real GL calls, and GL context state is thread-local. Calling through
+ * unchanged produced exactly what a missing context looks like: the function
+ * pointers resolved fine, but glCheckFramebufferStatusOES came back 0x0000,
+ * not even a valid status code.
+ *
+ * So this only arms a pending id; the actual readback happens once per frame
+ * from te_SwapBuffers below, which is guaranteed to run on the thread that
+ * holds the real context. g_dumptex_pending itself is declared earlier,
+ * next to the rest of the texture-bisection state, so te_SwapBuffers -- which
+ * is defined above this point in the file -- can see it too. */
+int gl_tex_dump(unsigned id) {
+    g_dumptex_pending = id;
+    return 0;
+}
+
+/* SND HIDESTICKS 0|1: toggle the screen-position gate on texture 56. */
+void gl_hide_sticks(int on) { g_hide_sticks = on; }
+void gl_stick_probe(int n) { g_stick_probe = n; }
+unsigned gl_hidden_draws(void) { return g_hidden_draws; }
+
+/* One-shot raw dump of a specific texture's base-level upload, armed by
+ * writing its id to SCRATCH-adjacent state before the level loads (here,
+ * hardcoded to the atlas confirmed by live bisection to hold both stick
+ * circles: SND SKIPTEX narrowed the whole HUD down to texture 56, and
+ * skipping the whole thing also blanked the ammo digit that shares it --
+ * so it needs a pixel-level fix, not a texture-level one, and that needs
+ * to see the actual bytes rather than guess a layout from a different
+ * build's atlas.
+ *
+ * GLES has no glGetTexImage, so upload time is the only place the CPU-side
+ * pixels are ever available -- the driver is handed a copy and nothing here
+ * keeps one. Dumped as raw bytes plus a one-line header giving exactly the
+ * format/type/dims needed to decode them correctly, rather than assumed. */
+static void dump_tex_if_target(GLuint tex, GLint level, GLint w, GLint h,
+                               GLenum format, GLenum type, const void *p,
+                               uint64_t bytes) {
+    static int done;
+    FILE *f;
+    if (done || tex != 56 || level != 0 || !p)
+        return;
+    done = 1;
+    f = fopen("sdmc:/switch/boz/atlas56.hdr", "w");
+    if (f) {
+        fprintf(f, "w=%d h=%d format=0x%04x type=0x%04x bytes=%llu\n",
+                (int)w, (int)h, (unsigned)format, (unsigned)type,
+                (unsigned long long)bytes);
+        fclose(f);
+    }
+    f = fopen("sdmc:/switch/boz/atlas56.bin", "wb");
+    if (f) {
+        fwrite(p, 1, (size_t)bytes, f);
+        fclose(f);
+    }
+    printf("  [tex  ] dumped texture 56: %dx%d format=0x%04x type=0x%04x\n",
+           (int)w, (int)h, (unsigned)format, (unsigned)type);
+}
+
 static void te_TexImage2D(GuestCpu *c, GuestMem *m, void *u) {
     (void)u;
     if ((int)ga(c, m, 1) == 0)          /* census the base level only */
         tex_note((uint32_t)ga(c, m, 3), (uint32_t)ga(c, m, 4),
                  (uint32_t)ga(c, m, 2), 0);
+    if ((int)ga(c, m, 1) == 0)
+        tex_dims((uint32_t)ga(c, m, 3), (uint32_t)ga(c, m, 4));
     {
         uint64_t bytes = image_bytes((uint32_t)ga(c, m, 3), (uint32_t)ga(c, m, 4),
                                      (uint32_t)ga(c, m, 6), (uint32_t)ga(c, m, 7));
@@ -1063,6 +1649,9 @@ static void te_TexImage2D(GuestCpu *c, GuestMem *m, void *u) {
         if (!p && ga(c, m, 8))
             return;                     /* a NULL data pointer is legal -- it
                                          * defines the level without content */
+        dump_tex_if_target(g_bound_tex[g_active_unit & 7u], (GLint)ga(c, m, 1),
+                           (GLint)ga(c, m, 3), (GLint)ga(c, m, 4),
+                           (GLenum)ga(c, m, 6), (GLenum)ga(c, m, 7), p, bytes);
         glTexImage2D((GLenum)ga(c, m, 0), (GLint)ga(c, m, 1), (GLint)ga(c, m, 2),
                      (GLsizei)ga(c, m, 3), (GLsizei)ga(c, m, 4),
                      (GLint)ga(c, m, 5), (GLenum)ga(c, m, 6),
@@ -1133,6 +1722,13 @@ static const struct { const char *name; GuestHleFn fn; } g_egl_overrides[] = {
     { "glTexCoordPointer",       te_TexCoordPointer },
     { "glNormalPointer",         te_NormalPointer },
     { "glDrawElements",          te_DrawElements },
+    /* Texture bisection: bind state, unit, TEXTURE_2D enable, and the other
+     * draw call, so every draw can be attributed and optionally dropped. */
+    { "glActiveTexture",         te_ActiveTexture },
+    { "glBindTexture",           te_BindTexture },
+    { "glEnable",                te_Enable },
+    { "glDisable",               te_Disable },
+    { "glDrawArrays",            te_DrawArrays },
     { NULL, NULL }
 };
 

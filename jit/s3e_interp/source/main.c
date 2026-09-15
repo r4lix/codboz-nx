@@ -5529,6 +5529,14 @@ static void ctl_mkparents(const char *rel) {
     }
 }
 
+/* Texture bisection, in gl_egl.c. */
+void gl_tex_list(void);
+int  gl_tex_skip(unsigned id);
+int  gl_tex_dump(unsigned id);
+void gl_hide_sticks(int on);
+void gl_stick_probe(int n);
+unsigned gl_hidden_draws(void);
+
 static void ctl_command(char *line) {
     char *arg = strchr(line, ' ');
     if (arg)
@@ -5598,6 +5606,29 @@ static void ctl_command(char *line) {
             } else {
                 ctl_say("ERR use: SND AIM <speed> [radius]\n");
             }
+        } else if (!strcmp(arg, "TEXLIST")) {
+            gl_tex_list();
+            ctl_say("OK\n");
+        } else if (!strncmp(arg, "SKIPTEX ", 8)) {
+            int r = gl_tex_skip((unsigned)atoi(arg + 8));
+            ctl_say(r < 0 ? "ERR use: SND SKIPTEX <id> (0 clears)\n"
+                          : "OK\n");
+        } else if (!strncmp(arg, "DUMPTEX ", 8)) {
+            int r = gl_tex_dump((unsigned)atoi(arg + 8));
+            ctl_say(r == 0 ? "OK\n" : "ERR dump failed\n");
+        } else if (!strncmp(arg, "STICKPROBE ", 11)) {
+            int n = atoi(arg + 11);
+            if (n > 0 && n <= 20000) {
+                gl_stick_probe(n);
+                ctl_say("OK\n");
+            } else {
+                ctl_say("ERR use: SND STICKPROBE <1..20000>\n");
+            }
+        } else if (!strcmp(arg, "HIDESTICKS 0") || !strcmp(arg, "HIDESTICKS 1")) {
+            gl_hide_sticks(arg[11] == '1');
+            printf("  [tex  ] virtual sticks %s (%u draws hidden so far)\n",
+                   arg[11] == '1' ? "hidden" : "shown", gl_hidden_draws());
+            ctl_say("OK\n");
         } else if (!strncmp(arg, "TAPMAX ", 7)) {
             int f = atoi(arg + 7);
             if (f >= 0 && f <= 120) {
@@ -6140,6 +6171,34 @@ static void run(void) {
                                     g_img.hdr.config_len);
         printf("cfg: %d keys from the game's own ICF (%u bytes)\n", n,
                (unsigned)g_img.hdr.config_len);
+        /* Optional extra keys from the card, applied on top of the game
+         * own ones. The only way to ask this engine a question is to change a
+         * config value and watch what happens, and doing that through a
+         * rebuild-and-deploy cycle per key turns an experiment into an
+         * afternoon. Absent by default, so it costs nothing.
+         *
+         * The buffer is deliberately never freed: config entries point into
+         * it rather than copying, so it has to outlive them. */
+        {
+            FILE *cf = fopen("sdmc:/switch/boz/override.icf", "rb");
+            if (cf) {
+                long clen;
+                fseek(cf, 0, SEEK_END);
+                clen = ftell(cf);
+                fseek(cf, 0, SEEK_SET);
+                if (clen > 0 && clen < (1 << 20)) {
+                    char *cbuf = (char *)malloc((size_t)clen);
+                    if (cbuf &&
+                        fread(cbuf, 1, (size_t)clen, cf) == (size_t)clen)
+                        printf("cfg: override.icf applied, %d keys total\n",
+                               s3e_config_load_overrides(cbuf,
+                                                         (unsigned)clen));
+                    else
+                        free(cbuf);
+                }
+                fclose(cf);
+            }
+        }
     }
     {   /* The BSS global holding the object read at RVA 0x23f228, resolved
          * from the GOT statically. Fixed in every run, so it can be watched

@@ -172,20 +172,15 @@ static int icf_resolve(char *val, char *out, size_t out_len) {
 static char g_icf_resolved[8][24];
 static int g_icf_resolved_n;
 
-int s3e_config_load_icf(const char *text, unsigned len) {
+/* The parse loop, shared by the game's own ICF and by the override file.
+ * `owned` is modified in place and must outlive every key parsed from it,
+ * because entries point into it rather than copying. */
+static int icf_parse(char *owned) {
     char *p, *line, *next;
     const char *sect = "";
     int active = 1;
 
-    if (!text || !len || g_icf_text)
-        return 0;
-    g_icf_text = (char *)malloc((size_t)len + 1);
-    if (!g_icf_text)
-        return 0;
-    memcpy(g_icf_text, text, len);
-    g_icf_text[len] = 0;
-
-    for (p = g_icf_text; p && *p; p = next) {
+    for (p = owned; p && *p; p = next) {
         char *hash, *eq, *k, *v;
         size_t n;
         next = strchr(p, '\n');
@@ -235,6 +230,37 @@ int s3e_config_load_icf(const char *text, unsigned len) {
         icf_set(sect, k, v);
     }
     return g_icf_n;
+}
+
+int s3e_config_load_icf(const char *text, unsigned len) {
+    if (!text || !len || g_icf_text)
+        return 0;
+    g_icf_text = (char *)malloc((size_t)len + 1);
+    if (!g_icf_text)
+        return 0;
+    memcpy(g_icf_text, text, len);
+    g_icf_text[len] = 0;
+    return icf_parse(g_icf_text);
+}
+
+/* Extra keys from the card, applied AFTER the game's own ICF.
+ *
+ * icf_set lets later definitions win, so this overrides anything the game
+ * shipped and can introduce keys it never set. It exists because the only way
+ * to ask this engine a question is to change a config value and watch, and
+ * doing that through a rebuild-and-deploy cycle per key is how an experiment
+ * turns into an afternoon. The file is optional and absent by default. */
+static char *g_icf_over;
+
+int s3e_config_load_overrides(const char *text, unsigned len) {
+    if (!text || !len || g_icf_over)
+        return 0;
+    g_icf_over = (char *)malloc((size_t)len + 1);
+    if (!g_icf_over)
+        return 0;
+    memcpy(g_icf_over, text, len);
+    g_icf_over[len] = 0;
+    return icf_parse(g_icf_over);
 }
 
 const char *s3e_config_get(const char *section, const char *key) {

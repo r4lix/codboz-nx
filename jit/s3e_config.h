@@ -99,6 +99,10 @@
  * parked is the PortMaster values, not the game's own. */
 int s3e_config_load_icf(const char *text, unsigned len);
 
+/* Extra keys from the card, applied after the game's ICF; later
+ * definitions win, so these override it. Returns the total entry count. */
+int s3e_config_load_overrides(const char *text, unsigned len);
+
 /* The value for [section] key, or NULL when the key is not set -- which the
  * caller must answer with S3E_RESULT_ERROR (1), never with a zeroed buffer and
  * success. Parked keys return NULL unless the ICF supplies them. */
