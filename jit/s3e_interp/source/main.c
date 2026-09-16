@@ -25,7 +25,11 @@
 
 #include "guest.h"
 #include "dynarmic_glue.h"
+#include <time.h>
 #include "audio.h"
+#ifdef __SWITCH__
+#include "net.h"
+#endif
 #include "recomp.h"
 #include "s3e_loader.h"
 #include "s3e_files.h"
@@ -358,9 +362,26 @@ static void hle_extgethash(GuestCpu *cpu, GuestMem *mem, void *user) {
 }
 
 /* Callers dereference the result without a NULL check. */
+static int gputs(GuestMem *m, uint32_t addr, const char *s);
+
 static void hle_devstring(GuestCpu *cpu, GuestMem *mem, void *user) {
     static uint32_t s;
     (void)user;
+#ifdef __SWITCH__
+    /* S3E_DEVICE_UNIQUE_ID. The Play Online server keys the player's account
+     * on it, so it must be stable across launches (net.c keeps it on the
+     * card); "unknown" for every player would be one shared account. */
+    if (cpu->r[0] == 0x19u) {
+        static uint32_t id;
+        if (!id) {
+            id = galloc(40);
+            if (id)
+                gputs(mem, id, net_device_id());
+        }
+        cpu->r[0] = id;
+        return;
+    }
+#endif
     if (!s) {
         s = galloc(8);
         guest_st32(mem, s, 0x6E6B6E75u);      /* "unkn" */
@@ -1546,6 +1567,7 @@ static void cb_pump(void);      /* defined after `g`, which it re-enters */
 static void timer_pump(void);   /* s3eTimerSetTimer callbacks; same reason */
 static void snd_pump_finished(void);  /* defined with the sound state */
 static void snd_pump_wedged(void);    /* retires channels nothing can drain */
+static void net_pump_guest(void);    /* socket readiness and DNS results */
 /* Renders a sound through the game's own generator callback; defined after
  * `g`, because it calls into the guest. Non-zero if it played something. */
 static int snd_play_generated(GuestMem *mem, uint32_t ch, uint32_t start,
@@ -1614,6 +1636,7 @@ static void hle_device_yield(GuestCpu *cpu, GuestMem *mem, void *user) {
     snd_selftest_poll();
     cb_pump();
     timer_pump();
+    net_pump_guest();
     snd_endinfo_readback();   /* what the handler wrote; defined below */
     cpu->r[0] = 0;
 }
@@ -3984,6 +4007,12 @@ static uint64_t g_clock_base;         /* tick at the first query */
 static void hle_timer_ms(GuestCpu *cpu, GuestMem *mem, void *user) {
     (void)mem; (void)user;
     g_clock_queries++;
+    /* s3eTimerGetMs and s3eTimerGetUST return uint64 in r0:r1. Only r0 was
+     * ever set, so the high half was whatever r1 held: harmless where the game
+     * keeps the low word, but Demonware's socket wrapper (RVA 0x16a30) stores
+     * all 64 bits as a connection's start time and times the connection out
+     * against it. */
+    cpu->r[1] = 0;
     if (g_clock_fixed) {
         g_ticks += 16;
         cpu->r[0] = g_ticks;
@@ -4904,6 +4933,24 @@ static unsigned char *slurp(const char *path, size_t *out) {
 static GuestHleSlot g_slots[512];
 static Guest g;
 
+/* ---- network glue ------------------------------------------------------
+ * net.c owns sockets and Play Online; it needs only the guest heap and a way
+ * to call guest callbacks, which live here with `g`. */
+#ifdef __SWITCH__
+static uint32_t galloc(uint32_t n);
+static uint32_t net_glue_alloc(uint32_t n) { return galloc(n); }
+static int net_glue_call3(uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2,
+                          uint32_t *ret) {
+    return guest_call_r0_3(&g, fn, a0, a1, a2, ret) == GUEST_OK;
+}
+static void net_pump_guest(void) {
+    if (g_memp)
+        net_pump(g_memp);
+}
+#else
+static void net_pump_guest(void) {}
+#endif
+
 /* ------------------------------------------------------------ PC histogram */
 
 /* Instruction mix. pcprof says which code is hot; this says what it is made
@@ -5205,6 +5252,26 @@ static uint32_t timer_now_ms(void) {
     }
 }
 
+/* s3eTimerGetUTC: uint64 milliseconds since 1970 in r0:r1. It was unbound, so
+ * the game read 0 -- a clock stuck in 1970, which Demonware's auth, with its
+ * ticket issue and expiry times, cannot work with. */
+static void hle_timer_utc(GuestCpu *cpu, GuestMem *mem, void *user) {
+    struct timespec ts;
+    uint64_t ms = 0;
+    (void)mem; (void)user;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+        ms = (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+    cpu->r[0] = (uint32_t)ms;
+    cpu->r[1] = (uint32_t)(ms >> 32);
+}
+
+/* s3eTimerGetLocaltimeOffset: int64 ms. UTC is an honest answer. */
+static void hle_timer_localoffset(GuestCpu *cpu, GuestMem *mem, void *user) {
+    (void)mem; (void)user;
+    cpu->r[0] = 0;
+    cpu->r[1] = 0;
+}
+
 static void hle_timer_set(GuestCpu *cpu, GuestMem *mem, void *user) {
     uint32_t ms = cpu->r[0], fn = cpu->r[1], ud = cpu->r[2];
     int i, slot = -1;
@@ -5464,6 +5531,15 @@ static void bind_slot(uint32_t i, const char *nm) {
     if (!nm)
         return;
 #ifdef __SWITCH__
+    {   /* s3eSocket / s3eInet: net.c */
+        GuestHleFn netfn = net_find_hle(nm);
+        if (netfn) {
+            g_slots[i].fn = netfn;
+            return;
+        }
+    }
+#endif
+#ifdef __SWITCH__
     /* All 247 GL/EGL entry points come from the generated thunk table. Only
      * on device: the host differential harness has no GLES to link against. */
     {
@@ -5537,6 +5613,10 @@ static void bind_slot(uint32_t i, const char *nm) {
         g_slots[i].fn = hle_memory_setint;
     else if (!strcmp(nm, "s3eTimerGetMs") || !strcmp(nm, "s3eTimerGetUST"))
         g_slots[i].fn = hle_timer_ms;
+    else if (!strcmp(nm, "s3eTimerGetUTC"))
+        g_slots[i].fn = hle_timer_utc;
+    else if (!strcmp(nm, "s3eTimerGetLocaltimeOffset"))
+        g_slots[i].fn = hle_timer_localoffset;
     else if (!strcmp(nm, "s3eTimerSetTimer"))
         g_slots[i].fn = hle_timer_set;
     else if (!strcmp(nm, "s3eTimerCancelTimer"))
@@ -6964,24 +7044,54 @@ static void run(void) {
          * The buffer is deliberately never freed: config entries point into
          * it rather than copying, so it has to outlive them. */
         {
-            FILE *cf = fopen("sdmc:/switch/boz/override.icf", "rb");
-            if (cf) {
-                long clen;
-                fseek(cf, 0, SEEK_END);
-                clen = ftell(cf);
-                fseek(cf, 0, SEEK_SET);
-                if (clen > 0 && clen < (1 << 20)) {
-                    char *cbuf = (char *)malloc((size_t)clen);
-                    if (cbuf &&
-                        fread(cbuf, 1, (size_t)clen, cf) == (size_t)clen)
-                        printf("cfg: override.icf applied, %d keys total\n",
-                               s3e_config_load_overrides(cbuf,
-                                                         (unsigned)clen));
-                    else
-                        free(cbuf);
+            /* Play Online keys first, then the card's override.icf on top --
+             * one blob, because the config layer takes overrides only once.
+             * GENERIC is the account type the community server logs in, and
+             * 1.0.11 is the version the PS Vita and PortMaster clients report:
+             * rooms are matched on it, so it is what puts us in theirs. */
+            static const char online[] =
+                "[GAME]\nOnlineAccount=GENERIC\nGameVersion=1.0.11\n"
+                "VoiceChatEnabled=0\n";
+            char *text = NULL;
+            size_t tlen = 0;
+#ifdef __SWITCH__
+            if (net_online_enabled()) {
+                text = (char *)malloc(sizeof online);
+                if (text) {
+                    memcpy(text, online, sizeof online - 1);
+                    tlen = sizeof online - 1;
                 }
-                fclose(cf);
             }
+#endif
+            {
+                FILE *cf = fopen("sdmc:/switch/boz/override.icf", "rb");
+                if (cf) {
+                    long clen;
+                    fseek(cf, 0, SEEK_END);
+                    clen = ftell(cf);
+                    fseek(cf, 0, SEEK_SET);
+                    if (clen > 0 && clen < (1 << 20)) {
+                        char *grown = (char *)realloc(text, tlen + (size_t)clen + 2u);
+                        if (grown) {
+                            text = grown;
+                            text[tlen++] = '\n';
+                            if (fread(text + tlen, 1, (size_t)clen, cf) == (size_t)clen)
+                                tlen += (size_t)clen;
+                        }
+                    }
+                    fclose(cf);
+                }
+            }
+            if (tlen)
+                printf("cfg: overrides applied (online %s), %d keys total\n",
+#ifdef __SWITCH__
+                       net_online_enabled() ? "on" : "off",
+#else
+                       "off",
+#endif
+                       s3e_config_load_overrides(text, (unsigned)tlen));
+            else
+                free(text);
         }
     }
     {   /* The BSS global holding the object read at RVA 0x23f228, resolved
@@ -7150,6 +7260,31 @@ static void run(void) {
         }
     }
     startup_stage_write("06 guest memory mapped");
+#ifdef __SWITCH__
+    {   /* Player name. The game builds its online name with
+         * sprintf(name, "Player-%d", n) through one PC-relative literal
+         * (RVA 0x18f74c, used by the add-pc at 0x18f606). Repointing that
+         * literal at a plain string makes the sprintf produce it verbatim --
+         * the same patch the PortMaster port applies, at the same addresses,
+         * checked byte for byte before anything is written. */
+        const uint32_t lit_at = g_img.load_base + 0x18f74cu;
+        const uint32_t pc_at  = g_img.load_base + 0x18f60au;
+        const uint32_t fmt_at = g_img.load_base + 0x3af131u;
+        const char *fmt = (const char *)guest_ptr(&g.mem, fmt_at, 10);
+        uint32_t lit = 0;
+        if (guest_ld32(&g.mem, lit_at, &lit) && lit == fmt_at - pc_at && fmt &&
+            !memcmp(fmt, "Player-%d", 10)) {
+            const char *name = net_player_name();
+            const uint32_t at = galloc((uint32_t)strlen(name) + 1u);
+            if (at && gputs(&g.mem, at, name)) {
+                guest_st32(&g.mem, lit_at, at - pc_at);
+                printf("  [net  ] player name: %s\n", name);
+            }
+        } else {
+            printf("  [net  ] player name reference not found; keeping Player-N\n");
+        }
+    }
+#endif
 
     n = g_img.got_count < 511 ? g_img.got_count : 511;
     for (i = 0; i < n; i++) {
@@ -7824,6 +7959,10 @@ int main(int argc, char **argv) {
     } else {
         printf("socket init failed; logging on screen\n");
         consoleUpdate(NULL);
+    }
+    {   /* after sockets: Play Online needs them, and reads config.txt */
+        static const NetGlue glue = { net_glue_alloc, net_glue_call3 };
+        net_init(&glue, sockets_up);
     }
     /* Whether the console is still in the output path decides if it is
      * safe to print after the window changes hands. */

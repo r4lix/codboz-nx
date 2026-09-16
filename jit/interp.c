@@ -2602,6 +2602,25 @@ GuestStatus guest_call(Guest *g, uint32_t fn, uint32_t r0, uint32_t r1) {
  * interrupted register state -- r0 included -- which is right for event
  * callbacks nobody reads a result from, and loses the one number a sound
  * generator callback returns: how many samples it produced. */
+GuestStatus guest_call_r0_3(Guest *g, uint32_t fn, uint32_t r0, uint32_t r1,
+                            uint32_t r2, uint32_t *ret) {
+    GuestCpu saved = g->cpu;
+    const uint32_t pad = GUEST_STUB_BASE + GUEST_STUB_SIZE - 4;
+    GuestStatus st;
+
+    g->cpu.r[0] = r0;
+    g->cpu.r[1] = r1;
+    g->cpu.r[2] = r2;
+    g->cpu.r[GUEST_LR] = pad;
+    branch_interworking(&g->cpu, fn);
+
+    st = guest_run(g, pad, 20000000);
+    if (ret)
+        *ret = g->cpu.r[0];
+    g->cpu = saved;
+    return (st == GUEST_HALTED) ? GUEST_OK : st;
+}
+
 GuestStatus guest_call_r0(Guest *g, uint32_t fn, uint32_t r0, uint32_t r1,
                           uint32_t *ret) {
     GuestCpu saved = g->cpu;
