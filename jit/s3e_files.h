@@ -38,6 +38,7 @@ int      s3e_vfs_seek(uint32_t h, int32_t off, uint32_t origin);
 uint32_t s3e_vfs_tell(uint32_t h);
 uint32_t s3e_vfs_size(uint32_t h);
 void     s3e_vfs_close(uint32_t h);
+int      s3e_vfs_flush(uint32_t h);   /* s3eFileFlush: 0 on success */
 int      s3e_vfs_exists(const char *name);
 int      s3e_vfs_error(void);
 int      s3e_vfs_delete(const char *name);

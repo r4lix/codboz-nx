@@ -224,3 +224,14 @@ int snd_music_playing(void) {
     mutexUnlock(&g_mlock);
     return r;
 }
+
+/* s3eAudio STATUS: 0 stopped, 1 playing, 2 paused. Distinct from
+ * snd_music_playing because a paused stream is still a stream -- the game's
+ * music manager throws its track away the moment status reads 0. */
+int snd_music_status(void) {
+    int r;
+    music_lock();
+    r = !g_m.active ? 0 : (g_m.paused ? 2 : 1);
+    mutexUnlock(&g_mlock);
+    return r;
+}

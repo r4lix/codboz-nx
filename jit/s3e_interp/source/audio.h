@@ -32,17 +32,31 @@ void snd_out_exit(void);
  * Decoded into our own storage here rather than referenced: the game owns that
  * buffer and may reuse it the moment this returns, and chasing a guest pointer
  * from another thread while the guest is running is not a race worth having. */
-void snd_out_play(unsigned ch, const void *data, uint32_t bytes,
-                  uint32_t block, uint32_t rate, uint32_t volume);
+/* Returns the number of samples decoded, so the caller can compare that with
+ * what the game's own sample descriptor promises. */
+uint32_t snd_out_play(unsigned ch, const void *data, uint32_t bytes,
+                      uint32_t block, uint32_t rate, uint32_t volume);
+
+/* Start a voice from `samples` frames of 16-bit signed mono PCM, copied. This is
+ * what s3eSoundChannelPlay really carries when no generator is registered, and
+ * what the game's own generator callback produces when one is. */
+void snd_out_play_pcm(unsigned ch, const int16_t *pcm, uint32_t samples,
+                      uint32_t rate, uint32_t volume);
 
 void snd_out_stop(unsigned ch);
 void snd_out_pause(unsigned ch, int paused);
 void snd_out_set_volume(unsigned ch, uint32_t volume);
 
+/* Master sample volume, s3eSoundSetInt property 0 (256 = unity). */
+void snd_out_set_master(uint32_t volume);
+
 /* Non-zero while the voice still has samples left. This is what the game polls
  * to decide a sound has finished and the channel can be reused, so it has to
  * reflect the mixer rather than the fact that Play was once called. */
 int  snd_out_busy(unsigned ch);
+
+/* Samples left and total for a live voice (0,0 when idle). */
+void snd_out_progress(unsigned ch, uint32_t *left, uint32_t *total);
 
 /* Bitmask of voices that have finished since the last call, and clears it.
  * Collected on the guest thread, which is the only one allowed to turn this
@@ -60,6 +74,8 @@ void snd_music_stop(void);
 void snd_music_pause(int paused);
 void snd_music_set_volume(uint32_t volume);
 int  snd_music_playing(void);
+/* s3eAudio STATUS: 0 stopped, 1 playing, 2 paused. */
+int  snd_music_status(void);
 
 /* Mixer liveness and state, for the control socket. */
 uint64_t snd_out_mix_calls(void);

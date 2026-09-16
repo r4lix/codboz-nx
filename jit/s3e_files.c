@@ -19,6 +19,7 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#include <sys/stat.h>
 #define MKDIR(p) _mkdir(p)
 #else
 #include <sys/stat.h>
@@ -51,6 +52,12 @@ typedef struct {
     int      writable;
     char     name[128];
 } Slot;
+
+/* Every open, write, close and delete on a save file is logged, capped: saves
+ * are the one place a wrong byte means lost progress, and without this there
+ * was no way to see the order the game touches them in. */
+#define SAVE_TRACE_MAX 200
+static int     g_save_trace;
 
 static char    g_root[PATH_MAX_];
 static char   *g_arch[MAX_ARCH];
@@ -98,15 +105,15 @@ static void join(char *out, size_t n, const char *a, const char *b) {
     snprintf(out, n, "%s/%s", a, b);
 }
 
+/* stat, not fopen. Opening a file to measure it fails on Horizon whenever any
+ * handle already has it open for writing -- which the game's save code does
+ * constantly -- so an existing save looked absent: the existence check said
+ * no, and the write path picked "w+b" and truncated it. */
 static long file_size(const char *path) {
-    FILE *f = fopen(path, "rb");
-    long n;
-    if (!f)
+    struct stat st;
+    if (stat(path, &st) != 0 || !(st.st_mode & S_IFREG))
         return -1;
-    fseek(f, 0, SEEK_END);
-    n = ftell(f);
-    fclose(f);
-    return n;
+    return (long)st.st_size;
 }
 
 /* mkdir -p over a path whose last component may be a file name. */
@@ -399,11 +406,31 @@ uint32_t s3e_vfs_open(const char *name, const char *mode) {
             g_err = S3E_FILE_ERR_NOT_FOUND;
             return 0;
         }
+        /* Buffered, like every other stream. For one build this was unbuffered
+         * on the theory that several handles shared a save; the trace showed
+         * the game always closes a handle before reopening, and the real bug
+         * was file_size() re-opening an open file. Unbuffered cost a 1-3 s
+         * freeze on every autosave: 1_save_game.i3d is ~21 KB written in 1- to
+         * 4-byte pieces, each of which became its own SD-card write. */
         set_buffer(fh);
-        if (strchr(mode, 'a'))
-            fseek(fh, 0, SEEK_END);
-        fs = file_size(real);
-        return slot_new(fh, 0, fs > 0 ? (uint32_t)fs : 0u, name, 1);
+        /* Size from the handle we hold, not by path. Asking by path re-opens
+         * the file, and Horizon refuses a second open of a file that is open
+         * for writing -- so this came back -1, the slot got size 0, every read
+         * of an existing save returned nothing, and the game judged its saves
+         * corrupt and deleted them (logged: "delete data-etc/profile_0.i3d"). */
+        fseek(fh, 0, SEEK_END);
+        fs = ftell(fh);
+        if (!strchr(mode, 'a'))
+            fseek(fh, 0, SEEK_SET);
+        {
+            uint32_t h = slot_new(fh, 0, fs > 0 ? (uint32_t)fs : 0u, name, 1);
+            if (g_save_trace < SAVE_TRACE_MAX) {
+                g_save_trace++;
+                printf("  [save ] open %s (%s) -> %08x size=%ld\n", name, mode,
+                       (unsigned)h, fs);
+            }
+            return h;
+        }
     }
 
     if (!resolve(name, real, sizeof real, &off, &size)) {
@@ -443,6 +470,11 @@ uint32_t s3e_vfs_write(uint32_t h, const void *src, uint32_t n) {
         return 0;
     if (!seek_to(s, (long)(s->base + s->pos), 1))
         return 0;
+    if (g_save_trace < SAVE_TRACE_MAX) {
+        g_save_trace++;
+        printf("  [save ] write %08x %s pos=%u n=%u\n", (unsigned)h, s->name,
+               (unsigned)s->pos, (unsigned)n);
+    }
     put = fwrite(src, 1, n, s->fh);
     s->pos += (uint32_t)put;
     s->fpos += (long)put;
@@ -483,10 +515,25 @@ void s3e_vfs_close(uint32_t h) {
     Slot *s = slot_of(h);
     if (!s)
         return;
+    if (s->writable && g_save_trace < SAVE_TRACE_MAX) {
+        g_save_trace++;
+        printf("  [save ] close %08x %s size=%u\n", (unsigned)h, s->name,
+               (unsigned)s->size);
+    }
     if (s->fh)
         fclose(s->fh);
     s->used = 0;
     s->fh = NULL;
+}
+
+/* s3eFileFlush. It used to be a no-op in the HLE, which with buffered save
+ * streams meant a flush followed by a read-back through another handle found
+ * nothing written. */
+int s3e_vfs_flush(uint32_t h) {
+    Slot *s = slot_of(h);
+    if (!s || !s->fh)
+        return 1;
+    return fflush(s->fh) == 0 ? 0 : 1;
 }
 
 int s3e_vfs_error(void) { return g_err; }
@@ -495,7 +542,14 @@ int s3e_vfs_delete(const char *name) {
     char real[PATH_MAX_], n[PATH_MAX_];
     norm(name, n, sizeof n);
     snprintf(real, sizeof real, "%s/save/%s", g_root, n);
-    return remove(real) == 0 ? 0 : 1;
+    {
+        int rc = remove(real) == 0 ? 0 : 1;
+        if (g_save_trace < SAVE_TRACE_MAX) {
+            g_save_trace++;
+            printf("  [save ] delete %s -> %s\n", name, rc ? "failed" : "ok");
+        }
+        return rc;
+    }
 }
 
 int s3e_vfs_mkdir(const char *name) {

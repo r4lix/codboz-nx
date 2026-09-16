@@ -31,7 +31,10 @@ typedef struct {
     int16_t *pcm;           /* our copy */
     uint32_t samples;
     uint32_t cap;           /* allocated frames, so a reused voice can skip malloc */
-    uint32_t pos;           /* Q16 position within pcm */
+    /* Q16 position within pcm. 64-bit: a 32-bit Q16 index tops out at 65535
+     * samples and wrapped back to 0, so any sound longer than ~3 s at 22 kHz
+     * (repair_00, buy_debris) never drained and looped forever. */
+    uint64_t pos;
     uint32_t step;          /* Q16 source frames per output frame */
     uint32_t volume;        /* as the game set it; 256 taken as unity */
     uint8_t  active;
@@ -60,6 +63,7 @@ static uint32_t        g_drained;
  * rather than ours. This counts buffers actually filled. */
 static uint64_t        g_mix_calls;
 static int             g_music_on = 1;
+static uint32_t        g_master = 256u;   /* s3eSoundSetInt VOLUME, 256 = unity */
 
 
 /* ---- IMA ADPCM ---------------------------------------------------------
@@ -152,14 +156,15 @@ static void mix(int16_t *out) {
     mutexLock(&g_lock);
     for (i = 0; i < SND_OUT_CHANNELS; i++) {
         Voice *v = &g_ch[i];
-        uint32_t pos, step, vol;
+        uint64_t pos;
+        uint32_t step, vol;
         if (!v->active || v->paused || !v->pcm)
             continue;
         pos = v->pos;
         step = v->step;
-        vol = v->volume;
+        vol = (v->volume * g_master) >> 8;
         for (f = 0; f < OUT_FRAMES; f++) {
-            uint32_t idx = pos >> 16;
+            uint64_t idx = pos >> 16;
             int32_t s;
             if (idx >= v->samples) {
                 v->active = 0;      /* drained; snd_out_busy stops reporting it */
@@ -278,12 +283,12 @@ void snd_out_exit(void) {
     g_live = 0;
 }
 
-void snd_out_play(unsigned ch, const void *data, uint32_t bytes,
-                  uint32_t block, uint32_t rate, uint32_t volume) {
+uint32_t snd_out_play(unsigned ch, const void *data, uint32_t bytes,
+                      uint32_t block, uint32_t rate, uint32_t volume) {
     Voice *v;
     uint32_t need, got;
     if (!g_live || ch >= SND_OUT_CHANNELS || !data || !bytes)
-        return;
+        return 0;
     if (!rate)
         rate = 22050u;
     v = &g_ch[ch];
@@ -297,7 +302,7 @@ void snd_out_play(unsigned ch, const void *data, uint32_t bytes,
         int16_t *p = (int16_t *)realloc(v->pcm, need * sizeof(int16_t));
         if (!p) {
             mutexUnlock(&g_lock);
-            return;
+            return 0;
         }
         v->pcm = p;
         v->cap = need;
@@ -305,7 +310,7 @@ void snd_out_play(unsigned ch, const void *data, uint32_t bytes,
     got = ima_decode((const uint8_t *)data, bytes, block, v->pcm, need);
     if (!got) {
         mutexUnlock(&g_lock);
-        return;
+        return 0;
     }
     v->samples = got;
     v->pos = 0;
@@ -313,6 +318,41 @@ void snd_out_play(unsigned ch, const void *data, uint32_t bytes,
     v->volume = volume ? volume : 256u;
     v->paused = 0;
     v->active = 1;
+    /* A drain left over from the sound this one replaces must not be reported
+     * against it: that fired the NEW instance's end-of-sample handler. */
+    g_drained &= ~(1u << ch);
+    mutexUnlock(&g_lock);
+    return got;
+}
+
+void snd_out_play_pcm(unsigned ch, const int16_t *pcm, uint32_t samples,
+                      uint32_t rate, uint32_t volume) {
+    Voice *v;
+    if (!g_live || ch >= SND_OUT_CHANNELS || !pcm || !samples)
+        return;
+    if (!rate)
+        rate = 22050u;
+    v = &g_ch[ch];
+    mutexLock(&g_lock);
+    if (v->cap < samples) {
+        int16_t *p = (int16_t *)realloc(v->pcm, samples * sizeof(int16_t));
+        if (!p) {
+            mutexUnlock(&g_lock);
+            return;
+        }
+        v->pcm = p;
+        v->cap = samples;
+    }
+    memcpy(v->pcm, pcm, samples * sizeof(int16_t));
+    v->samples = samples;
+    v->pos = 0;
+    v->step = (uint32_t)(((uint64_t)rate << 16) / OUT_RATE);
+    v->volume = volume ? volume : 256u;
+    v->paused = 0;
+    v->active = 1;
+    /* A drain left over from the sound this one replaces must not be reported
+     * against it: that fired the NEW instance's end-of-sample handler. */
+    g_drained &= ~(1u << ch);
     mutexUnlock(&g_lock);
 }
 
@@ -321,6 +361,7 @@ void snd_out_stop(unsigned ch) {
         return;
     mutexLock(&g_lock);
     g_ch[ch].active = 0;
+    g_drained &= ~(1u << ch);   /* a stopped sound does not also "finish" */
     mutexUnlock(&g_lock);
 }
 
@@ -337,6 +378,29 @@ void snd_out_set_volume(unsigned ch, uint32_t volume) {
         return;
     mutexLock(&g_lock);
     g_ch[ch].volume = volume;
+    mutexUnlock(&g_lock);
+}
+
+/* Master sample volume (s3eSoundSetInt property 0), applied on top of each
+ * voice's own. The mixer reads it once per voice per buffer; a torn read of
+ * one word is harmless, so it takes no lock. */
+void snd_out_set_master(uint32_t volume) {
+    g_master = volume > 256u ? 256u : volume;
+}
+
+/* Samples still to play on a voice, and how long it is in total. Used to spot
+ * a sound that is cut off: a Play or Stop arriving while a voice still has
+ * most of its audio left is the game (or this port) ending it early. */
+void snd_out_progress(unsigned ch, uint32_t *left, uint32_t *total) {
+    *left = *total = 0;
+    if (!g_live || ch >= SND_OUT_CHANNELS)
+        return;
+    mutexLock(&g_lock);
+    if (g_ch[ch].active) {
+        uint32_t done = (uint32_t)(g_ch[ch].pos >> 16);
+        *total = g_ch[ch].samples;
+        *left = done < g_ch[ch].samples ? g_ch[ch].samples - done : 0;
+    }
     mutexUnlock(&g_lock);
 }
 

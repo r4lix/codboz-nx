@@ -1324,7 +1324,7 @@ static void hle_file_mkdir(GuestCpu *cpu, GuestMem *mem, void *user) {
 
 static void hle_file_flush(GuestCpu *cpu, GuestMem *mem, void *user) {
     (void)mem; (void)user;
-    cpu->r[0] = 0;
+    cpu->r[0] = (uint32_t)s3e_vfs_flush(cpu->r[0]);
 }
 
 static void hle_zero(GuestCpu *cpu, GuestMem *mem, void *user) {
@@ -1343,11 +1343,14 @@ static void hle_zero(GuestCpu *cpu, GuestMem *mem, void *user) {
  * Unicorn reference cannot do this from inside a hook and has to stop the
  * emulator and deliver from its driver loop; an interpreter just recurses.)
  */
-#define MAX_CBS 64
+/* 128: every sound channel registers its own generator and end-of-sample
+ * handler, on top of the engine and UI listeners. */
+#define MAX_CBS 128
 
 typedef struct {
     char     kind[28];          /* import name minus the trailing "Register" */
     uint32_t id, fn, user;
+    uint32_t chan;              /* s3eSoundChannel: its channel; else CB_NO_CHAN */
     int      used;
 } Callback;
 
@@ -1412,12 +1415,45 @@ static int cb_find_fn(const char *kind, uint32_t id, uint32_t fn) {
     return -1;
 }
 
+/* Channel callbacks are per CHANNEL. The game's sound manager registers a
+ * generator (type 1) and an end-of-sample handler (type 0) on each channel it
+ * allocates, with that channel's own sound instance as userData, and replaces
+ * them on every allocation. Keyed by (kind, id, fn) like the other events,
+ * every channel collapsed into one entry holding whichever instance registered
+ * last -- invisible while only channel 0 was ever used, and wrong for anything
+ * else. So a channel callback is found by (channel, type), used or not, which
+ * also lets a re-registration reuse its slot instead of growing the table. */
+#define CB_NO_CHAN 0xFFFFFFFFu
+static unsigned g_chan_cb_log;
+
+static int cb_find_chan(const char *kind, uint32_t chan, uint32_t id) {
+    int i;
+    for (i = 0; i < g_cb_n; i++)
+        if (g_cbs[i].chan == chan && g_cbs[i].id == id &&
+            !strcmp(g_cbs[i].kind, kind))
+            return i;
+    return -1;
+}
+
+static int cb_queue_chan(const char *kind, uint32_t id, uint32_t chan,
+                         uint32_t sysdata) {
+    int i = cb_find_chan(kind, chan, id);
+    if (i < 0 || !g_cbs[i].used ||
+        g_cb_queue_n >= (int)(sizeof g_cb_queue / sizeof *g_cb_queue))
+        return 0;
+    g_cb_queue[g_cb_queue_n].slot = i;
+    g_cb_queue[g_cb_queue_n].sysdata = sysdata;
+    g_cb_queue_n++;
+    return 1;
+}
+
 static void hle_register(GuestCpu *cpu, GuestMem *mem, void *user) {
     uint32_t idx = (uint32_t)(uintptr_t)user;
     char kind[28];
     int i;
     const uint32_t a = (uint32_t)cb_arg_shift(slot_name(idx));
     const uint32_t r_id = cpu->r[a], r_fn = cpu->r[a + 1], r_ud = cpu->r[a + 2];
+    const uint32_t chan = a ? cpu->r[0] : CB_NO_CHAN;
     (void)mem;
     cb_kind(slot_name(idx), kind, sizeof kind);
     /* Registrations accumulate. Only an identical (kind, id, fn) is treated as
@@ -1425,7 +1461,13 @@ static void hle_register(GuestCpu *cpu, GuestMem *mem, void *user) {
      * different function for the same event is an additional listener, not a
      * replacement. Overwriting here is what silently unhooked the engine's
      * pointer handler when the UI layer registered its own. */
-    i = cb_find_fn(kind, r_id, r_fn);
+    i = a ? cb_find_chan(kind, chan, r_id) : cb_find_fn(kind, r_id, r_fn);
+    if (i < 0) {                            /* reuse a slot something freed */
+        int k;
+        for (k = 0; k < g_cb_n && i < 0; k++)
+            if (!g_cbs[k].used)
+                i = k;
+    }
     if (i < 0 && g_cb_n < MAX_CBS)
         i = g_cb_n++;
     if (i >= 0) {
@@ -1433,10 +1475,17 @@ static void hle_register(GuestCpu *cpu, GuestMem *mem, void *user) {
         g_cbs[i].id = r_id;
         g_cbs[i].fn = r_fn;
         g_cbs[i].user = r_ud;
+        g_cbs[i].chan = chan;
         g_cbs[i].used = 1;
-        printf("  [cb   ] %-18s id=%-3u fn=%08x user=%08x%s\n", kind,
-               (unsigned)r_id, (unsigned)r_fn, (unsigned)r_ud,
-               a ? "  (channel-shifted)" : "");
+        /* The sound manager re-registers on every play, so channel callbacks
+         * are reported only while there are few enough to read. */
+        if (!a || g_chan_cb_log++ < 40)
+            printf("  [cb   ] %-18s id=%-3u fn=%08x user=%08x%s%u\n", kind,
+                   (unsigned)r_id, (unsigned)r_fn, (unsigned)r_ud,
+                   a ? "  ch" : "", a ? (unsigned)chan : 0u);
+    } else {
+        printf("  [cb   ] %-18s id=%-3u fn=%08x DROPPED: table full\n", kind,
+               (unsigned)r_id, (unsigned)r_fn);
     }
     cpu->r[0] = 0;                          /* S3E_RESULT_SUCCESS */
 }
@@ -1447,18 +1496,23 @@ static void hle_unregister(GuestCpu *cpu, GuestMem *mem, void *user) {
     int i;
     const uint32_t a = (uint32_t)cb_arg_shift(slot_name(idx));
     const uint32_t r_id = cpu->r[a], r_fn = cpu->r[a + 1];
+    const uint32_t chan = a ? cpu->r[0] : CB_NO_CHAN;
     (void)mem;
     cb_kind(slot_name(idx), kind, sizeof kind);
     /* Only ever remove the exact handler named. Falling back to "the first
      * registration for this event" is how input dies mid-session: the game
      * tears down a UI listener and we unhook the engine's instead, after which
      * events are still generated and delivered to nothing. */
-    i = cb_find_fn(kind, r_id, r_fn);
-    if (i >= 0) {
+    /* A channel callback is named by (channel, type) alone: UnRegister takes
+     * no function, so what sits in the function position here is garbage and
+     * every channel unregistration used to report NOT FOUND. */
+    i = a ? cb_find_chan(kind, chan, r_id) : cb_find_fn(kind, r_id, r_fn);
+    if (i >= 0 && g_cbs[i].used) {
         g_cbs[i].used = 0;
-        printf("  [cb   ] -%-17s id=%-3u fn=%08x\n", kind,
-               (unsigned)r_id, (unsigned)r_fn);
-    } else {
+        if (!a || g_chan_cb_log++ < 40)
+            printf("  [cb   ] -%-17s id=%-3u fn=%08x\n", kind,
+                   (unsigned)r_id, (unsigned)g_cbs[i].fn);
+    } else if (!a || g_chan_cb_log++ < 40) {
         printf("  [cb   ] -%-17s id=%-3u fn=%08x NOT FOUND, keeping all\n",
                kind, (unsigned)r_id, (unsigned)r_fn);
     }
@@ -1489,8 +1543,66 @@ static int cb_queue(const char *kind, uint32_t id, uint32_t sysdata) {
 }
 
 static void cb_pump(void);      /* defined after `g`, which it re-enters */
+static void timer_pump(void);   /* s3eTimerSetTimer callbacks; same reason */
 static void snd_pump_finished(void);  /* defined with the sound state */
+static void snd_pump_wedged(void);    /* retires channels nothing can drain */
+/* Renders a sound through the game's own generator callback; defined after
+ * `g`, because it calls into the guest. Non-zero if it played something. */
+static int snd_play_generated(GuestMem *mem, uint32_t ch, uint32_t start,
+                              uint32_t samples, uint32_t rate, uint32_t volume);
+/* Runs the end-of-sample handler for a drained channel and honours its answer;
+ * defined after `g` for the same reason. */
+static void snd_finish_channel(uint32_t ch);
 static void snd_endinfo_readback(void);
+
+/* ---- mixer self-test --------------------------------------------------
+ *
+ * The voice position was a 32-bit Q16 value, so its sample index wrapped at
+ * 65536 and any longer sound played forever without ever draining -- which is
+ * what made a repaired barricade (repair_00, buy_debris) loop. The game only
+ * plays a sound that long when someone repairs a barricade, so proving the fix
+ * would mean playing the game. This plays one on demand instead: a quiet tone
+ * well past the old wrap point, timed from start to drain. */
+#define SELFTEST_SAMPLES 100000u        /* > 65536, the old wrap point */
+#define SELFTEST_CH      15u            /* the top voice; the game works up */
+#define SELFTEST_RATE    22050u
+
+static uint64_t g_selftest_t0;
+static int      g_selftest_on;
+
+static void snd_selftest_start(void) {
+    int16_t *pcm = (int16_t *)malloc(SELFTEST_SAMPLES * sizeof(int16_t));
+    unsigned i;
+    if (!pcm) {
+        printf("  [test ] mixer selftest: out of memory\n");
+        return;
+    }
+    /* Audible enough to appear in a recording, quiet enough not to drown the
+     * game while someone is playing it. */
+    for (i = 0; i < SELFTEST_SAMPLES; i++)
+        pcm[i] = (int16_t)(((i / 25u) & 1u) ? 600 : -600);
+    snd_out_play_pcm(SELFTEST_CH, pcm, SELFTEST_SAMPLES, SELFTEST_RATE, 8);
+    free(pcm);                          /* the mixer decoded into its own copy */
+    g_selftest_t0 = armGetSystemTick();
+    g_selftest_on = 1;
+    printf("  [test ] mixer selftest: %u samples at %u Hz, expect %u ms\n",
+           (unsigned)SELFTEST_SAMPLES, (unsigned)SELFTEST_RATE,
+           (unsigned)((uint64_t)SELFTEST_SAMPLES * 1000ull / SELFTEST_RATE));
+}
+
+/* Prints once, when the voice drains. A build with the old wrap never prints:
+ * the voice stays active forever, which is exactly the failure being tested. */
+static void snd_selftest_poll(void) {
+    unsigned ms, want;
+    if (!g_selftest_on || snd_out_busy(SELFTEST_CH))
+        return;
+    ms = (unsigned)((armGetSystemTick() - g_selftest_t0) * 1000ull /
+                    armGetSystemTickFreq());
+    want = (unsigned)((uint64_t)SELFTEST_SAMPLES * 1000ull / SELFTEST_RATE);
+    g_selftest_on = 0;
+    printf("  [test ] mixer selftest: drained after %u ms (want %u) -- %s\n",
+           ms, want, (ms + 250u >= want && ms <= want + 1500u) ? "PASS" : "FAIL");
+}
 
 static void hle_device_yield(GuestCpu *cpu, GuestMem *mem, void *user) {
     (void)mem; (void)user;
@@ -1498,7 +1610,10 @@ static void hle_device_yield(GuestCpu *cpu, GuestMem *mem, void *user) {
     if (g_yields <= 3 || (g_yields % 1000) == 0)
         printf("  [yield] #%d (%d callbacks registered)\n", g_yields, g_cb_n);
     snd_pump_finished();   /* end-of-sample callbacks; see below */
+    snd_pump_wedged();
+    snd_selftest_poll();
     cb_pump();
+    timer_pump();
     snd_endinfo_readback();   /* what the handler wrote; defined below */
     cpu->r[0] = 0;
 }
@@ -2015,6 +2130,18 @@ static int      g_reload_hold = 12;      /* SND HOLD <frames>, ~200 ms at 60 */
  * frames is a hundred milliseconds: unmistakably a tap, and still long
  * enough for buy and repair, which worked on ordinary presses. */
 static int      g_use_cap = 6;           /* SND TAPMAX <frames> */
+/* Y pressed while moving sends use only once held this long (see key_update). */
+static int      g_y_use_delay = 12;      /* SND YHOLD <frames> */
+/* Aiming and sprinting are both TOGGLES in this game: one press of 74 starts
+ * aiming and the next stops it, and 78 sprints for as long as it is down. On a
+ * console pad the natural feel is the opposite of each -- hold the shoulder
+ * button to aim, click the stick once to run. Both are converted here, and
+ * both can be switched off live (SND AIMHOLD 0, SND RUNTOGGLE 0) so the game's
+ * own behaviour is one command away rather than a rebuild. */
+static int      g_aim_hold = 1;          /* SND AIMHOLD 0|1 */
+static int      g_run_toggle = 1;        /* SND RUNTOGGLE 0|1 */
+#define AIM_PULSE_FRAMES 8u              /* ~130 ms: a deliberate press */
+#define AIM_GAP_FRAMES   6u              /* key up between two presses */
 static uint32_t g_key_pulse;   /* SND KEY: one code to send next update */
 static uint32_t g_key_sends[512];
 
@@ -2230,9 +2357,35 @@ static void key_update(GuestMem *mem) {
     uint8_t now_down[512];
     u64 held;
     unsigned i, k;
+    int moving;
+    static unsigned still_frames;   /* updates since the left stick was last pushed */
+    static int y_use_ok;            /* latched when Y goes down, kept for the press */
 
     padUpdate(&g_pad);
     held = padGetButtons(&g_pad);
+
+    /* Y's use code (78) is also SPRINT, and the game tells them apart by
+     * whether you are moving, not by how long the key is down: while walking,
+     * a tap of any length starts a one-second run and the reload never
+     * happens. The tap cap cannot fix that. So a Y press that starts while the
+     * left stick is pushed -- or within STILL_FRAMES of it, while the character
+     * is still coasting to a stop -- is reload only; a press that starts from
+     * standing still is use + reload as before. 6000 is the stick deadzone
+     * used below (PAD_DEADZONE).
+     *
+     * The decision is LATCHED when Y goes down. Checking movement every frame
+     * instead flipped the use code on mid-press whenever the stick was let go,
+     * which the game read as a sprint started during the coast -- and left the
+     * running animation playing on a character that had already stopped. */
+#define STILL_FRAMES 20u
+    {
+        HidAnalogStickState ls = padGetStickPos(&g_pad, 0);
+        moving = ls.x > 6000 || ls.x < -6000 || ls.y > 6000 || ls.y < -6000;
+        if (moving)
+            still_frames = 0;
+        else if (still_frames < 0xFFFFu)
+            still_frames++;
+    }
 
     /* Which CODES are down, from every button bound to them. */
     memset(now_down, 0, sizeof now_down);
@@ -2244,6 +2397,11 @@ static void key_update(GuestMem *mem) {
         }
         if (press_frames[i] < 0xFFFFu)
             press_frames[i]++;
+        /* Driven from the edges further down instead of straight from the
+         * button: hold-to-aim and press-to-run. */
+        if ((g_aim_hold && g_key_map[i].button == HidNpadButton_ZL) ||
+            (g_run_toggle && g_key_map[i].button == HidNpadButton_StickL))
+            continue;
         /* Past its cap the PRIMARY code stops contributing, so a long squeeze
          * still reaches the game as a short tap. The second code is not
          * capped: Y carries use and reload together, and they want opposite
@@ -2251,11 +2409,70 @@ static void key_update(GuestMem *mem) {
          * reload wants the hold that makes it fire instantly. */
         cap = g_key_map[i].button == HidNpadButton_Y ? g_use_cap
                                                     : g_key_map[i].cap;
-        if (!(cap > 0 && press_frames[i] > (unsigned)cap) &&
-            g_key_map[i].game && g_key_map[i].game < 512)
+        if (g_key_map[i].button == HidNpadButton_Y && press_frames[i] == 1)
+            y_use_ok = !moving && still_frames >= STILL_FRAMES;
+        if (g_key_map[i].button == HidNpadButton_Y && !y_use_ok) {
+            /* Pressed on the move: a TAP is reload only, and HOLDING past
+             * g_y_use_delay adds use, so buying and repairing still work while
+             * walking -- the way Square is held on a console. Held over
+             * nothing, that is a sprint for exactly as long as it is held,
+             * which a deliberate hold is asking for; the accidental one-second
+             * run on a tap is what this removes. */
+            if (press_frames[i] > (unsigned)g_y_use_delay &&
+                g_key_map[i].game && g_key_map[i].game < 512)
+                now_down[g_key_map[i].game] = 1;
+        } else if (!(cap > 0 && press_frames[i] > (unsigned)cap) &&
+                   g_key_map[i].game && g_key_map[i].game < 512) {
             now_down[g_key_map[i].game] = 1;
+        }
         if (g_key_map[i].alt && g_key_map[i].alt < 512)
             now_down[g_key_map[i].alt] = 1;
+    }
+
+    /* Hold ZL to aim: the game toggles aiming on each press of 74, so holding
+     * is that toggle driven from BOTH edges -- one pulse when ZL goes down,
+     * another when it comes up. A pulse rather than a single frame because the
+     * game samples key state once a frame and a one-frame press can fall
+     * between two samples. */
+    /* Tracked as STATE, not edges. Retriggering one pulse on each edge merged
+     * a quick tap's press and release into a single press: the release landed
+     * while the "aim on" pulse was still down, the game saw one toggle, and the
+     * player stayed aimed until ZL was pressed again. Now the game's aim state
+     * is followed as we believe it to be, and a separate press -- down, then a
+     * gap up so the game sees two -- is sent whenever it differs from ZL. */
+    if (g_aim_hold) {
+        static int game_aiming;             /* what our toggles have left it at */
+        static unsigned phase;              /* frames left in the current step */
+        static int pressing;                /* 1 while 74 is down, 0 in the gap */
+        const int want = (held & HidNpadButton_ZL) != 0;
+        if (phase) {
+            phase--;
+            if (pressing)
+                now_down[XKEY_AIM] = 1;
+            if (!phase && pressing) {
+                pressing = 0;
+                game_aiming = !game_aiming; /* the press is complete */
+                phase = AIM_GAP_FRAMES;     /* key up long enough to see */
+            }
+        } else if (want != game_aiming) {
+            pressing = 1;
+            phase = AIM_PULSE_FRAMES;
+            now_down[XKEY_AIM] = 1;
+        }
+    }
+
+    /* Click L3 to run: latch 78 down until L3 is clicked again. It has to
+     * unlatch when the character stops, because 78 is also USE -- held over
+     * nothing it buys and repairs instead of sprinting, which is the same
+     * collision the Y handling above works around. */
+    if (g_run_toggle) {
+        static int run_latched;
+        if ((held & HidNpadButton_StickL) && !(prev & HidNpadButton_StickL))
+            run_latched = !run_latched;
+        if (!moving && still_frames >= STILL_FRAMES)
+            run_latched = 0;
+        if (run_latched)
+            now_down[XKEY_ACTION_SPRINT] = 1;
     }
 
     /* Stretch a tap into a hold for any code that asks for one. The key stays
@@ -3884,6 +4101,8 @@ static void snd_trace(void *user, const GuestCpu *cpu) {
 }
 
 static uint8_t  g_snd_playing[SND_CHANNELS];
+static uint8_t  g_snd_paused[SND_CHANNELS];   /* s3eSoundChannelPause; GetInt 5 */
+static uint8_t  g_snd_wedged[SND_CHANNELS];   /* yields seen playing-but-silent */
 
 /* Per-channel state. Recorded now for the trace, but this is the state a mixer
  * has to keep regardless, so it is kept properly rather than printed and
@@ -3900,6 +4119,8 @@ typedef struct {
     uint32_t repeat;
     uint32_t prop[8];           /* whatever else it sets, by id */
     uint32_t prop_seen;
+    uint8_t  desc_fresh;        /* property 2 set since the last Play */
+    uint8_t  was_adpcm;         /* how the current sound was started, for a repeat */
 } SndChannel;
 
 static SndChannel g_snd[SND_CHANNELS];
@@ -3990,12 +4211,19 @@ static void snd_pump_finished(void) {
     unsigned ch;
     /* Taken unconditionally: leaving the mask standing while the callback is
      * off would fire a burst of stale ones the moment it is switched back. */
-    if (!g_snd_endcb)
+    if (!g_snd_endcb) {
+        /* STATUS reads g_snd_playing, so a drained voice must still clear it. */
+        for (ch = 0; ch < SND_CHANNELS; ch++)
+            if (done & (1u << ch))
+                g_snd_playing[ch] = 0;
         return;
+    }
     for (ch = 0; ch < SND_CHANNELS && done; ch++) {
         if (!(done & (1u << ch)))
             continue;
         done &= ~(1u << ch);
+        if (!g_snd_playing[ch])
+            continue;              /* not the game's voice (the selftest tone) */
         g_snd_playing[ch] = 0;
         if (g_snd_end_shown < 20) {
             g_snd_end_shown++;
@@ -4007,22 +4235,65 @@ static void snd_pump_finished(void) {
          * streamed sound continues. Reported rather than guessed at. */
         if (!g_memp)
             continue;
-        {
-            uint32_t info = ENDINFO_ADDR(ch);
-            unsigned k;
-            for (k = 0; k < ENDINFO_STRIDE; k += 4u)
-                guest_st32(g_memp, info + k, 0);
-            guest_st32(g_memp, info + 0u, ch);
-            g_endinfo_pending = info;
-            cb_queue("s3eSoundChannel", 0, info);
+        snd_finish_channel(ch);
+    }
+}
+
+/* STATUS follows g_snd_playing, not the mixer. The mixer drains a voice on its
+ * own thread, but the end-of-sample decision (and a looping sound's restart)
+ * only happens at the next yield. Answering from the mixer let the game poll
+ * STATUS inside that gap, see 0, and retire the sound instance without ever
+ * calling Stop -- after which the restart kept the loop going with nobody left
+ * to fade it or stop it. That was the endless teleporter and barricade-repair
+ * sounds. Real Marmalade loops inside the mixer, so there is no such gap.
+ * g_snd_playing is cleared only by Stop or by an end-of-sample that stops. */
+/* A channel leaves "playing" through a drain, a Stop, or an end-of-sample that
+ * says stop. If the mixer is live and holds no voice for a channel that is not
+ * paused, none of those will ever happen: the play started nothing, or its
+ * voice was replaced. Retire it after a few yields, so the game can have the
+ * channel back. Without this, one such channel is lost for the whole run. */
+static void snd_pump_wedged(void) {
+    static unsigned wedge_log;
+    unsigned ch;
+    if (!g_snd_live)
+        return;
+    for (ch = 0; ch < SND_CHANNELS; ch++) {
+        if (!g_snd_playing[ch] || g_snd_paused[ch] || snd_out_busy(ch)) {
+            g_snd_wedged[ch] = 0;
+            continue;
         }
+        if (++g_snd_wedged[ch] < 3u)
+            continue;
+        g_snd_wedged[ch] = 0;
+        g_snd_playing[ch] = 0;
+        if (wedge_log < 50u) {
+            wedge_log++;
+            printf("  [snd  ] ch%u had no voice: freeing it\n", (unsigned)ch);
+        }
+    }
+}
+
+/* A voice with most of its audio left, ended by something other than reaching
+ * its end, is a sound the player hears cut off. Reported with what did it. */
+static void snd_report_cut(uint32_t ch, const char *why) {
+    static unsigned cut_log;
+    uint32_t left = 0, total = 0;
+    if (ch >= SND_CHANNELS)
+        return;
+    snd_out_progress(ch, &left, &total);
+    if (!total || left * 4u < total)          /* past three quarters: not a cut */
+        return;
+    if (cut_log < 2000u) {
+        cut_log++;
+        printf("  [snd  ] ch%u CUT with %u of %u samples left: %s\n",
+               (unsigned)ch, (unsigned)left, (unsigned)total, why);
     }
 }
 
 static int snd_channel_busy(uint32_t ch) {
     if (ch >= SND_CHANNELS)
         return 0;
-    return g_snd_live ? snd_out_busy(ch) : (int)g_snd_playing[ch];
+    return (int)g_snd_playing[ch];
 }
 
 static void logprop(const char *who, uint32_t prop, uint32_t v,
@@ -4035,35 +4306,72 @@ static void logprop(const char *who, uint32_t prop, uint32_t v,
 
 /* s3eSoundGetInt: 0 is S3E_SOUND_NUM_CHANNELS in every Marmalade build I can
  * check against, and answering 0 there is what leaves the mixer unbuilt. */
+/* s3eSoundGetInt / SetInt, numbered as Marmalade -- and as the PortMaster
+ * reference, which plays every sound in this game -- number them:
+ *   0 VOLUME (0..256)  1 DEFAULT_FREQ  2 OUTPUT_FREQ  3 NUM_CHANNELS
+ *   5 AVAILABLE        7 STEREO        anything else -1
+ *
+ * This used to answer 0 with the channel count and 3 with 1. The game copies
+ * property 3 into its sound manager's channel limit and rejects any free
+ * channel at or above it (RVA 0xd75e6), so it could only ever use channel 0:
+ * a sound that started while another was playing was simply dropped. And
+ * property 0 told it the master volume was 16 of 256. */
+static uint32_t g_snd_volume = 256u;
+static uint32_t g_snd_rate = 22050u;
+
 static void hle_sound_getint(GuestCpu *cpu, GuestMem *mem, void *user) {
     static uint32_t seen;
     uint32_t prop = cpu->r[0], v;
     (void)mem; (void)user;
     switch (prop) {
-    case 0:  v = SND_CHANNELS; break;      /* NUM_CHANNELS  */
-    case 1:  v = 1;            break;      /* AVAILABLE     */
-    case 2:  v = 44100;        break;      /* OUTPUT_FREQ   */
-    case 3:  v = 1;            break;      /* STEREO/other  */
-    default: v = 1;            break;
+    case 0:  v = g_snd_volume;  break;     /* VOLUME       */
+    case 1:  v = 22050u;        break;     /* DEFAULT_FREQ */
+    case 2:  v = g_snd_rate;    break;     /* OUTPUT_FREQ  */
+    case 3:  v = SND_CHANNELS;  break;     /* NUM_CHANNELS */
+    case 5:  v = 1;             break;     /* AVAILABLE    */
+    case 7:  v = 1;             break;     /* STEREO       */
+    default: v = 0xFFFFFFFFu;   break;
     }
     logprop("SoundGetInt", prop, v, &seen);
     cpu->r[0] = v;
 }
 
 static void hle_sound_setint(GuestCpu *cpu, GuestMem *mem, void *user) {
+    uint32_t prop = cpu->r[0], val = cpu->r[1];
     (void)mem; (void)user;
-    cpu->r[0] = 0;                          /* S3E_RESULT_SUCCESS */
+    if (prop == 0u) {                       /* VOLUME: master for every sample */
+        g_snd_volume = (int32_t)val < 0 ? 0u : (val > 256u ? 256u : val);
+        snd_out_set_master(g_snd_volume);
+        cpu->r[0] = 0;
+    } else if (prop == 2u) {
+        g_snd_rate = val;
+        cpu->r[0] = 0;
+    } else {
+        cpu->r[0] = 1;                      /* S3E_RESULT_ERROR */
+    }
 }
+
+/* s3eAudioGetInt / SetInt, Marmalade numbering (as the reference port):
+ *   0 VOLUME (0..256)  1 STATUS (0 stopped, 1 playing, 2 paused)
+ *   4 CHANNEL (selected stream)  5 NUM_CHANNELS  6, 9 AVAILABLE  else -1
+ *
+ * The music manager polls STATUS every frame and wipes its state -- a queued
+ * track included -- the moment it reads 0 (RVA 0x1b9ea4), so a PAUSED stream
+ * has to say 2, not 0. There is one stream here, so only channel 0 selects. */
+static uint32_t g_audio_volume = 256u;
 
 static void hle_audio_getint(GuestCpu *cpu, GuestMem *mem, void *user) {
     static uint32_t seen;
     uint32_t prop = cpu->r[0], v;
     (void)mem; (void)user;
     switch (prop) {
-    case 0:  v = 1;   break;                /* AVAILABLE  */
-    case 1:  v = g_audio_hle ? (uint32_t)snd_music_playing() : 0u; break;
-    case 2:  v = 256; break;                /* VOLUME (S3E_AUDIO_MAX_VOLUME) */
-    default: v = 1;   break;
+    case 0:  v = g_audio_volume; break;
+    case 1:  v = g_audio_hle ? (uint32_t)snd_music_status() : 0u; break;
+    case 4:  v = 0;  break;
+    case 5:  v = 1;  break;
+    case 6:
+    case 9:  v = 1;  break;
+    default: v = 0xFFFFFFFFu; break;
     }
     logprop("AudioGetInt", prop, v, &seen);
     cpu->r[0] = v;
@@ -4072,9 +4380,15 @@ static void hle_audio_getint(GuestCpu *cpu, GuestMem *mem, void *user) {
 static void hle_audio_setint(GuestCpu *cpu, GuestMem *mem, void *user) {
     uint32_t prop = cpu->r[0], val = cpu->r[1];
     (void)mem; (void)user;
-    if (prop == 2u)                         /* VOLUME, same scale as GetInt */
-        snd_music_set_volume(val);
-    cpu->r[0] = 0;
+    if (prop == 0u) {                       /* VOLUME */
+        g_audio_volume = (int32_t)val < 0 ? 0u : (val > 256u ? 256u : val);
+        snd_music_set_volume(g_audio_volume);
+        cpu->r[0] = 0;
+    } else if (prop == 4u) {                /* CHANNEL: only stream 0 exists */
+        cpu->r[0] = val == 0u ? 0u : 1u;
+    } else {
+        cpu->r[0] = 1;                      /* S3E_RESULT_ERROR */
+    }
 }
 
 /* s3eAudioPlay(filename, repeatCount). The game names its tracks with paths
@@ -4096,7 +4410,7 @@ static void hle_audio_play(GuestCpu *cpu, GuestMem *mem, void *user) {
     snd_trace(user, cpu);
     gstr(mem, cpu->r[0], name, sizeof name);
     printf("  [mus  ] s3eAudioPlay(%s, repeat=%u)\n", name, (unsigned)repeat);
-    cpu->r[0] = snd_music_play(name, repeat == 0u, 256u) ? 0u : 1u;
+    cpu->r[0] = snd_music_play(name, repeat == 0u, g_audio_volume) ? 0u : 1u;
 }
 
 static void hle_audio_stop(GuestCpu *cpu, GuestMem *mem, void *user) {
@@ -4177,6 +4491,67 @@ static void hle_sound_getfreechannel(GuestCpu *cpu, GuestMem *mem, void *user) {
     cpu->r[0] = 0xFFFFFFFFu;
 }
 
+/* Start (or restart) the voice for what the channel currently holds: c->buf,
+ * c->samples, and how it was first played (c->was_adpcm). Shared by Play and by
+ * an end-of-sample handler asking for the sound to continue, so a repeat
+ * decodes exactly the way the first pass did. */
+/* Non-zero if a voice really started. The caller needs to know: STATUS is
+ * answered from g_snd_playing now, so a play that starts nothing must not
+ * leave the channel marked playing -- nothing would ever drain it, the game
+ * would never take that channel back, and with sixteen of them a few such
+ * wedges leave the quiet sounds (ambience) with nowhere to play. */
+static int snd_start_voice(GuestMem *mem, uint32_t ch, SndChannel *c) {
+    const uint32_t rate = c->rate ? c->rate : 22050u;
+    if (!c->was_adpcm && snd_play_generated(mem, ch, c->buf, c->samples, rate,
+                                            c->prop[3]))
+        return 1;
+    if (c->was_adpcm) {
+        /* r2 counts compressed bytes in PAIRS, not samples: the descriptor
+         * gives 11264 bytes for an r2 of 5632. */
+        const uint32_t bytes = c->samples * 2u;
+        const void *src = guest_ptr(mem, c->buf, bytes);
+        uint32_t block = 512u;
+        guest_ld32(mem, c->prop[2] + 0x28u, &block);
+        if (block < 5u || block > 4096u)
+            block = 512u;
+        if (!src)
+            return 0;
+        {
+            /* The descriptor 48 bytes ahead of the data states the sound's own
+             * length and rate: +0x10 compressed bytes, +0x14 decoded samples,
+             * +0x1c rate, +0x28 block. A sound that stops early is either
+             * decoded short (fewer samples than +0x14 for the whole sound) or
+             * played fast (our rate above the descriptor's), and this says
+             * which -- guessing between them from the sound is hopeless. */
+            uint32_t d_bytes = 0, d_samples = 0, d_rate = 0, got;
+            static unsigned desc_log;
+            guest_ld32(mem, c->prop[2] + 0x10u, &d_bytes);
+            guest_ld32(mem, c->prop[2] + 0x14u, &d_samples);
+            guest_ld32(mem, c->prop[2] + 0x1cu, &d_rate);
+            got = snd_out_play(ch, src, bytes, block, rate, c->prop[3]);
+            if (desc_log < 2000u &&
+                (d_rate != rate || (d_bytes && bytes > d_bytes) ||
+                 (uint64_t)got * 20ull < (uint64_t)d_samples * 19ull)) {
+                desc_log++;
+                printf("  [snd  ] ch%u MISMATCH rate=%u desc_rate=%u "
+                       "bytes=%u/%u decoded=%u desc_samples=%u\n",
+                       (unsigned)ch, (unsigned)rate, (unsigned)d_rate,
+                       (unsigned)bytes, (unsigned)d_bytes, (unsigned)got,
+                       (unsigned)d_samples);
+            }
+        }
+    } else {
+        /* No generator and no descriptor: plain 16-bit mono PCM, as the
+         * s3eSound API itself defines the buffer. */
+        const int16_t *src = (const int16_t *)guest_ptr(mem, c->buf,
+                                                        c->samples * 2u);
+        if (!src)
+            return 0;
+        snd_out_play_pcm(ch, src, c->samples, rate, c->prop[3]);
+    }
+    return 1;
+}
+
 /* s3eSoundChannelPlay(channel, start, numSamples, repeatCount, ...). */
 static void hle_sound_channel_play(GuestCpu *cpu, GuestMem *mem, void *user) {
     uint32_t ch = cpu->r[0];
@@ -4185,28 +4560,61 @@ static void hle_sound_channel_play(GuestCpu *cpu, GuestMem *mem, void *user) {
     if (ch < SND_CHANNELS) {
         SndChannel *c = &g_snd[ch];
         g_snd_playing[ch] = 1;
+        g_snd_paused[ch] = 0;
         c->buf = cpu->r[1];
         c->samples = cpu->r[2];
         c->repeat = cpu->r[3];
-        /* 16-bit mono, so samples*2 bytes; guest_ptr refuses a span that
-         * leaves the region, which is the check that matters before handing a
-         * length to memcpy. */
         {
-            /* r2 counts compressed bytes in PAIRS, not samples: the descriptor
-             * gives 11264 bytes for an r2 of 5632, and 4608 for 2304. So the
-             * span to read is samples*2, which is also what the block count
-             * divides evenly. */
-            const uint32_t bytes = c->samples * 2u;
-            const void *src = guest_ptr(mem, c->buf, bytes);
-            uint32_t block = 512u;
-            if (c->prop[2])
-                guest_ld32(mem, c->prop[2] + 0x28u, &block);
-            if (block < 5u || block > 4096u)
-                block = 512u;
-            if (src)
-                snd_out_play(ch, src, bytes, block,
-                             c->rate ? c->rate : 22050u, c->prop[3]);
+            /* Compact and nearly uncapped: which sound the game keeps
+             * re-playing is a question about minutes of play, which the
+             * call-count cap on snd_trace never reaches. */
+            static unsigned play_log;
+            if (play_log < 20000u) {
+                /* Every play enters through one IwSound function, so lr alone
+                 * names nothing. Return-address-looking words on the guest
+                 * stack (odd = Thumb, inside the image) name who asked. */
+                char bt[96];
+                unsigned k, nbt = 0;
+                size_t used = 0;
+                bt[0] = 0;
+                for (k = 0; k < 256u && nbt < 6u; k += 4u) {
+                    uint32_t w = 0;
+                    if (!guest_ld32(mem, cpu->r[13] + k, &w))   /* non-zero = ok */
+                        break;
+                    if ((w & 1u) && w >= 0x800000u && w < 0xc10000u) {
+                        int n = snprintf(bt + used, sizeof bt - used, " %06x",
+                                         (unsigned)(w - 0x800001u));
+                        if (n < 0 || (size_t)n >= sizeof bt - used)
+                            break;
+                        used += (size_t)n;
+                        nbt++;
+                    }
+                }
+                play_log++;
+                printf("  [snd  ] PLAY ch%u n=%u desc=%08x vol=%u lr=%08x bt(rva):%s\n",
+                       (unsigned)ch, (unsigned)c->samples, (unsigned)c->prop[2],
+                       (unsigned)c->prop[3], (unsigned)cpu->r[GUEST_LR], bt);
+            }
         }
+        /* The game's own generator first. Its sound manager registers an
+         * S3E_CHANNEL_GEN_AUDIO callback on the channel for EVERY sample type
+         * before it plays (RVA 0xd7626 / 0xd764e / 0xd7674) and expects the
+         * platform to pull decoded audio from it -- which is exactly how the
+         * PortMaster reference plays this game. Only one of the three types
+         * happened to be IMA ADPCM with a descriptor we could decode ourselves,
+         * so everything of the other two was silent. The native paths below
+         * remain only for a play with no generator registered. */
+        /* Except IMA ADPCM, which we decode natively. The game's ADPCM
+         * generator (RVA 0xd76a9 -> 0xd65c8) reads the very descriptor it sets
+         * through property 2 right before such a play, and running it cost
+         * ~100 ms of guest time per sound on the game thread -- an audible
+         * hitch every time one started. A descriptor set for THIS play is the
+         * signal; the other sample types never set one. */
+        c->was_adpcm = (uint8_t)(c->desc_fresh && c->prop[2]);
+        c->desc_fresh = 0;
+        snd_report_cut(ch, "replaced by a new play");
+        if (!snd_start_voice(mem, ch, c))
+            g_snd_playing[ch] = 0;   /* nothing to drain it otherwise */
         /* One look at the data, to settle 8- vs 16-bit and mono vs stereo.
          *
          * Read as int16, real audio is a smooth low-magnitude walk around
@@ -4275,13 +4683,51 @@ static void hle_sound_channel_play(GuestCpu *cpu, GuestMem *mem, void *user) {
 
 static void hle_sound_channel_stop(GuestCpu *cpu, GuestMem *mem, void *user) {
     uint32_t ch = cpu->r[0];
+    static unsigned stop_log;
     (void)mem;
     snd_trace(user, cpu);
+    /* Uncapped (well, 300): whether the game ever stops a looping sound is a
+     * question about the END of a session, which the call-count cap on
+     * snd_trace never reaches. */
+    if (stop_log < 20000u) {
+        stop_log++;
+        printf("  [snd  ] stop ch%u (lr=%08x)\n", (unsigned)ch,
+               (unsigned)cpu->r[GUEST_LR]);
+    }
     if (ch < SND_CHANNELS) {
+        snd_report_cut(ch, "stop");
         g_snd_playing[ch] = 0;
+        g_snd_paused[ch] = 0;
         snd_out_stop(ch);
     }
     cpu->r[0] = 0;
+}
+
+/* s3eSoundChannelPause / Resume(channel). The game pauses every live sound
+ * instance when its pause menu opens (RVA 0xd7356 walks the instance list and
+ * calls each one's pause) and resumes them on the way out. Both used to be
+ * no-ops, so whatever was playing carried on under the pause menu. STATUS
+ * (GetInt 4) stays 1 while paused and PAUSED (GetInt 5) says 1: IsPlaying
+ * (RVA 0xd85f4) reads the pair exactly that way. */
+static void snd_channel_set_paused(GuestCpu *cpu, int paused) {
+    uint32_t ch = cpu->r[0];
+    if (ch < SND_CHANNELS && g_snd_playing[ch]) {
+        g_snd_paused[ch] = paused ? 1u : 0u;
+        snd_out_pause(ch, paused);
+    }
+    cpu->r[0] = 0;                          /* S3E_RESULT_SUCCESS */
+}
+
+static void hle_sound_channel_pause(GuestCpu *cpu, GuestMem *mem, void *user) {
+    (void)mem;
+    snd_trace(user, cpu);
+    snd_channel_set_paused(cpu, 1);
+}
+
+static void hle_sound_channel_resume(GuestCpu *cpu, GuestMem *mem, void *user) {
+    (void)mem;
+    snd_trace(user, cpu);
+    snd_channel_set_paused(cpu, 0);
 }
 
 /* s3eSoundChannelGetInt(channel, prop). Property 0 is STATUS: non-zero means
@@ -4293,10 +4739,23 @@ static void hle_sound_channel_getint(GuestCpu *cpu, GuestMem *mem, void *user) {
      * end-of-sample event yet, so a channel that stays busy until an explicit
      * Stop is a channel the game will never reuse -- and with sixteen of them
      * that is silence a few seconds into a firefight. */
-    if (prop == 0)
-        cpu->r[0] = (uint32_t)snd_channel_busy(ch);
-    else
-        cpu->r[0] = 0;
+    /* Numbered as the reference: 0 RATE scale (0x10000 = as recorded), 1 RATE,
+     * 2 user value, 3 VOLUME, 4 STATUS (playing), 5 PAUSED. Property 0 used to
+     * be answered as status; the game has never polled it, so that was
+     * harmless, but it is the kind of wrong answer that waits to bite. */
+    if (ch >= SND_CHANNELS) {
+        cpu->r[0] = 0xFFFFFFFFu;
+    } else {
+        switch (prop) {
+        case 0:  cpu->r[0] = g_snd[ch].prop[0] ? g_snd[ch].prop[0] : 0x10000u; break;
+        case 1:  cpu->r[0] = g_snd[ch].rate ? g_snd[ch].rate : 22050u; break;
+        case 2:  cpu->r[0] = g_snd[ch].prop[2]; break;
+        case 3:  cpu->r[0] = g_snd[ch].prop[3] ? g_snd[ch].prop[3] : 256u; break;
+        case 4:  cpu->r[0] = (uint32_t)snd_channel_busy(ch); break;
+        case 5:  cpu->r[0] = g_snd_paused[ch]; break;
+        default: cpu->r[0] = 0xFFFFFFFFu; break;
+        }
+    }
     if (g_snd_stat_shown < 40) {
         g_snd_stat_shown++;
         printf("  [snd  ]   ChannelGetInt(ch%u, %u) -> %u\n",
@@ -4323,6 +4782,8 @@ static void hle_sound_channel_setint(GuestCpu *cpu, GuestMem *mem, void *user) {
         SndChannel *c = &g_snd[ch];
         if (prop < 8) {
             c->prop[prop] = val;
+            if (prop == 2u)
+                c->desc_fresh = 1;
             if (!(c->prop_seen & (1u << prop))) {
                 c->prop_seen |= 1u << prop;
                 printf("  [snd  ] ch%u property %u = %u (0x%x)\n",
@@ -4338,8 +4799,19 @@ static void hle_sound_channel_setint(GuestCpu *cpu, GuestMem *mem, void *user) {
          * it is the only small non-rate value it sets, so it is the volume.
          * 256 is taken as unity; if everything turns out half as loud as it
          * should be, this scale is where to look. */
-        if (prop == 3u)
+        if (prop == 3u) {
+            static unsigned vol_log;
+            static uint32_t last_vol[SND_CHANNELS];
+            /* Changes only: distance fades and the fade-to-zero stop of a
+             * looping sound are what this shows. */
+            if (val != last_vol[ch] && vol_log < 5000u) {
+                vol_log++;
+                printf("  [snd  ] ch%u volume %u -> %u\n", (unsigned)ch,
+                       (unsigned)last_vol[ch], (unsigned)val);
+            }
+            last_vol[ch] = val;
             snd_out_set_volume(ch, val);
+        }
     }
     cpu->r[0] = 0;
 }
@@ -4702,6 +5174,289 @@ static void cb_pump(void) {
     }
 }
 
+/* ---- one-shot timers --------------------------------------------------
+ *
+ * s3eTimerSetTimer(ms, fn, userData) calls fn(NULL, userData) once, ms later;
+ * s3eTimerCancelTimer(fn, userData) removes it. Both were unbound, so they fell
+ * to hle_default -- "success" -- and the callback never ran.
+ *
+ * The main menu's music is exactly such a callback. GameStateFrontEnd arms a
+ * 1500 ms timer (RVA 0x190ac2) whose handler (RVA 0x1908f4) asks the music
+ * manager for blackops-music/mus_theatre_underscore.mp3, and cancels it again on
+ * the way out (RVA 0x190b3a) just before stopping the music -- which is the
+ * s3eAudioStop every session logged at the menu-to-game transition, stopping a
+ * track that had never started.
+ *
+ * Fired from s3eDeviceYield like every other callback, because that is the one
+ * point where re-entering guest code is safe. A timer is cleared before its
+ * handler runs, so the handler is free to arm a new one. */
+#define MAX_TIMERS 16
+static struct { uint32_t fn, user, due; int used; } g_timers[MAX_TIMERS];
+static unsigned g_timer_log;
+
+static uint32_t timer_now_ms(void) {
+    if (g_clock_fixed)
+        return g_ticks;
+    {
+        uint64_t now = armGetSystemTick();
+        if (!g_clock_base)
+            g_clock_base = now;
+        return (uint32_t)(((now - g_clock_base) * 1000ull) / armGetSystemTickFreq());
+    }
+}
+
+static void hle_timer_set(GuestCpu *cpu, GuestMem *mem, void *user) {
+    uint32_t ms = cpu->r[0], fn = cpu->r[1], ud = cpu->r[2];
+    int i, slot = -1;
+    (void)mem; (void)user;
+    /* Re-arming the same (fn, userData) restarts it rather than stacking a
+     * second copy. */
+    for (i = 0; i < MAX_TIMERS && slot < 0; i++)
+        if (g_timers[i].used && g_timers[i].fn == fn && g_timers[i].user == ud)
+            slot = i;
+    for (i = 0; i < MAX_TIMERS && slot < 0; i++)
+        if (!g_timers[i].used)
+            slot = i;
+    if (slot < 0 || !fn) {
+        cpu->r[0] = 1;                      /* S3E_RESULT_ERROR */
+        return;
+    }
+    g_timers[slot].fn = fn;
+    g_timers[slot].user = ud;
+    g_timers[slot].due = timer_now_ms() + ms;
+    g_timers[slot].used = 1;
+    if (g_timer_log < 40) {
+        g_timer_log++;
+        printf("  [timer] set %u ms fn=%08x user=%08x\n",
+               (unsigned)ms, (unsigned)fn, (unsigned)ud);
+    }
+    cpu->r[0] = 0;                          /* S3E_RESULT_SUCCESS */
+}
+
+static void hle_timer_cancel(GuestCpu *cpu, GuestMem *mem, void *user) {
+    uint32_t fn = cpu->r[0], ud = cpu->r[1];
+    int i, n = 0;
+    (void)mem; (void)user;
+    for (i = 0; i < MAX_TIMERS; i++)
+        if (g_timers[i].used && g_timers[i].fn == fn && g_timers[i].user == ud) {
+            g_timers[i].used = 0;
+            n++;
+        }
+    if (g_timer_log < 40) {
+        g_timer_log++;
+        printf("  [timer] cancel fn=%08x user=%08x (%d pending removed)\n",
+               (unsigned)fn, (unsigned)ud, n);
+    }
+    cpu->r[0] = 0;
+}
+
+static void timer_pump(void) {
+    uint32_t now = timer_now_ms();
+    int i;
+    for (i = 0; i < MAX_TIMERS; i++) {
+        uint32_t fn, ud;
+        GuestStatus st;
+        if (!g_timers[i].used || (int32_t)(now - g_timers[i].due) < 0)
+            continue;
+        fn = g_timers[i].fn;
+        ud = g_timers[i].user;
+        g_timers[i].used = 0;
+        if (g_timer_log < 40) {
+            g_timer_log++;
+            printf("  [timer] fire fn=%08x user=%08x\n", (unsigned)fn, (unsigned)ud);
+        }
+        st = guest_call(&g, fn, 0, ud);
+        if (st != GUEST_OK)
+            printf("  [timer] fn=%08x stopped: %s\n", (unsigned)fn,
+                   guest_status_str(st));
+    }
+}
+
+/* ---- sound generators -------------------------------------------------
+ *
+ * Rendered whole at Play time, on the guest thread, by calling the channel's
+ * S3E_CHANNEL_GEN_AUDIO callback in chunks until it sets endSample -- the way
+ * the PortMaster reference plays every sound in this game. Doing it at Play
+ * time rather than from the mixer is what keeps guest code on the one thread
+ * allowed to run it; sounds here are short, so the cost is a burst, not a
+ * stream.
+ *
+ * The info block is s3eSoundGenAudioInfo: channel, target, numSamples, mix,
+ * origStart, origNumSamples, origRepeat, endSample -- eight words, one scratch
+ * block per channel, in guest memory because the callback writes through it. */
+#define GEN_CHUNK 32768u    /* few calls per sound: each one is a guest round trip */
+static uint32_t g_gen_target[SND_CHANNELS], g_gen_info[SND_CHANNELS];
+static int16_t *g_gen_pcm;
+static uint32_t g_gen_cap;
+static unsigned g_gen_log;
+
+static int snd_play_generated(GuestMem *mem, uint32_t ch, uint32_t start,
+                              uint32_t samples, uint32_t rate, uint32_t volume) {
+    int slot;
+    uint32_t written = 0, limit, calls = 0;
+    if (ch >= SND_CHANNELS)
+        return 0;
+    slot = cb_find_chan("s3eSoundChannel", ch, 1u);
+    if (slot < 0 || !g_cbs[slot].used || !g_cbs[slot].fn)
+        return 0;
+    if (samples > 0x100000u)                /* bounds the expansion below */
+        return 0;
+    limit = samples * 8u + GEN_CHUNK;       /* ADPCM expands ~2x; generous */
+    if (!g_gen_target[ch])
+        g_gen_target[ch] = galloc(GEN_CHUNK * 2u);
+    if (!g_gen_info[ch])
+        g_gen_info[ch] = galloc(32u);
+    if (!g_gen_target[ch] || !g_gen_info[ch])
+        return 0;
+
+    for (calls = 0; calls < 4096u; ) {
+        uint32_t requested = GEN_CHUNK, produced = 0, end = 0;
+        const void *src;
+        GuestStatus st;
+        if (written + requested > limit)
+            requested = limit - written;
+        if (!requested)
+            break;
+        guest_st32(mem, g_gen_info[ch] + 0u, ch);
+        guest_st32(mem, g_gen_info[ch] + 4u, g_gen_target[ch]);
+        guest_st32(mem, g_gen_info[ch] + 8u, requested);
+        guest_st32(mem, g_gen_info[ch] + 12u, 0);         /* mix: no */
+        guest_st32(mem, g_gen_info[ch] + 16u, start);
+        guest_st32(mem, g_gen_info[ch] + 20u, samples);
+        guest_st32(mem, g_gen_info[ch] + 24u, 0);         /* origRepeat */
+        guest_st32(mem, g_gen_info[ch] + 28u, 0);         /* endSample */
+        st = guest_call_r0(&g, g_cbs[slot].fn, g_gen_info[ch], g_cbs[slot].user,
+                           &produced);
+        calls++;
+        if (st != GUEST_OK) {
+            printf("  [snd  ] ch%u generator fn=%08x stopped: %s\n", (unsigned)ch,
+                   (unsigned)g_cbs[slot].fn, guest_status_str(st));
+            return 0;
+        }
+        guest_ld32(mem, g_gen_info[ch] + 28u, &end);
+        if ((int32_t)produced < 0 || produced > requested)
+            return 0;
+        if (produced) {
+            if (g_gen_cap < written + produced) {
+                uint32_t cap = g_gen_cap ? g_gen_cap : GEN_CHUNK;
+                int16_t *p;
+                while (cap < written + produced)
+                    cap *= 2u;
+                p = (int16_t *)realloc(g_gen_pcm, cap * sizeof(int16_t));
+                if (!p)
+                    return 0;
+                g_gen_pcm = p;
+                g_gen_cap = cap;
+            }
+            src = guest_ptr(mem, g_gen_target[ch], produced * 2u);
+            if (!src)
+                return 0;
+            memcpy(g_gen_pcm + written, src, produced * 2u);
+            written += produced;
+        }
+        if (end || !produced)                /* finished, or no progress */
+            break;
+    }
+    if (!written)
+        return 0;
+    snd_out_play_pcm(ch, g_gen_pcm, written, rate, volume);
+    if (g_gen_log < 30) {
+        g_gen_log++;
+        printf("  [snd  ] ch%u generated %u samples from %u in %u call(s), fn=%08x\n",
+               (unsigned)ch, (unsigned)written, (unsigned)samples,
+               (unsigned)calls, (unsigned)g_cbs[slot].fn);
+    }
+    return 1;
+}
+
+/* ---- end of sample ----------------------------------------------------
+ *
+ * Marmalade calls the END_SAMPLE handler the moment a sample runs out and
+ * takes its RETURN VALUE as the decision: non-zero keeps the channel playing --
+ * the same data again, or whatever the handler left in newData/numSamples --
+ * and zero lets it stop. (The PortMaster reference does exactly this in
+ * service_finished_sound.) This port queued the handler for later and threw the
+ * answer away, so every sound stopped after one pass.
+ *
+ * That is what made the teleporter loop forever. Its sound is meant to repeat a
+ * fixed number of times: the game's handler (RVA 0xd8820) counts a repeat
+ * counter down and keeps returning "continue" until it runs out. Stopped after
+ * pass one instead, the game's own bookkeeping still believed the loop live
+ * and kept re-triggering the sound from scratch -- endlessly, with gaps.
+ *
+ * The info block is s3eSoundEndSampleInfo: channel, repsRemaining, newData,
+ * numSamples. */
+static unsigned g_finish_log;
+
+static void snd_finish_channel(uint32_t ch) {
+    SndChannel *c;
+    uint32_t info, reps, keep = 0, reps_after = 0, new_data = 0, new_n = 0;
+    int slot, forever;
+    unsigned k;
+    if (ch >= SND_CHANNELS || !g_memp)
+        return;
+    c = &g_snd[ch];
+    reps = c->repeat;
+    forever = reps == 0u;
+    if (reps > 0u)
+        reps--;
+    info = ENDINFO_ADDR(ch);
+    for (k = 0; k < ENDINFO_STRIDE; k += 4u)
+        guest_st32(g_memp, info + k, 0);
+    guest_st32(g_memp, info + 0u, ch);
+    guest_st32(g_memp, info + 4u, reps);
+    guest_st32(g_memp, info + 12u, c->samples);
+
+    slot = cb_find_chan("s3eSoundChannel", ch, 0u);
+    if (slot >= 0 && g_cbs[slot].used && g_cbs[slot].fn) {
+        GuestStatus st = guest_call_r0(&g, g_cbs[slot].fn, info, g_cbs[slot].user,
+                                       &keep);
+        if (st != GUEST_OK) {
+            printf("  [snd  ] ch%u end handler stopped: %s\n", (unsigned)ch,
+                   guest_status_str(st));
+            keep = 0;
+        }
+    } else {
+        keep = (forever || reps > 0u) ? 1u : 0u;
+    }
+    guest_ld32(g_memp, info + 4u, &reps_after);
+    guest_ld32(g_memp, info + 8u, &new_data);
+    guest_ld32(g_memp, info + 12u, &new_n);
+
+    if (g_finish_log < 20000u) {
+        /* The handler's own inputs, read from its instance (userData): spec at
+         * +0xc with its loop count at +0x2c, repeats left at +0x28, and the
+         * stop flag (bit 1) in +0x16. A CONTINUE with loop count 0 is an
+         * infinite loop the game has to end by setting that flag. */
+        uint32_t inst = slot >= 0 ? g_cbs[slot].user : 0, spec = 0, loops = 0,
+                 left = 0, flags = 0;
+        if (inst) {
+            guest_ld32(g_memp, inst + 0x0cu, &spec);
+            guest_ld32(g_memp, inst + 0x28u, &left);
+            guest_ld16(g_memp, inst + 0x16u, &flags);
+            if (spec)
+                guest_ld32(g_memp, spec + 0x2cu, &loops);
+        }
+        g_finish_log++;
+        printf("  [snd  ] ch%u finished: handler says %s (reps %u, newData %08x, n %u)"
+               " inst=%08x spec=%08x loops=%u left=%u flags=%04x\n",
+               (unsigned)ch, keep ? "CONTINUE" : "stop", (unsigned)reps_after,
+               (unsigned)new_data, (unsigned)new_n, (unsigned)inst,
+               (unsigned)spec, (unsigned)loops, (unsigned)left, (unsigned)flags);
+    }
+    if (!keep) {
+        g_snd_playing[ch] = 0;
+        return;
+    }
+    if (new_data && new_n) {
+        c->buf = new_data;
+        c->samples = new_n;
+    }
+    c->repeat = (int32_t)reps_after > 0 ? reps_after : 0u;
+    /* Same rule as a fresh play: only claim the channel if a voice started. */
+    g_snd_playing[ch] = (uint8_t)(snd_start_voice(g_memp, ch, c) ? 1 : 0);
+}
+
 static void bind_slot(uint32_t i, const char *nm) {
     g_slots[i].name = nm;
     g_slots[i].user = (void *)(uintptr_t)i;
@@ -4753,9 +5508,10 @@ static void bind_slot(uint32_t i, const char *nm) {
         g_slots[i].fn = hle_sound_channel_getint;
     else if (!strcmp(nm, "s3eSoundChannelSetInt"))
         g_slots[i].fn = hle_sound_channel_setint;
-    else if (!strcmp(nm, "s3eSoundChannelPause") ||
-             !strcmp(nm, "s3eSoundChannelResume"))
-        g_slots[i].fn = hle_audio_ok;
+    else if (!strcmp(nm, "s3eSoundChannelPause"))
+        g_slots[i].fn = hle_sound_channel_pause;
+    else if (!strcmp(nm, "s3eSoundChannelResume"))
+        g_slots[i].fn = hle_sound_channel_resume;
     else if (!strcmp(nm, "s3eAudioGetInt"))
         g_slots[i].fn = hle_audio_getint;
     else if (!strcmp(nm, "s3eAudioSetInt"))
@@ -4781,6 +5537,10 @@ static void bind_slot(uint32_t i, const char *nm) {
         g_slots[i].fn = hle_memory_setint;
     else if (!strcmp(nm, "s3eTimerGetMs") || !strcmp(nm, "s3eTimerGetUST"))
         g_slots[i].fn = hle_timer_ms;
+    else if (!strcmp(nm, "s3eTimerSetTimer"))
+        g_slots[i].fn = hle_timer_set;
+    else if (!strcmp(nm, "s3eTimerCancelTimer"))
+        g_slots[i].fn = hle_timer_cancel;
     else if (!strcmp(nm, "s3eDeviceYield"))
         g_slots[i].fn = hle_device_yield;
     else if (!strcmp(nm, "s3ePointerUpdate"))
@@ -5629,6 +6389,25 @@ static void ctl_command(char *line) {
             printf("  [tex  ] virtual sticks %s (%u draws hidden so far)\n",
                    arg[11] == '1' ? "hidden" : "shown", gl_hidden_draws());
             ctl_say("OK\n");
+        } else if (!strncmp(arg, "YHOLD ", 6)) {
+            int f = atoi(arg + 6);
+            if (f >= 1 && f <= 120) {
+                g_y_use_delay = f;
+                printf("  [key  ] Y on the move: use after %d frames held\n", f);
+                ctl_say("OK\n");
+            } else {
+                ctl_say("ERR use: SND YHOLD <1..120>\n");
+            }
+        } else if (!strcmp(arg, "AIMHOLD 0") || !strcmp(arg, "AIMHOLD 1")) {
+            g_aim_hold = arg[8] == '1';
+            printf("  [key  ] aim: %s\n",
+                   g_aim_hold ? "hold ZL to aim" : "press ZL to toggle aim");
+            ctl_say("OK\n");
+        } else if (!strcmp(arg, "RUNTOGGLE 0") || !strcmp(arg, "RUNTOGGLE 1")) {
+            g_run_toggle = arg[10] == '1';
+            printf("  [key  ] run: %s\n",
+                   g_run_toggle ? "click L3 to run" : "hold L3 to run");
+            ctl_say("OK\n");
         } else if (!strncmp(arg, "TAPMAX ", 7)) {
             int f = atoi(arg + 7);
             if (f >= 0 && f <= 120) {
@@ -5691,6 +6470,11 @@ static void ctl_command(char *line) {
                    (unsigned long long)snd_out_mix_calls(),
                    snd_out_active_voices(),
                    snd_music_playing() ? "playing" : "idle");
+            ctl_say("OK\n");
+        } else if (!strcmp(arg, "SELFTEST")) {
+            /* Plays a sound longer than the mixer's old position limit and
+             * reports how long it took to drain. Needs no barricade. */
+            snd_selftest_start();
             ctl_say("OK\n");
         } else if (!strcmp(arg, "MUSIC 0") || !strcmp(arg, "MUSIC 1")) {
             snd_out_music_enable(arg[6] == '1');
@@ -6801,15 +7585,24 @@ static void run(void) {
          * So: a button the game does not use, held for a second, and read
          * from the held state rather than an edge, which cannot race. */
         padUpdate(&g_pad);
-        if (padGetButtons(&g_pad) & HidNpadButton_Minus) {
-            if (!quit_held)
-                quit_held = armGetSystemTick();
-            else if (armGetSystemTick() - quit_held > armGetSystemTickFreq()) {
-                printf("  ... stopped by - held\n");
-                break;
+        /* MINUS ALONE IS NOT ENOUGH. It was, and a long press on it during
+         * play stopped the game dead on the "Press + to exit" screen -- which
+         * from the player's seat is indistinguishable from a freeze. Minus is
+         * a button someone holds by accident; Minus AND Plus together for a
+         * second is not. Still read from the held state rather than an edge,
+         * which is what made this reliable in the first place. */
+        {
+            const u64 escape = HidNpadButton_Minus | HidNpadButton_Plus;
+            if ((padGetButtons(&g_pad) & escape) == escape) {
+                if (!quit_held)
+                    quit_held = armGetSystemTick();
+                else if (armGetSystemTick() - quit_held > armGetSystemTickFreq()) {
+                    printf("  ... stopped by - and + held\n");
+                    break;
+                }
+            } else {
+                quit_held = 0;
             }
-        } else {
-            quit_held = 0;
         }
         printf("  ... %lluM instructions, pc=%06x, %d presents\n",
                (unsigned long long)(g.executed / 1000000ull),

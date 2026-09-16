@@ -511,6 +511,11 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit);
  * need. Saves and restores the interrupted register state. */
 GuestStatus guest_call(Guest *g, uint32_t fn, uint32_t r0, uint32_t r1);
 
+/* The same, but hands back the callee's r0 -- for callbacks whose return value
+ * matters, such as a sound generator's sample count. */
+GuestStatus guest_call_r0(Guest *g, uint32_t fn, uint32_t r0, uint32_t r1,
+                          uint32_t *ret);
+
 const char *guest_status_str(GuestStatus s);
 
 #ifdef __cplusplus
