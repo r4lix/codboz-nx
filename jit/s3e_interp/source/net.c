@@ -15,6 +15,7 @@
 #include <switch.h>
 
 #include "net.h"
+#include "zeroconf_host.h"
 
 /* ---- Marmalade constants (s3eSocket.h) --------------------------------- */
 enum {
@@ -859,6 +860,7 @@ void net_pump(GuestMem *mem) {
     if (!g_up || !g_glue.call3)
         return;
     g_mem = mem;
+    s3e_zero_conf_pump();        /* mDNS: may call the game back (see below) */
 
     if (g_lookup.pending) {
         const uint32_t fn = g_lookup.fn, user = g_lookup.user,
@@ -949,6 +951,305 @@ void net_pump(GuestMem *mem) {
             g_glue.call3(fn, handle, 0, user, NULL);
         }
     }
+}
+
+/* ---- s3eZeroConf (Local Wi-Fi) -----------------------------------------
+ *
+ * Local Wi-Fi finds hosts with Bonjour: the host publishes _PROJECT_KIWI._tcp
+ * and clients browse for it, then connect over plain TCP. The mDNS engine is
+ * the PortMaster port's (zeroconf.c, MIT) and talks to the network itself;
+ * what lives here is the guest boundary. Handles are small numbers, strings
+ * and TXT arrays are copied in, and every result is rebuilt in guest memory
+ * before the game's callback sees it -- the engine calls these trampolines
+ * with host pointers the guest could never read. */
+
+#define ZC_HANDLES   8u
+#define ZC_HANDLE0   0x2A000u
+#define ZC_MAX_TXT   16u
+#define ZC_STR       256u
+
+typedef struct {
+    int      used;
+    void    *host;                       /* engine search or publisher */
+    uint32_t found, update, lost, user;  /* guest callbacks and userData */
+} ZcHandle;
+
+static ZcHandle g_zc[ZC_HANDLES];
+static uint32_t g_zc_buf;                /* guest scratch for callback data */
+
+/* The game identifies a discovered service by the service-id pointer it is
+ * handed, across found, update and lost. The engine's IDs are host pointers to
+ * a token, so each token gets one guest cell for as long as the run lasts. */
+static struct {
+    uint32_t token, cell;
+} g_zc_ids[128];
+static unsigned g_zc_nids;
+
+static uint32_t zc_guest_handle(const ZcHandle *h) {
+    return ZC_HANDLE0 + (uint32_t)(h - g_zc);
+}
+
+static ZcHandle *zc_from_guest(uint32_t handle) {
+    const uint32_t i = handle - ZC_HANDLE0;
+    if (handle < ZC_HANDLE0 || i >= ZC_HANDLES || !g_zc[i].used)
+        return NULL;
+    return &g_zc[i];
+}
+
+static ZcHandle *zc_new(void) {
+    unsigned i;
+    for (i = 0; i < ZC_HANDLES; i++)
+        if (!g_zc[i].used) {
+            memset(&g_zc[i], 0, sizeof g_zc[i]);
+            g_zc[i].used = 1;
+            return &g_zc[i];
+        }
+    return NULL;
+}
+
+static uint32_t zc_service_cell(void *service_id) {
+    uint32_t token, cell;
+    unsigned i;
+    if (!service_id || !g_mem)
+        return 0;
+    token = *(uint32_t *)service_id;
+    for (i = 0; i < g_zc_nids; i++)
+        if (g_zc_ids[i].token == token)
+            return g_zc_ids[i].cell;
+    cell = g_glue.alloc ? g_glue.alloc(4) : 0;
+    if (!cell)
+        return 0;
+    guest_st32(g_mem, cell, token);
+    if (g_zc_nids < sizeof g_zc_ids / sizeof g_zc_ids[0]) {
+        g_zc_ids[g_zc_nids].token = token;
+        g_zc_ids[g_zc_nids].cell = cell;
+        g_zc_nids++;
+    }
+    return cell;
+}
+
+/* Lay a string into the scratch buffer; returns its guest address. */
+static uint32_t zc_put(uint32_t *at, const char *str) {
+    const uint32_t start = *at;
+    size_t n = str ? strlen(str) : 0;
+    if (n >= ZC_STR)
+        n = ZC_STR - 1;
+    gputstr(g_mem, start, str ? str : "", n + 1);
+    *at += (uint32_t)((n + 4) & ~(size_t)3);
+    return start;
+}
+
+static uint32_t zc_put_txt(uint32_t *at, uint16_t count, const char **txt) {
+    const uint32_t array = *at;
+    unsigned i;
+    if (count > ZC_MAX_TXT)
+        count = ZC_MAX_TXT;
+    *at += 4u * ZC_MAX_TXT;
+    for (i = 0; i < count; i++)
+        guest_st32(g_mem, array + 4u * i, zc_put(at, txt ? txt[i] : ""));
+    return array;
+}
+
+static int zc_scratch(void) {
+    if (!g_zc_buf && g_glue.alloc)
+        g_zc_buf = g_glue.alloc(0x40u + 4u * ZC_MAX_TXT + ZC_STR * (4u + ZC_MAX_TXT));
+    return g_zc_buf != 0 && g_mem != NULL;
+}
+
+static int32_t zc_found_tramp(void *search, void *system_data, void *user) {
+    const ZcHandle *h = (const ZcHandle *)user;
+    const struct s3e_zeroconf_found_data *d = system_data;
+    uint32_t at, k;
+    struct in_addr a;
+    (void)search;
+    if (!h || !h->used || !h->found || !d || !zc_scratch())
+        return 0;
+    at = g_zc_buf + 0x40u;
+    for (k = 0; k < 0x38u; k += 4u)
+        guest_st32(g_mem, g_zc_buf + k, 0);
+    guest_st32(g_mem, g_zc_buf + 0x00u, zc_service_cell(d->service_id));
+    guest_st32(g_mem, g_zc_buf + 0x08u, zc_put(&at, d->name));
+    guest_st32(g_mem, g_zc_buf + 0x0cu, zc_put(&at, d->service_type));
+    guest_st32(g_mem, g_zc_buf + 0x10u, zc_put(&at, d->domain));
+    guest_st32(g_mem, g_zc_buf + 0x14u, zc_put(&at, d->host));
+    guest_st16(g_mem, g_zc_buf + 0x18u, d->port);
+    guest_st16(g_mem, g_zc_buf + 0x1au, d->txt_count);
+    guest_st32(g_mem, g_zc_buf + 0x1cu, zc_put_txt(&at, d->txt_count, d->txt_records));
+    guest_st32(g_mem, g_zc_buf + 0x20u, d->ipv4_address);
+    a.s_addr = d->ipv4_address;
+    NETLOG("zeroconf found \"%s\" at %s:%u (%u TXT)\n", d->name ? d->name : "",
+           inet_ntoa(a), (unsigned)ntohs(d->port), (unsigned)d->txt_count);
+    g_glue.call3(h->found, zc_guest_handle(h), g_zc_buf, h->user, NULL);
+    return 0;
+}
+
+static int32_t zc_update_tramp(void *search, void *system_data, void *user) {
+    const ZcHandle *h = (const ZcHandle *)user;
+    const struct s3e_zeroconf_txt_update_data *d = system_data;
+    uint32_t at;
+    (void)search;
+    if (!h || !h->used || !h->update || !d || !zc_scratch())
+        return 0;
+    at = g_zc_buf + 0x40u;
+    guest_st32(g_mem, g_zc_buf + 0x00u, zc_service_cell(d->service_id));
+    guest_st32(g_mem, g_zc_buf + 0x04u, 0);
+    guest_st16(g_mem, g_zc_buf + 0x06u, d->txt_count);
+    guest_st32(g_mem, g_zc_buf + 0x08u, zc_put_txt(&at, d->txt_count, d->txt_records));
+    g_glue.call3(h->update, zc_guest_handle(h), g_zc_buf, h->user, NULL);
+    return 0;
+}
+
+static int32_t zc_lost_tramp(void *search, void *system_data, void *user) {
+    const ZcHandle *h = (const ZcHandle *)user;
+    (void)search;
+    if (!h || !h->used || !h->lost)
+        return 0;
+    NETLOG("zeroconf lost\n");
+    g_glue.call3(h->lost, zc_guest_handle(h), zc_service_cell(system_data), h->user, NULL);
+    return 0;
+}
+
+/* Guest TXT array -> host strings. */
+static uint16_t zc_txt_in(GuestMem *m, uint32_t array, uint32_t count,
+                          char txt[ZC_MAX_TXT][ZC_STR], const char *ptrs[ZC_MAX_TXT]) {
+    uint32_t i;
+    if (count > ZC_MAX_TXT)
+        count = ZC_MAX_TXT;
+    for (i = 0; i < count; i++) {
+        uint32_t p = 0;
+        txt[i][0] = 0;
+        if (array)
+            guest_ld32(m, array + 4u * i, &p);
+        if (p)
+            gstr(m, p, txt[i], ZC_STR);
+        ptrs[i] = txt[i];
+    }
+    return (uint16_t)count;
+}
+
+/* s3eZeroConfStartSearch(type, domain, found, update, lost, userData) */
+static void h_zc_start(GuestCpu *c, GuestMem *m, void *u) {
+    char type[ZC_STR], domain[ZC_STR];
+    ZcHandle *h;
+    uint32_t lost = 0, user = 0;
+    (void)u;
+    g_mem = m;
+    if (!g_up || !gstr(m, c->r[0], type, sizeof type)) {
+        c->r[0] = 0;
+        return;
+    }
+    domain[0] = 0;
+    if (c->r[1])
+        gstr(m, c->r[1], domain, sizeof domain);
+    guest_ld32(m, c->r[GUEST_SP], &lost);
+    guest_ld32(m, c->r[GUEST_SP] + 4u, &user);
+    h = zc_new();
+    if (!h) {
+        c->r[0] = 0;
+        return;
+    }
+    h->found = c->r[2];
+    h->update = c->r[3];
+    h->lost = lost;
+    h->user = user;
+    h->host = s3eZeroConfStartSearch(type, domain[0] ? domain : NULL,
+                                     h->found ? zc_found_tramp : NULL,
+                                     h->update ? zc_update_tramp : NULL,
+                                     h->lost ? zc_lost_tramp : NULL, h);
+    NETLOG("zeroconf search %s.%s -> %s\n", type, domain[0] ? domain : "local",
+           h->host ? "started" : "FAILED");
+    if (!h->host) {
+        h->used = 0;
+        c->r[0] = 0;
+        return;
+    }
+    c->r[0] = zc_guest_handle(h);
+}
+
+static void h_zc_stop(GuestCpu *c, GuestMem *m, void *u) {
+    ZcHandle *h = zc_from_guest(c->r[0]);
+    (void)m;
+    (void)u;
+    if (h) {
+        s3eZeroConfStopSearch(h->host);
+        h->used = 0;
+        NETLOG("zeroconf search stopped\n");
+    }
+    c->r[0] = 0;
+}
+
+/* s3eZeroConfPublish(port, name, type, domain, txtCount, txtRecords) */
+static void h_zc_publish(GuestCpu *c, GuestMem *m, void *u) {
+    char name[ZC_STR], type[ZC_STR], domain[ZC_STR];
+    char txt[ZC_MAX_TXT][ZC_STR];
+    const char *ptrs[ZC_MAX_TXT];
+    uint32_t count = 0, array = 0;
+    uint16_t n;
+    ZcHandle *h;
+    (void)u;
+    g_mem = m;
+    if (!g_up || !gstr(m, c->r[1], name, sizeof name) ||
+        !gstr(m, c->r[2], type, sizeof type)) {
+        c->r[0] = 0;
+        return;
+    }
+    domain[0] = 0;
+    if (c->r[3])
+        gstr(m, c->r[3], domain, sizeof domain);
+    guest_ld32(m, c->r[GUEST_SP], &count);
+    guest_ld32(m, c->r[GUEST_SP] + 4u, &array);
+    n = zc_txt_in(m, array, count & 0xFFFFu, txt, ptrs);
+    h = zc_new();
+    if (!h) {
+        c->r[0] = 0;
+        return;
+    }
+    h->host = s3eZeroConfPublish((uint16_t)c->r[0], name, type,
+                                 domain[0] ? domain : NULL, n, ptrs);
+    NETLOG("zeroconf publish \"%s\" %s port %u (%u TXT) -> %s\n", name, type,
+           (unsigned)ntohs((uint16_t)c->r[0]), (unsigned)n,
+           h->host ? "published" : "FAILED");
+    if (!h->host) {
+        h->used = 0;
+        c->r[0] = 0;
+        return;
+    }
+    c->r[0] = zc_guest_handle(h);
+}
+
+/* s3eZeroConfUpdateTxtRecord(service, txtCount, txtRecords) */
+static void h_zc_update(GuestCpu *c, GuestMem *m, void *u) {
+    char txt[ZC_MAX_TXT][ZC_STR];
+    const char *ptrs[ZC_MAX_TXT];
+    ZcHandle *h = zc_from_guest(c->r[0]);
+    uint16_t n;
+    (void)u;
+    if (!h) {
+        c->r[0] = 1;
+        return;
+    }
+    n = zc_txt_in(m, c->r[2], c->r[1] & 0xFFFFu, txt, ptrs);
+    c->r[0] = (uint32_t)s3eZeroConfUpdateTxtRecord(h->host, n, ptrs);
+}
+
+static void h_zc_unpublish(GuestCpu *c, GuestMem *m, void *u) {
+    ZcHandle *h = zc_from_guest(c->r[0]);
+    (void)m;
+    (void)u;
+    if (!h) {
+        c->r[0] = 1;
+        return;
+    }
+    c->r[0] = (uint32_t)s3eZeroConfUnpublish(h->host);
+    h->used = 0;
+    NETLOG("zeroconf unpublished\n");
+}
+
+GuestHleFn net_zeroconf_fn(unsigned index) {
+    static const GuestHleFn table[5] = {
+        h_zc_start, h_zc_stop, h_zc_publish, h_zc_update, h_zc_unpublish,
+    };
+    return index < 5u ? table[index] : NULL;
 }
 
 /* ---- configuration ------------------------------------------------------ */

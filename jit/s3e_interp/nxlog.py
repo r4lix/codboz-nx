@@ -51,6 +51,11 @@ def reader(conn, addr):
     # hand. Partial lines are held back so a stamp only ever appears at a real
     # line start.
     t0 = time.time()
+    # With two consoles connected at once their lines interleave in one file,
+    # so each line also carries the last octet of the sender's address, after
+    # the stamp: "[   12.34] @188 ...". Anything matching on the text after the
+    # stamp keeps working.
+    who = ("@%s " % addr[0].rsplit(".", 1)[-1]).encode()
     pending = b""
     try:
         while True:
@@ -64,7 +69,7 @@ def reader(conn, addr):
                 if nl < 0:
                     break
                 line, pending = pending[:nl + 1], pending[nl + 1:]
-                out += (b"[%8.2f] " % (time.time() - t0)) + line
+                out += (b"[%8.2f] " % (time.time() - t0)) + who + line
             if not out:
                 continue
             with lock:

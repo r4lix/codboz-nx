@@ -86,6 +86,7 @@ static int g_hook_hits[3];
 static uint32_t g_ext_stub;          /* guest addr of a "return 0" stub */
 static uint32_t g_tp_stub[5];        /* s3eTouchpad function table, as guest
                                       * addresses the game can actually call */
+static uint32_t g_zc_stub[5];        /* s3eZeroConf (Local Wi-Fi), likewise */
 
 static void gstr(const GuestMem *m, uint32_t addr, char *out, size_t n) {
     size_t i = 0;
@@ -354,6 +355,20 @@ static void hle_extgethash(GuestCpu *cpu, GuestMem *mem, void *user) {
         cpu->r[0] = 0;                  /* S3E_RESULT_SUCCESS */
         return;
     }
+#ifdef __SWITCH__
+    /* s3eZeroConf: Bonjour discovery for Local Wi-Fi. Refused, the game still
+     * shows the menu but can never see a host or be seen as one. The table
+     * entries are net.c's, in StartSearch, StopSearch, Publish,
+     * UpdateTxtRecord, Unpublish order. */
+    if (cpu->r[0] == NET_ZEROCONF_HASH && cpu->r[1] &&
+        cpu->r[2] == sizeof g_zc_stub && g_zc_stub[0]) {
+        for (i = 0; i < 5; i++)
+            guest_st32(mem, cpu->r[1] + 4 * i, g_zc_stub[i]);
+        printf("  [zconf] s3eZeroConf handed over\n");
+        cpu->r[0] = 0;
+        return;
+    }
+#endif
     /* A zero return makes the caller take the "extension missing" path and
      * then call the table entries anyway, so they still have to be callable. */
     for (i = 0; i + 4 <= cpu->r[2]; i += 4)
@@ -7313,6 +7328,22 @@ static void run(void) {
             g_tp_stub[k] = GUEST_STUB_BASE + 4 * (n + 1 + (int)k);
         }
     }
+#ifdef __SWITCH__
+    /* And five for s3eZeroConf, right after them. */
+    {
+        static const char *zc_names[5] = {
+            "<s3eZeroConfStartSearch>", "<s3eZeroConfStopSearch>",
+            "<s3eZeroConfPublish>", "<s3eZeroConfUpdateTxtRecord>",
+            "<s3eZeroConfUnpublish>",
+        };
+        unsigned k;
+        for (k = 0; k < 5 && n + 6 + (int)k < 512; k++) {
+            g_slots[n + 6 + k].name = zc_names[k];
+            g_slots[n + 6 + k].fn = net_zeroconf_fn(k);
+            g_zc_stub[k] = GUEST_STUB_BASE + 4 * (n + 6 + (int)k);
+        }
+    }
+#endif
     g.prof = hle_profile;       /* frame-time split; see frame_profile_report */
     /* Guest-PC histogram. Sized to the loaded image, so a PC outside it (stub
      * page, callback trampolines) falls out on the bounds test rather than
@@ -7443,7 +7474,11 @@ static void run(void) {
      * The dispatcher bounds-checks against this, so a slot past it is
      * not called at all and the guest returns into nothing -- which is
      * a black screen about four seconds in. */
+#ifdef __SWITCH__
+    g.hle.count = n + 1 + 5 + 5;   /* ... and the five s3eZeroConf entries */
+#else
     g.hle.count = n + 1 + 5;
+#endif
     /* Sound output. Failure is not fatal: every snd_out_* call becomes a
      * no-op and the HLE handlers keep reporting the working-but-idle device
      * they reported before there was any output at all. */

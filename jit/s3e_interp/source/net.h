@@ -44,6 +44,11 @@ void net_pump(GuestMem *mem);
 /* The HLE handler for an import, or NULL if it is not a network import. */
 GuestHleFn net_find_hle(const char *name);
 
+/* The s3eZeroConf extension table, in the game's order: StartSearch,
+ * StopSearch, Publish, UpdateTxtRecord, Unpublish. NULL past the end. */
+GuestHleFn net_zeroconf_fn(unsigned index);
+#define NET_ZEROCONF_HASH 0x9f590656u
+
 /* Play Online configuration. */
 int         net_online_enabled(void);
 const char *net_server(void);
