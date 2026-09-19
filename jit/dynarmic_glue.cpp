@@ -421,11 +421,19 @@ public:
     }
 
     void CallSVC(std::uint32_t swi) override {
-        const std::uint64_t t_enter = armGetSystemTick();
+        /* Timing the boundary costs two CNTPCT_EL0 reads here and two more
+         * inside DispatchStub. At this game's ~3900 crossings per frame that
+         * is ~15 600 reads per frame, paid in every build. They are worth
+         * paying only when someone is reading the numbers, so they follow the
+         * same profile.txt gate as the other profilers: g->prof is set only
+         * then, and it is the flag tested here. */
+        const bool timed = g->prof != nullptr;
+        const std::uint64_t t_enter = timed ? armGetSystemTick() : 0;
         svc_calls++;
         ring[ring_n % kRing] = Dispatch{jit->Regs()[15], jit->Regs()[14], swi};
         ring_n++;
-        if (svc_calls <= 24u || (svc_calls % 200000ull) == 0ull) {
+        /* A power-of-two mask rather than a 64-bit modulo per call. */
+        if (svc_calls <= 24u || (svc_calls & 0x3FFFFull) == 0ull) {
             const char *what = swi >= SvcStub ? "stub" : (swi >= SvcHook ? "hook" : "halt");
             std::printf("  [dyn  ] svc #%llu %s%u pc=%08x lr=%08x\n",
                         (unsigned long long)svc_calls, what,
@@ -453,15 +461,25 @@ public:
             return;
         }
 
-        SyncFromJit();
-        if (swi >= SvcStub)
+        if (swi >= SvcStub) {
+            /* Imports are softfp. Every one of the 381 stubs takes its
+             * arguments in r0-r3 and returns in r0; not one reads cpu->s[].
+             * Copying the 64-word VFP file in each direction was 128 of the
+             * 160 words moved per call, for nothing. The hooks below are the
+             * exception -- hook_affine_compose writes s12-s15 -- so they keep
+             * the full sync. */
+            SyncFromJitCore();
             DispatchStub(swi - SvcStub);
-        else
+            SyncToJitCore();
+        } else {
+            SyncFromJit();
             DispatchHook(swi - SvcHook);
-        SyncToJit();
+            SyncToJit();
+        }
         /* Only the dispatching path is charged. The early returns above are
          * halt and fault, which happen once and would not move the total. */
-        t_svc += armGetSystemTick() - t_enter;
+        if (timed)
+            t_svc += armGetSystemTick() - t_enter;
     }
 
     /* -------------------------------------------------- everything else */
@@ -531,7 +549,21 @@ public:
 
     /* ---------------------------------------------------------- state */
 
+    /* Set while cpu.s[] is known to be behind the JIT's ExtRegs, because an
+     * import call skipped copying them. Only SyncToJit cares: it would
+     * otherwise push that stale copy back and clobber live registers -- and
+     * s16-s31 are callee-saved, so the guest can have values there across an
+     * import call. */
+    bool vfp_stale = false;
+
     void SyncToJit() {
+        if (vfp_stale) {
+            /* The JIT holds the truth; take it before overwriting it. */
+            const std::array<std::uint32_t, 64>& cur = jit->ExtRegs();
+            for (int i = 0; i < 64; i++)
+                g->cpu.s[i] = cur[i];
+            vfp_stale = false;
+        }
         std::array<std::uint32_t, 16>& r = jit->Regs();
         for (int i = 0; i < 16; i++)
             r[i] = g->cpu.r[i];
@@ -540,6 +572,24 @@ public:
             e[i] = g->cpu.s[i];
         jit->SetCpsr(PackCpsr(g->cpu));
         jit->SetFpscr(g->cpu.fpscr);
+    }
+
+    /* The core half of the pair, for import calls: 16 words plus flags. */
+    void SyncToJitCore() {
+        std::array<std::uint32_t, 16>& r = jit->Regs();
+        for (int i = 0; i < 16; i++)
+            r[i] = g->cpu.r[i];
+        jit->SetCpsr(PackCpsr(g->cpu));
+        jit->SetFpscr(g->cpu.fpscr);
+    }
+
+    void SyncFromJitCore() {
+        const std::array<std::uint32_t, 16>& r = jit->Regs();
+        for (int i = 0; i < 16; i++)
+            g->cpu.r[i] = r[i];
+        UnpackCpsr(g->cpu, jit->Cpsr());
+        g->cpu.fpscr = jit->Fpscr();
+        vfp_stale = true;
     }
 
     void SyncFromJit() {
@@ -551,6 +601,7 @@ public:
             g->cpu.s[i] = e[i];
         UnpackCpsr(g->cpu, jit->Cpsr());
         g->cpu.fpscr = jit->Fpscr();
+        vfp_stale = false;
     }
 
     /* One entry per 4 KB page that lies wholly inside a region, pointing at

@@ -3577,6 +3577,9 @@ static void hle_profile(uint32_t slot, int enter) {
     }
 }
 
+/* Set with g.prof, from profile.txt: whether the handler split is measured. */
+static int g_prof_on;
+
 /* Scheduling of the interpreter thread itself; filled in at startup. */
 static int32_t g_main_prio = -1;
 
@@ -3620,11 +3623,19 @@ static void frame_profile_report(void) {
     if (!total)
         return;
 
-    printf("  [prof ] %llu ms/300f: handlers %llu%%, interpreting %llu%%\n",
-           (unsigned long long)(total * 1000ull / freq),
-           (unsigned long long)(hle * 100ull / total),
-           (unsigned long long)((total - (hle < total ? hle : total)) * 100ull
-                                / total));
+    if (!g_prof_on) {
+        /* Without profile.txt nothing is timed, but the call counts below are
+         * free: they are incremented by the dispatcher either way. */
+        printf("  [prof ] %llu ms/300f (put profile.txt on the card for the"
+               " handler split)\n",
+               (unsigned long long)(total * 1000ull / freq));
+    } else {
+        printf("  [prof ] %llu ms/300f: handlers %llu%%, interpreting %llu%%\n",
+               (unsigned long long)(total * 1000ull / freq),
+               (unsigned long long)(hle * 100ull / total),
+               (unsigned long long)((total - (hle < total ? hle : total)) * 100ull
+                                    / total));
+    }
 
     for (b = 0; b < 5; b++) {
         uint64_t bestv = 0;
@@ -3644,6 +3655,40 @@ static void frame_profile_report(void) {
                slot_name((uint32_t)best[b]),
                (unsigned long long)(bestv * 100ull / total),
                (unsigned)g_prof_slot_calls[best[b]]);
+    }
+
+    /* And the same ranking by CALL COUNT, which needs no timing and is the
+     * one that shows where the boundary is being crossed. A handler can be
+     * 0% of the time and still be called 800 times a frame -- that is 800
+     * register syncs and dispatcher round trips, and it is invisible in a
+     * ranking by ticks. The counts are collected by the dispatcher whether or
+     * not the profiler is on, so this prints in every build. */
+    {
+        unsigned calls_total = 0;
+        int shown, taken[10];
+        for (i = 0; i < 512; i++)
+            calls_total += g_prof_slot_calls[i];
+        printf("  [calls] %u HLE calls/300f = %u per frame\n",
+               calls_total, calls_total / 300u);
+        for (shown = 0; shown < 10; shown++) {
+            unsigned bestc = 0;
+            int k;
+            taken[shown] = -1;
+            for (i = 0; i < 512; i++) {
+                int seen = 0;
+                for (k = 0; k < shown; k++)
+                    if (taken[k] == i) seen = 1;
+                if (!seen && g_prof_slot_calls[i] > bestc) {
+                    bestc = g_prof_slot_calls[i];
+                    taken[shown] = i;
+                }
+            }
+            if (taken[shown] < 0 || !bestc)
+                break;
+            printf("  [calls]   %-28s %6u/frame  %2u%%\n",
+                   slot_name((uint32_t)taken[shown]), bestc / 300u,
+                   calls_total ? (unsigned)((uint64_t)bestc * 100ull / calls_total) : 0u);
+        }
     }
 
     /* Queries per frame is the whole diagnosis of the clock bug: at one per
@@ -7446,7 +7491,6 @@ static void run(void) {
         }
     }
 #endif
-    g.prof = hle_profile;       /* frame-time split; see frame_profile_report */
     /* Guest-PC histogram. Sized to the loaded image, so a PC outside it (stub
      * page, callback trampolines) falls out on the bounds test rather than
      * needing its own range. ~440 KB for a 7 MB image; if the allocation
@@ -7474,6 +7518,13 @@ static void run(void) {
         if (want_prof) {
             g.iprof = g_iprof;
             g.pcprof = (uint32_t *)calloc(g.pcprof_buckets, sizeof(uint32_t));
+            /* The HLE split belongs with them, and for the same reason: the
+             * dynarmic boundary times itself with four CNTPCT_EL0 reads per
+             * import call (~15 600 a frame here), and it tests this pointer to
+             * decide whether to. It used to be set unconditionally, so every
+             * shipping build paid for a measurement nobody was reading. */
+            g.prof = hle_profile;
+            g_prof_on = 1;
         }
         if (!g.pcprof)
             g.pcprof_buckets = 0;
