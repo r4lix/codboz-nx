@@ -499,6 +499,15 @@ static const char *fps_glyph(char ch) {
     }
 }
 
+/* Whether the counter is drawn. It is still measured and logged either way. */
+static int g_show_fps = 0;   /* off unless the menu or config.txt turns it on */
+void gl_show_fps(int on) { g_show_fps = on ? 1 : 0; }
+int  gl_fps_shown(void) { return g_show_fps; }
+
+/* The in-game settings menu (s3e_interp/source/menu.cpp). */
+int  menu_is_open(void);
+void menu_render(int surface_w, int surface_h);
+
 static void fps_overlay(EGLDisplay dpy, EGLSurface surface) {
     static uint64_t last_tick;
     static uint32_t frame_count, shown_fps;
@@ -525,8 +534,14 @@ static void fps_overlay(EGLDisplay dpy, EGLSurface surface) {
     if (!surface_w || !surface_h) {
         eglQuerySurface(dpy, surface, EGL_WIDTH, &surface_w);
         eglQuerySurface(dpy, surface, EGL_HEIGHT, &surface_h);
+        /* EGL reports 0x0 for this window on the console; the counter was
+         * never drawn because of it. The window is 1280x720. */
+        if (surface_w <= 0 || surface_h <= 0) {
+            surface_w = 1280;
+            surface_h = 720;
+        }
     }
-    if (surface_w <= 0 || surface_h <= 0)
+    if (surface_w <= 0 || surface_h <= 0 || !g_show_fps)
         return;
 
     snprintf(text, sizeof text, "FPS %u", (unsigned)shown_fps);
@@ -1039,6 +1054,27 @@ static void te_SwapBuffers(GuestCpu *c, GuestMem *m, void *u) {
     }
     fps_overlay((EGLDisplay)dpy, (EGLSurface)s);
     touch_overlay();
+    if (menu_is_open()) {
+        /* Last, so the menu is drawn over the game and its overlays. Queried
+         * each frame: docking changes the surface size. */
+        EGLint w = 0, h = 0;
+        eglQuerySurface((EGLDisplay)dpy, (EGLSurface)s, EGL_WIDTH, &w);
+        eglQuerySurface((EGLDisplay)dpy, (EGLSurface)s, EGL_HEIGHT, &h);
+        {
+            static int told;
+            if (!told) {
+                told = 1;
+                printf("  [menu ] surface reports %dx%d\n", (int)w, (int)h);
+            }
+        }
+        /* The game's window is 1280x720 (the console scales it when docked).
+         * If EGL cannot say, that is the size to draw for. */
+        if (w <= 0 || h <= 0) {
+            w = 1280;
+            h = 720;
+        }
+        menu_render((int)w, (int)h);
+    }
     g_tex_frame++;
     c->r[0] = (uint32_t)eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)s);
     if (c->r[0])
@@ -1595,6 +1631,7 @@ int gl_tex_dump(unsigned id) {
 
 /* SND HIDESTICKS 0|1: toggle the screen-position gate on texture 56. */
 void gl_hide_sticks(int on) { g_hide_sticks = on; }
+int  gl_sticks_hidden(void) { return g_hide_sticks; }
 void gl_stick_probe(int n) { g_stick_probe = n; }
 unsigned gl_hidden_draws(void) { return g_hidden_draws; }
 

@@ -441,6 +441,10 @@ unsigned snd_out_active_voices(void) {
     return n;
 }
 
+int snd_out_music_enabled(void) {
+    return g_music_on;
+}
+
 void snd_out_music_enable(int on) {
     g_music_on = on ? 1 : 0;
 }

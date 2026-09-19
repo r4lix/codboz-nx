@@ -81,6 +81,7 @@ int  snd_music_status(void);
 uint64_t snd_out_mix_calls(void);
 unsigned snd_out_active_voices(void);
 void     snd_out_music_enable(int on);
+int      snd_out_music_enabled(void);
 
 /* Called by the mixer with an interleaved L,R accumulator. */
 void snd_music_mix(int32_t *acc, unsigned frames);

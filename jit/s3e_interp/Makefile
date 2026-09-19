@@ -42,9 +42,9 @@ BUILD		:=	build
 APP_TITLE	:=	s3e interpreter test
 APP_AUTHOR	:=	codboz_nx
 APP_VERSION	:=	0.1
-SOURCES		:=	source .. ../../loader
+SOURCES		:=	source .. ../../loader ../third_party/imgui
 DATA		:=	data
-INCLUDES	:=	.. ../../loader
+INCLUDES	:=	.. ../../loader ../third_party/imgui
 #ROMFS	:=	romfs
 
 #---------------------------------------------------------------------------------
@@ -118,7 +118,8 @@ ifeq ($(PGO),use)
 CFLAGS	+=	-fprofile-use -fprofile-correction -Wno-missing-profile
 endif
 
-CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions
+# Dear ImGui (the settings menu): no shell on Horizon to open URLs with.
+CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -DIMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS
 
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)

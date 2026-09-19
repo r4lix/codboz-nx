@@ -29,6 +29,8 @@
 #include "audio.h"
 #ifdef __SWITCH__
 #include "net.h"
+#include "menu.h"
+#include "settings.h"
 #endif
 #include "recomp.h"
 #include "s3e_loader.h"
@@ -2077,7 +2079,11 @@ static int input_poll(int *px, int *py) {
         hidInitializeTouchScreen();
         g_touch_ready = 1;
     }
-    if (hidGetTouchScreenStates(&ts, 1) && ts.count > 0 &&
+    if (
+#ifdef __SWITCH__
+        !menu_blocks_input() &&
+#endif
+        hidGetTouchScreenStates(&ts, 1) && ts.count > 0 &&
         (int)ts.touches[0].x >= (int)VIEW_X &&
         (int)ts.touches[0].x < (int)(VIEW_X + VIEW_W)) {
         *px = clampi(((int)ts.touches[0].x - (int)VIEW_X) * (int)SCREEN_W
@@ -2401,6 +2407,18 @@ static void key_update(GuestMem *mem) {
 
     padUpdate(&g_pad);
     held = padGetButtons(&g_pad);
+#ifdef __SWITCH__
+    /* The settings menu (hold - for 2 s) reads the pad before the game does.
+     * While it is open, or until the buttons that closed it are released, the
+     * game sees an idle controller: every key it holds is released below like
+     * any other button going up. */
+    {
+        const HidAnalogStickState mls = padGetStickPos(&g_pad, 0);
+        menu_input(held, mls.x, mls.y);
+    }
+    if (menu_blocks_input())
+        held = 0;
+#endif
 
     /* Y's use code (78) is also SPRINT, and the game tells them apart by
      * whether you are moving, not by how long the key is down: while walking,
@@ -2419,6 +2437,10 @@ static void key_update(GuestMem *mem) {
     {
         HidAnalogStickState ls = padGetStickPos(&g_pad, 0);
         moving = ls.x > 6000 || ls.x < -6000 || ls.y > 6000 || ls.y < -6000;
+#ifdef __SWITCH__
+        if (menu_blocks_input())
+            moving = 0;             /* the stick is navigating the menu */
+#endif
         if (moving)
             still_frames = 0;
         else if (still_frames < 0xFFFFu)
@@ -2784,6 +2806,19 @@ static void tp_stick(GuestMem *mem, int id, int ax, int ay,
     }
 }
 
+/* The sticks as the game should see them: centred while the settings menu
+ * has the controller. */
+static HidAnalogStickState game_stick(int index) {
+    HidAnalogStickState s = padGetStickPos(&g_pad, index);
+#ifdef __SWITCH__
+    if (menu_blocks_input()) {
+        s.x = 0;
+        s.y = 0;
+    }
+#endif
+    return s;
+}
+
 static void tp_update(GuestMem *mem) {
     HidAnalogStickState l, r;
     if (!tp_engaged()) {
@@ -2791,8 +2826,8 @@ static void tp_update(GuestMem *mem) {
         if (g_tp_active[1]) { g_tp_active[1] = 0; tp_button(mem, 1, 0); }
         return;
     }
-    l = padGetStickPos(&g_pad, 0);
-    r = padGetStickPos(&g_pad, 1);
+    l = game_stick(0);
+    r = game_stick(1);
     tp_stick(mem, 0, l.x, l.y, TP_W / 5,     TP_H / 2, TP_W / 5, TP_H / 2);
     tp_stick(mem, 1, r.x, r.y, TP_W * 4 / 5, TP_H / 2, g_tp_look_r, g_tp_look_r);
 }
@@ -2886,8 +2921,8 @@ static void pad_touch_update(GuestMem *mem) {
     int lx, ly, rx, ry;
     padUpdate(&g_pad);
     tp_update(mem);
-    l = padGetStickPos(&g_pad, 0);
-    r = padGetStickPos(&g_pad, 1);
+    l = game_stick(0);
+    r = game_stick(1);
     lx = l.x < 0 ? -l.x : l.x;
     ly = l.y < 0 ? -l.y : l.y;
     rx = r.x < 0 ? -r.x : r.x;
@@ -2956,7 +2991,11 @@ static void touch_update(GuestMem *mem) {
     int i, j, n = 0;
 
     memset(now, 0, sizeof now);
-    if (g_touch_ready && hidGetTouchScreenStates(&ts, 1)) {
+    if (g_touch_ready &&
+#ifdef __SWITCH__
+        !menu_blocks_input() &&
+#endif
+        hidGetTouchScreenStates(&ts, 1)) {
         for (i = 0; i < (int)ts.count && n < REAL_TOUCH; i++) {
             /* Ignore anything outside the rendered viewport. Clamping instead
              * turned a palm resting on the left letterbox into a permanent
@@ -6389,8 +6428,68 @@ void gl_tex_list(void);
 int  gl_tex_skip(unsigned id);
 int  gl_tex_dump(unsigned id);
 void gl_hide_sticks(int on);
+int  gl_sticks_hidden(void);
+void gl_show_fps(int on);
+int  gl_fps_shown(void);
 void gl_stick_probe(int n);
 unsigned gl_hidden_draws(void);
+
+#ifdef __SWITCH__
+/* ---- settings bridge ----------------------------------------------------
+ * The in-game menu and config.txt name settings by key; these are the live
+ * values behind them, the same ones the control socket's SND commands change.
+ * Keys that apply only at boot (multiplayer_server, player_name) are not here:
+ * net.c reads those from the file itself. */
+int port_setting_get(const char *key) {
+    if (!strcmp(key, "control_layout")) return g_tp_on;
+    if (!strcmp(key, "aim_hold"))       return g_aim_hold;
+    if (!strcmp(key, "run_toggle"))     return g_run_toggle;
+    if (!strcmp(key, "y_hold_frames"))  return g_y_use_delay;
+    if (!strcmp(key, "aim_stick"))      return g_aim_stick;
+    if (!strcmp(key, "aim_speed"))      return g_aim_speed;
+    if (!strcmp(key, "hide_sticks"))    return gl_sticks_hidden();
+    if (!strcmp(key, "show_fps"))       return gl_fps_shown();
+    if (!strcmp(key, "music"))          return snd_out_music_enabled();
+    return 0;
+}
+
+void port_setting_set(const char *key, int v) {
+    if (!strcmp(key, "control_layout"))     g_tp_on = v ? 1 : 0;
+    else if (!strcmp(key, "aim_hold"))      g_aim_hold = v ? 1 : 0;
+    else if (!strcmp(key, "run_toggle"))    g_run_toggle = v ? 1 : 0;
+    else if (!strcmp(key, "y_hold_frames")) g_y_use_delay = v < 1 ? 1 : (v > 120 ? 120 : v);
+    else if (!strcmp(key, "aim_stick"))     g_aim_stick = v ? 1 : 0;
+    else if (!strcmp(key, "aim_speed"))     g_aim_speed = v < 1 ? 1 : (v > 1000 ? 1000 : v);
+    else if (!strcmp(key, "hide_sticks"))   gl_hide_sticks(v ? 1 : 0);
+    else if (!strcmp(key, "show_fps"))      gl_show_fps(v ? 1 : 0);
+    else if (!strcmp(key, "music"))         snd_out_music_enable(v ? 1 : 0);
+}
+
+const char *port_build_label(void) {
+    return BOZ_BUILD_LABEL;
+}
+
+/* Everything config.txt sets, applied once at boot; absent keys keep the
+ * built-in defaults. */
+static void port_settings_apply(void) {
+    static const char *keys[] = {
+        "control_layout", "aim_hold", "run_toggle", "y_hold_frames", "aim_stick",
+        "aim_speed", "hide_sticks", "show_fps", "music",
+    };
+    unsigned i, applied = 0;
+    settings_load();
+    for (i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        const int current = port_setting_get(keys[i]);
+        const int value = settings_get_int(keys[i], current);
+        if (value != current) {
+            port_setting_set(keys[i], value);
+            applied++;
+        }
+    }
+    printf("  [menu ] config.txt: %u setting(s) applied; hold - for 2 s for the menu\n",
+           applied);
+}
+#endif
 
 static void ctl_command(char *line) {
     char *arg = strchr(line, ' ');
@@ -6493,6 +6592,9 @@ static void ctl_command(char *line) {
             } else {
                 ctl_say("ERR use: SND YHOLD <1..120>\n");
             }
+        } else if (!strcmp(arg, "MENU 0") || !strcmp(arg, "MENU 1")) {
+            menu_set_open(arg[5] == '1');   /* the settings menu, without the hold */
+            ctl_say("OK\n");
         } else if (!strcmp(arg, "AIMHOLD 0") || !strcmp(arg, "AIMHOLD 1")) {
             g_aim_hold = arg[8] == '1';
             printf("  [key  ] aim: %s\n",
@@ -7998,6 +8100,7 @@ int main(int argc, char **argv) {
     {   /* after sockets: Play Online needs them, and reads config.txt */
         static const NetGlue glue = { net_glue_alloc, net_glue_call3 };
         net_init(&glue, sockets_up);
+        port_settings_apply();
     }
     /* Whether the console is still in the output path decides if it is
      * safe to print after the window changes hands. */
