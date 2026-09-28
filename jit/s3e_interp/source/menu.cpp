@@ -336,13 +336,15 @@ void apply_style(float scale) {
     st.TabRounding = 0.0f;
     st.GrabRounding = 0.0f;
     st.WindowBorderSize = 1.0f;
-    st.FramePadding = ImVec2(8.0f, 5.0f);
-    st.ItemSpacing = ImVec2(10.0f, 10.0f);
+    st.FramePadding = ImVec2(6.0f, 4.0f);
+    st.ItemSpacing = ImVec2(8.0f, 7.0f);
     st.Colors[ImGuiCol_WindowBg] = ImVec4(0.07f, 0.08f, 0.10f, 0.92f);
     st.Colors[ImGuiCol_TitleBg] = ImVec4(0.16f, 0.29f, 0.48f, 1.00f);
     st.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.16f, 0.29f, 0.48f, 1.00f);
     st.ScaleAllSizes(scale);
-    st.FontSizeBase = 26.0f * scale;
+    /* 20 px at 720p: at 26 the five tab names no longer fitted the panel
+     * and ImGui ellipsized them ("Cont...", "Adva..."). */
+    st.FontSizeBase = 20.0f * scale;
 }
 
 bool ensure_context(int surface_h) {
@@ -367,7 +369,7 @@ bool ensure_context(int surface_h) {
             ImFontConfig cfg;
             cfg.FontDataOwnedByAtlas = false;
             have_font = io.Fonts->AddFontFromMemoryTTF(font.address, (int)font.size,
-                                                       26.0f, &cfg) != nullptr;
+                                                       20.0f, &cfg) != nullptr;
         }
         if (!have_font)
             io.Fonts->AddFontDefault();
