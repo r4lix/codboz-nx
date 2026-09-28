@@ -3012,6 +3012,10 @@ static uint64_t g_prof_enter;             /* tick at the current handler entry *
 static uint32_t g_prof_depth;             /* handlers can re-enter via callbacks */
 static uint64_t g_prof_slot_ticks[512];
 static uint32_t g_prof_slot_calls[512];
+/* The same counts for the current frame only, so a slow frame can say which
+ * imports it was busy with. Cleared by pace_frame at every present. */
+static uint32_t g_frame_slot_calls[512];
+static uint64_t g_frame_slot_ticks[512];
 static uint32_t g_prof_slot;
 
 /* The guest clock itself lives with hle_timer_ms far below; these two are
@@ -3035,6 +3039,8 @@ static void hle_profile(uint32_t slot, int enter) {
         if (g_prof_slot < 512) {
             g_prof_slot_ticks[g_prof_slot] += d;
             g_prof_slot_calls[g_prof_slot]++;
+            g_frame_slot_calls[g_prof_slot]++;
+            g_frame_slot_ticks[g_prof_slot] += d;
         }
     }
 }
@@ -3108,9 +3114,9 @@ static void frame_profile_report(void) {
      * one that shows where the boundary is being crossed. A handler can be
      * 0% of the time and still be called 800 times a frame -- that is 800
      * register syncs and dispatcher round trips, and it is invisible in a
-     * ranking by ticks. The counts are collected by the dispatcher whether or
-     * not the profiler is on, so this prints in every build. */
-    {
+     * ranking by ticks. The counts come from the profiler hook, so without
+     * Profilers they are all zero and the block is skipped. */
+    if (g_prof_on) {
         unsigned calls_total = 0;
         int shown, taken[10];
         for (i = 0; i < 512; i++)
@@ -3222,17 +3228,158 @@ static void instr_profile_report(uint64_t executed, int presents) {
     g_iw_next = executed + INSTR_WINDOW;
 }
 
+/* ------------------------------------------------------------ frame pacing
+ *
+ * The 300-frame report above says where the AVERAGE frame goes. It cannot say
+ * why the frame rate is uneven, which is a question about the distribution:
+ * a steady 30 and an alternation of 60 and 20 have the same mean.
+ *
+ * So every frame records its wall time, the part of it spent blocked in
+ * eglSwapBuffers (the vsync wait -- time the CPU had to spare), and what it
+ * did: guest instructions retired, guest code translated by dynarmic, and HLE
+ * crossings. Every 300 frames that becomes percentiles of frame time and of
+ * work time (frame minus swap wait), a count of frames by vsync interval, and
+ * the three worst frames with their activity. Work time over 16.7 ms is a
+ * CPU-bound frame; a slow frame with a large translation count is dynarmic
+ * compiling; one with ordinary counts and a long swap is the display.
+ *
+ * Always on: a few counter reads per frame. */
+#define PACE_N 300
+
+typedef struct {
+    uint32_t frame_us, swap_us;
+    uint32_t instr_k;       /* guest instructions retired, thousands */
+    uint32_t fetched;       /* guest instructions read for translation */
+    uint32_t svc;           /* HLE crossings */
+    int      frame;
+    uint16_t top_slot[3];   /* costliest imports this frame (Profilers only) */
+    uint32_t top_n[3];      /* ...their call counts */
+    uint32_t top_us[3];     /* ...and the time they took */
+} PaceFrame;
+
+static PaceFrame g_pace[PACE_N];
+static int       g_pace_n;
+static uint64_t  g_pace_last_tick, g_pace_last_instr, g_pace_last_fetch,
+                 g_pace_last_svc;
+extern uint64_t  g_egl_swap_ticks, g_egl_clear_ticks;
+
+static int cmp_u32(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void report_clocks(const char *when);
+
+static void pace_report(void) {
+    static uint32_t ft[PACE_N], wk[PACE_N];
+    int i, n = g_pace_n, bins[5] = {0, 0, 0, 0, 0};
+    uint64_t fetched = 0, instr = 0;
+    for (i = 0; i < n; i++) {
+        const uint32_t f = g_pace[i].frame_us;
+        ft[i] = f;
+        wk[i] = f > g_pace[i].swap_us ? f - g_pace[i].swap_us : 0;
+        /* Vsync intervals: 60, 30, 20, 15 fps and below. Frames land in
+         * the interval they overran into, with 2 ms of slack for jitter. */
+        bins[f <= 18700 ? 0 : f <= 35300 ? 1 : f <= 52000 ? 2 : f <= 68700 ? 3 : 4]++;
+        fetched += g_pace[i].fetched;
+        instr += g_pace[i].instr_k;
+    }
+    qsort(ft, (size_t)n, sizeof ft[0], cmp_u32);
+    qsort(wk, (size_t)n, sizeof wk[0], cmp_u32);
+#define PCT(a, p) ((a)[(n - 1) * (p) / 100] / 100u)   /* 0.1 ms units */
+    printf("  [pace ] frame ms p50 %u.%u p90 %u.%u p99 %u.%u max %u.%u | minus vsync wait:"
+           " work p50 %u.%u p90 %u.%u max %u.%u\n",
+           PCT(ft, 50) / 10, PCT(ft, 50) % 10, PCT(ft, 90) / 10, PCT(ft, 90) % 10,
+           PCT(ft, 99) / 10, PCT(ft, 99) % 10, ft[n - 1] / 1000, ft[n - 1] / 100 % 10,
+           PCT(wk, 50) / 10, PCT(wk, 50) % 10, PCT(wk, 90) / 10, PCT(wk, 90) % 10,
+           wk[n - 1] / 1000, wk[n - 1] / 100 % 10);
+#undef PCT
+    printf("  [pace ] vsync intervals: 1:%d 2:%d 3:%d 4:%d 5+:%d |"
+           " %lluk instr/frame, %llu instr translated in window\n",
+           bins[0], bins[1], bins[2], bins[3], bins[4],
+           (unsigned long long)(instr / (uint64_t)n), (unsigned long long)fetched);
+    /* The three worst frames, and what they were doing. */
+    for (i = 0; i < 3; i++) {
+        int j, w = -1;
+        for (j = 0; j < n; j++)
+            if (g_pace[j].frame_us && (w < 0 || g_pace[j].frame_us > g_pace[w].frame_us))
+                w = j;
+        if (w < 0 || g_pace[w].frame_us < 20000)
+            break;
+        printf("  [hitch] frame %d: %u ms (vsync wait %u ms), %uk instr,"
+               " %u translated, %u HLE calls",
+               g_pace[w].frame, g_pace[w].frame_us / 1000, g_pace[w].swap_us / 1000,
+               g_pace[w].instr_k, g_pace[w].fetched, g_pace[w].svc);
+        for (j = 0; j < 3 && g_pace[w].top_n[j]; j++)
+            printf("%s%s %u.%u ms/%u", j ? ", " : " -- ",
+                   slot_name(g_pace[w].top_slot[j]), g_pace[w].top_us[j] / 1000,
+                   g_pace[w].top_us[j] / 100 % 10, (unsigned)g_pace[w].top_n[j]);
+        printf("\n");
+        g_pace[w].frame_us = 0;
+    }
+    g_pace_n = 0;
+    report_clocks("window");   /* an OC profile can change mid-session */
+}
+
+static void pace_frame(void) {
+    const uint64_t now = armGetSystemTick(), freq = armGetSystemTickFreq();
+    uint64_t instr, fetched, svc;
+    dyn_counters(&instr, &fetched, &svc);
+    if (g_pace_last_tick && g_pace_n < PACE_N) {
+        PaceFrame *p = &g_pace[g_pace_n++];
+        p->frame_us = (uint32_t)((now - g_pace_last_tick) * 1000000ull / freq);
+        p->swap_us = (uint32_t)((g_egl_swap_ticks + g_egl_clear_ticks)
+                                * 1000000ull / freq);
+        memset(p->top_n, 0, sizeof p->top_n);
+        if (g_prof_on) {
+            unsigned k, s2;
+            for (k = 0; k < 3; k++) {
+                uint64_t best = 0;
+                uint32_t bi = 0;
+                for (s2 = 0; s2 < 512; s2++)
+                    if (g_frame_slot_ticks[s2] > best) {
+                        best = g_frame_slot_ticks[s2];
+                        bi = s2;
+                    }
+                if (!best)
+                    break;
+                p->top_slot[k] = (uint16_t)bi;
+                p->top_n[k] = g_frame_slot_calls[bi];
+                p->top_us[k] = (uint32_t)(best * 1000000ull / freq);
+                g_frame_slot_ticks[bi] = 0;
+            }
+        }
+        p->instr_k = (uint32_t)((instr - g_pace_last_instr) / 1000ull);
+        p->fetched = (uint32_t)(fetched - g_pace_last_fetch);
+        p->svc = (uint32_t)(svc - g_pace_last_svc);
+        p->frame = g_presents;
+    }
+    if (g_prof_on) {
+        memset(g_frame_slot_calls, 0, sizeof g_frame_slot_calls);
+        memset(g_frame_slot_ticks, 0, sizeof g_frame_slot_ticks);
+    }
+    g_egl_clear_ticks = 0;
+    g_pace_last_tick = now;
+    g_pace_last_instr = instr;
+    g_pace_last_fetch = fetched;
+    g_pace_last_svc = svc;
+}
+
 /* Called from the eglSwapBuffers thunk. On the GL path the game never calls
  * s3eSurfaceShow, so g_presents would stay at 0 and the synthetic tap -- armed
  * from inside that handler -- would never fire. The game sits on "TOUCH SCREEN
  * TO START" forever. A GL swap is the same event, so it counts as a frame. */
 void egl_frame_presented(void) {
     g_presents++;
+    pace_frame();
     tap_arm(g_presents);
     if (g_presents <= 3 || (g_presents % 100) == 0)
         printf("  [egl  ] frame %d presented via GL\n", g_presents);
-    if ((g_presents % 300) == 0)
+    if ((g_presents % 300) == 0) {
         frame_profile_report();
+        if (g_pace_n > 0)
+            pace_report();
+    }
 }
 
 /* Called from the eglCreateWindowSurface thunk in jit/gl_egl.c. The guest's

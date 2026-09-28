@@ -60,6 +60,13 @@ extern volatile uint32_t g_native_stage;
 
 /* Counts a GL frame so the input state machine still advances -- see main.c. */
 extern void egl_frame_presented(void);
+/* Ticks the last eglSwapBuffers call blocked for: with vsync on, the frame's
+ * wait for the display rather than work. Read by egl_frame_presented. */
+uint64_t g_egl_swap_ticks;
+/* Ticks spent in glClear since the last present. With vsync the wait for a
+ * free back buffer lands here -- in the first call that touches the new
+ * buffer -- not in eglSwapBuffers, which only queues the frame. */
+uint64_t g_egl_clear_ticks;
 
 /* ----------------------------------------------------------- guest access */
 
@@ -1076,7 +1083,11 @@ static void te_SwapBuffers(GuestCpu *c, GuestMem *m, void *u) {
         menu_render((int)w, (int)h);
     }
     g_tex_frame++;
-    c->r[0] = (uint32_t)eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)s);
+    {
+        const uint64_t t0 = armGetSystemTick();
+        c->r[0] = (uint32_t)eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)s);
+        g_egl_swap_ticks = armGetSystemTick() - t0;
+    }
     if (c->r[0])
         egl_frame_presented();
     if (shown < 3) {
@@ -1143,6 +1154,13 @@ static int vp_map_x(int v) { return VP_X0 + (v * VP_DST_W) / VP_W; }
 static int vp_map_y(int v) { return (v * VP_DST_H) / VP_H; }
 static int vp_map_w(int v) { return (v * VP_DST_W) / VP_W; }
 static int vp_map_h(int v) { return (v * VP_DST_H) / VP_H; }
+
+static void te_Clear(GuestCpu *c, GuestMem *m, void *u) {
+    const uint64_t t0 = armGetSystemTick();
+    (void)u;
+    glClear((GLbitfield)ga(c, m, 0));
+    g_egl_clear_ticks += armGetSystemTick() - t0;
+}
 
 static void te_Viewport(GuestCpu *c, GuestMem *m, void *u) {
     static int shown;
@@ -1747,6 +1765,7 @@ static const struct { const char *name; GuestHleFn fn; } g_egl_overrides[] = {
     /* Not EGL, but they need the same hand-written treatment: the generated
      * versions pass the game's 480x320 coordinates straight through. */
     { "glViewport",              te_Viewport },
+    { "glClear",                 te_Clear },
     { "glScissor",               te_Scissor },
     { "glTexImage2D",            te_TexImage2D },
     { "glCompressedTexImage2D",  te_CompressedTexImage2D },

@@ -40,6 +40,10 @@ void dyn_diag(void);
 /* One line for the log: whether it is live, and what it has done. */
 void dyn_report(Guest *g);
 
+/* Guest instructions retired, guest instructions read for translation (so a
+ * jump in it is JIT compile work), and interceptions -- running totals. */
+void dyn_counters(uint64_t *instr, uint64_t *fetched, uint64_t *svc);
+
 #ifdef __cplusplus
 }
 #endif

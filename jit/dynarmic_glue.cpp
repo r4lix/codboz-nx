@@ -853,6 +853,17 @@ extern "C" void dyn_diag(void) {
     }
 }
 
+/* Running totals for the per-frame stats in main.c. Read from the guest
+ * thread, inside an interception, so nothing here races. `used` is what the
+ * current Run() has retired so far; g->executed is only brought up to date
+ * when Run() returns, every 5M instructions. */
+extern "C" void dyn_counters(uint64_t* instr, uint64_t* fetched, uint64_t* svc) {
+    Guest* g = g_env.g;
+    *instr = g ? g->executed + g_env.used : 0;
+    *fetched = g_env.fetches;
+    *svc = g_env.svc_calls;
+}
+
 extern "C" void dyn_report(Guest* g) {
     (void)g;
     if (!g_jit) {
@@ -881,5 +892,8 @@ extern "C" GuestStatus dyn_run(Guest *g, uint32_t until, uint64_t limit) {
 }
 extern "C" void dyn_diag(void) { }
 extern "C" void dyn_report(Guest *g) { (void)g; }
+extern "C" void dyn_counters(uint64_t *instr, uint64_t *fetched, uint64_t *svc) {
+    *instr = 0; *fetched = 0; *svc = 0;
+}
 
 #endif /* BOZ_DYNARMIC */
