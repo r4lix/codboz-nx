@@ -2157,6 +2157,10 @@ static int      g_tp_on = 1;        /* SND TPAD 0|1 */
  * faster. The reference uses width/8; live-settable because it is pure feel
  * and rebuilding once per guess is how tuning gets abandoned half-done. */
 static int      g_tp_look_r = TP_W / 8;   /* SND TPLOOK <radius> */
+/* Vertical radius, separate: the game turns more slowly up and down than
+ * sideways for the same pad offset, so one shared radius left pitch sluggish
+ * at any setting that made yaw feel right. */
+static int      g_tp_look_ry = TP_W / 8;
 
 /* How many touchpad handlers the game has actually installed. Zero means it
  * ignored the extension, and the synthetic-touch path has to stay in charge:
@@ -2301,7 +2305,7 @@ static void tp_update(GuestMem *mem) {
     l = game_stick(0);
     r = game_stick(1);
     tp_stick(mem, 0, l.x, l.y, TP_W / 5,     TP_H / 2, TP_W / 5, TP_H / 2);
-    tp_stick(mem, 1, r.x, r.y, TP_W * 4 / 5, TP_H / 2, g_tp_look_r, g_tp_look_r);
+    tp_stick(mem, 1, r.x, r.y, TP_W * 4 / 5, TP_H / 2, g_tp_look_r, g_tp_look_ry);
 }
 
 /* ---- controller as touch ----------------------------------------------
@@ -2337,6 +2341,7 @@ static void tp_update(GuestMem *mem) {
  * half-done. */
 static int g_aim_stick = 0;      /* 0 = drag and re-anchor, 1 = held stick */
 static int g_aim_speed = PX_W(53);  /* px per frame at full deflection */
+static int g_aim_speed_y = PX_W(53); /* the same, vertically */
 static int g_aim_radius = PX_W(170);/* held-stick deflection, as for the left */
 
 static const int PAD_MOVE_AX = PX_W(226), PAD_MOVE_AY = PX_H(514);
@@ -2441,7 +2446,7 @@ static void pad_touch_update(GuestMem *mem) {
             aim_down = 1;
         }
         aim_x += r.x * g_aim_speed / 32767;
-        aim_y -= r.y * g_aim_speed / 32767;
+        aim_y -= r.y * g_aim_speed_y / 32767;
         /* Off the edge: lift and start again from the middle, so a held stick
          * keeps turning instead of stopping at the screen border. */
         if (aim_x < PAD_AIM_EDGE || aim_x > (int)SCREEN_W - PAD_AIM_EDGE ||
@@ -5381,13 +5386,54 @@ unsigned gl_hidden_draws(void);
  * values behind them, the same ones the control socket's SND commands change.
  * Keys that apply only at boot (multiplayer_server, player_name) are not here:
  * net.c reads those from the file itself. */
+
+/* Aim speed, as a percentage of the defaults, applied to BOTH ways the right
+ * stick can reach the game. With a controller the game normally takes the
+ * Xperia touchpad, and there turn rate is set by the look pad's radius --
+ * so a setting that only moved g_aim_speed (the touch-emulation fallback)
+ * did nothing at all in normal play.
+ *
+ * The radius is capped where the pad would clip: the look pad is centred at
+ * 4/5 of the width, so beyond 191 a full right deflection hits the edge while
+ * a full left one does not, and turning right would top out slower than
+ * turning left. That caps the pad path at ~160%.
+ *
+ * Vertical has its own percentage and more room: the pad is 544 tall and
+ * centred, so the radius can reach 271 (~225%) before the edge clips. */
+#define AIM_PCT_MIN   50
+#define AIM_PCT_MAX   160
+#define AIM_Y_PCT_MAX 225
+static int g_aim_pct = 100;
+static int g_aim_y_pct = 100;
+
+static void aim_y_apply(int pct) {
+    const int look_max = TP_H / 2 - 1;
+    int r;
+    g_aim_y_pct = pct < AIM_PCT_MIN ? AIM_PCT_MIN
+                : (pct > AIM_Y_PCT_MAX ? AIM_Y_PCT_MAX : pct);
+    r = (TP_W / 8) * g_aim_y_pct / 100;
+    g_tp_look_ry = r > look_max ? look_max : r;
+    g_aim_speed_y = PX_W(53) * g_aim_y_pct / 100;
+}
+
+static void aim_apply(int pct) {
+    const int look_max = TP_W - 1 - TP_W * 4 / 5;
+    int r;
+    g_aim_pct = pct < AIM_PCT_MIN ? AIM_PCT_MIN
+              : (pct > AIM_PCT_MAX ? AIM_PCT_MAX : pct);
+    r = (TP_W / 8) * g_aim_pct / 100;
+    g_tp_look_r = r > look_max ? look_max : r;
+    g_aim_speed = PX_W(53) * g_aim_pct / 100;
+}
+
 int port_setting_get(const char *key) {
     if (!strcmp(key, "control_layout")) return g_tp_on;
     if (!strcmp(key, "aim_hold"))       return g_aim_hold;
     if (!strcmp(key, "run_toggle"))     return g_run_toggle;
     if (!strcmp(key, "y_hold_frames"))  return g_y_use_delay;
     if (!strcmp(key, "aim_stick"))      return g_aim_stick;
-    if (!strcmp(key, "aim_speed"))      return g_aim_speed;
+    if (!strcmp(key, "aim_sensitivity")) return g_aim_pct;
+    if (!strcmp(key, "aim_sensitivity_y")) return g_aim_y_pct;
     if (!strcmp(key, "hide_sticks"))    return gl_sticks_hidden();
     if (!strcmp(key, "show_fps"))       return gl_fps_shown();
     if (!strcmp(key, "music"))          return snd_out_music_enabled();
@@ -5400,7 +5446,8 @@ void port_setting_set(const char *key, int v) {
     else if (!strcmp(key, "run_toggle"))    g_run_toggle = v ? 1 : 0;
     else if (!strcmp(key, "y_hold_frames")) g_y_use_delay = v < 1 ? 1 : (v > 120 ? 120 : v);
     else if (!strcmp(key, "aim_stick"))     g_aim_stick = v ? 1 : 0;
-    else if (!strcmp(key, "aim_speed"))     g_aim_speed = v < 1 ? 1 : (v > 1000 ? 1000 : v);
+    else if (!strcmp(key, "aim_sensitivity")) aim_apply(v);
+    else if (!strcmp(key, "aim_sensitivity_y")) aim_y_apply(v);
     else if (!strcmp(key, "hide_sticks"))   gl_hide_sticks(v ? 1 : 0);
     else if (!strcmp(key, "show_fps"))      gl_show_fps(v ? 1 : 0);
     else if (!strcmp(key, "music"))         snd_out_music_enable(v ? 1 : 0);
@@ -5415,7 +5462,8 @@ const char *port_build_label(void) {
 static void port_settings_apply(void) {
     static const char *keys[] = {
         "control_layout", "aim_hold", "run_toggle", "y_hold_frames", "aim_stick",
-        "aim_speed", "hide_sticks", "show_fps", "music",
+        "aim_sensitivity", "aim_sensitivity_y", "hide_sticks", "show_fps",
+        "music",
     };
     unsigned i, applied = 0;
     /* advanced_init read the file at startup; reloading here would throw

@@ -437,12 +437,22 @@ void tab_controls() {
         set_live("aim_stick", aim_stick);
     help("How the right stick turns the camera when the touch layout is used.");
 
-    int speed = port_setting_get("aim_speed");
-    ImGui::TextUnformatted("Aim speed");
+    int speed = port_setting_get("aim_sensitivity");
+    ImGui::TextUnformatted("Aim speed, horizontal");
     ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::SliderInt("##aimspeed", &speed, 20, 300))
-        set_live("aim_speed", speed);
-    help("How fast the camera turns at full right-stick deflection.");
+    if (ImGui::SliderInt("##aimspeed", &speed, 50, 160, "%d%%"))
+        set_live("aim_sensitivity", speed);
+    help("How fast the camera turns left and right with the right stick. "
+         "100% is the original feel; 160% is the most the pad can give.");
+
+    int speed_y = port_setting_get("aim_sensitivity_y");
+    ImGui::TextUnformatted("Aim speed, vertical");
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::SliderInt("##aimspeedy", &speed_y, 50, 225, "%d%%"))
+        set_live("aim_sensitivity_y", speed_y);
+    help("How fast the camera looks up and down with the right stick. The "
+         "game turns more slowly vertically, so this goes higher: 225% is "
+         "the most the pad can give.");
 }
 
 void tab_online() {
