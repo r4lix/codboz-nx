@@ -50,12 +50,6 @@ loader/out/
 *.raw
 *.log
 
-# Runtime flag files: their presence on the card (or here, when the source
-# tree is the card) turns on a measurement mode. Empty, and per-machine.
-jit/s3e_interp/bench.txt
-jit/s3e_interp/profile.txt
-jit/s3e_interp/recompablate.txt
-
 # Staging copy of the console's SD card.
 lite_card/
 

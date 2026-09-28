@@ -6,8 +6,11 @@ So a plain socket server is a complete replacement for `nxlink -s`, and it does
 not need the netloader, which is what has been failing (it writes the NRO to
 the SD card, and that write errors with EIO).
 
-Put this PC's IPv4 address in sdmc:/switch/boz/nxlink_host.txt, start this,
-then launch the NRO from hbmenu.
+Put this PC's IPv4 address in sdmc:/switch/boz/config.txt as
+
+    nxlink_host=192.168.1.x
+
+start this, then launch the NRO from hbmenu.
 
 One connection per thread, deliberately. The first version accepted a single
 connection and only accepted the next one after that had closed -- which is

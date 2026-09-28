@@ -27,10 +27,10 @@
 #include "dynarmic_glue.h"
 #include <time.h>
 #include "audio.h"
+#include "settings.h"
 #ifdef __SWITCH__
 #include "net.h"
 #include "menu.h"
-#include "settings.h"
 #endif
 #include "recomp.h"
 #include "s3e_loader.h"
@@ -118,7 +118,7 @@ static uint32_t g_live_bytes, g_peak_bytes;
 /* On by default. Disabling it was tried in r29 on the theory that the game
  * reads through freed pointers; it fixed neither known fault (r27 died at
  * 3.44B and r29 at 3.5B, same site) and only costs memory, so recycling stays.
- * Put a 0 in sdmc:/switch/boz/recycle.txt to disable it and compare. */
+ * Turn heap_recycle off in the Advanced tab to disable it and compare. */
 static int g_recycle_freed = 1;
 
 static void galloc_record(uint32_t addr, uint32_t size) {
@@ -1698,7 +1698,7 @@ static int g_quit;
  * single stray touch changes the instruction stream and silently turns the
  * benchmark back into two different workloads. Hands off anyway: + still
  * aborts, and that is the only button read. */
-static int      g_bench;            /* bench.txt */
+static int      g_bench;            /* the bench setting */
 static uint64_t g_bench_target;     /* stop at this executed count */
 static uint64_t g_bench_t0;         /* tick at the first guest instruction */
 /* Set the moment the target is reached, so the measurement is taken THERE
@@ -1711,7 +1711,7 @@ static int      g_bench_presents;   /* presents AT the target, not at print time
 
 /* 2000M ended mid-load: 702 presents, still streaming assets. 5000M is
  * about four minutes and reaches settled gameplay. Overridable by putting
- * a number of millions in bench.txt, so changing the length of a run does
+ * a number of millions in bench_million, so changing a run's length does
  * not need a rebuild -- and so a pair of runs can be made shorter while
  * something is being iterated on, then long again to confirm. */
 #define BENCH_INSTR 5000000000ull
@@ -2042,7 +2042,7 @@ static int clampi(int v, int lo, int hi) {
  * buttons act on, and where the bug lived -- stays visible long enough to see.
  */
 /* Touch diagnostics: the two on-screen squares and the pointer logging.
- * Off unless touchdbg.txt is on the card -- the markers are drawn every frame
+ * Off unless touch_debug asks for it -- the markers are drawn every frame
  * and have no business appearing while anyone is playing. Kept rather than
  * deleted because seeing where the game thinks the finger is, next to where it
  * actually is, is what finally separated "wrong coordinates" from "right
@@ -3577,7 +3577,7 @@ static void hle_profile(uint32_t slot, int enter) {
     }
 }
 
-/* Set with g.prof, from profile.txt: whether the handler split is measured. */
+/* Set with g.prof, from the profilers setting: is the handler split measured? */
 static int g_prof_on;
 
 /* Scheduling of the interpreter thread itself; filled in at startup. */
@@ -3624,10 +3624,10 @@ static void frame_profile_report(void) {
         return;
 
     if (!g_prof_on) {
-        /* Without profile.txt nothing is timed, but the call counts below are
-         * free: they are incremented by the dispatcher either way. */
-        printf("  [prof ] %llu ms/300f (put profile.txt on the card for the"
-               " handler split)\n",
+        /* Without the profilers nothing is timed, but the call counts below
+         * are free: the dispatcher increments them either way. */
+        printf("  [prof ] %llu ms/300f (turn Profilers on in the menu's"
+               " Advanced tab for the handler split)\n",
                (unsigned long long)(total * 1000ull / freq));
     } else {
         printf("  [prof ] %llu ms/300f: handlers %llu%%, interpreting %llu%%\n",
@@ -4098,7 +4098,7 @@ static void hle_gl_getint(GuestCpu *cpu, GuestMem *mem, void *user) {
  *
  * Every query reads the tick afresh rather than returning a value latched once
  * per frame, so an in-frame wait loop still terminates. The old counter stays
- * one file away (fixedclock.txt) because reproducibility is what a comparison
+ * one setting away (fixed_clock) because reproducibility is what a comparison
  * against the Unicorn reference needs; hostdiff keeps its own copy regardless. */
 static uint32_t g_ticks;              /* the fixed-step fallback's counter */
 static uint64_t g_clock_base;         /* tick at the first query */
@@ -5826,6 +5826,220 @@ static void startup_stage_clear(void) {
 }
 
 
+/* ---- advanced settings ---------------------------------------------------
+ *
+ * Every switch below used to be a file on the card: fastmem.txt turned
+ * fastmem on by existing, dynarmic.txt carried a cache size in its text,
+ * bench.txt an instruction count. That was a reasonable mechanism while the
+ * only way to run this was from a PC with the card in it, and a poor one
+ * now: a player holding a console cannot create a file, but can open a menu.
+ * They are keys in config.txt instead, edited from the menu's Advanced tab.
+ *
+ * The old files are still read ONCE each, and only where the matching key is
+ * absent, so a card set up the old way behaves exactly as it did and is
+ * written into config.txt on the next launch. Nothing deletes them; they
+ * stop being consulted as soon as the key exists.
+ *
+ * All of these take effect at launch and are read once, here: what the menu
+ * edits is the next run, not this one.
+ */
+
+/* Set when the previous launch died before it finished starting. Every
+ * advanced key is then ignored for one run, because the usual reason a launch
+ * dies early is the setting someone just changed -- and the menu that would
+ * change it back is on the far side of the boot that is failing. */
+static int g_safe_mode;
+
+/* What the run actually ended up using, for the menu to show. Built as each
+ * switch is read, because "what was asked for" and "what is running" differ
+ * under safe mode, and again when dynarmic or fastmem decline to start. */
+static char g_runtime_label[192];
+
+static void runtime_note(const char *text) {
+    size_t n = strlen(g_runtime_label);
+    if (n + 3 >= sizeof g_runtime_label)
+        return;
+    if (n) {
+        g_runtime_label[n++] = ',';
+        g_runtime_label[n++] = ' ';
+    }
+    snprintf(g_runtime_label + n, sizeof g_runtime_label - n, "%s", text);
+}
+
+/* A legacy flag file, in either directory they were accepted from. Returns 1
+ * if it exists; *num is the number it carried, or -1 for none. */
+static int legacy_flag(const char *name, long *num) {
+    char path[96];
+    unsigned i;
+    *num = -1;
+    for (i = 0; i < 2; i++) {
+        FILE *f;
+        snprintf(path, sizeof path, i ? "sdmc:/%s" : "sdmc:/switch/boz/%s", name);
+        f = fopen(path, "rb");
+        if (!f)
+            continue;
+        if (fscanf(f, "%ld", num) != 1)
+            *num = -1;
+        fclose(f);
+        return 1;
+    }
+    return 0;
+}
+
+/* The same, for a file whose CONTENTS were the value rather than a number:
+ * nxlink_host.txt held an address. */
+static int legacy_text(const char *name, char *out, size_t cap) {
+    char path[96];
+    unsigned i;
+    for (i = 0; i < 2; i++) {
+        FILE *f;
+        size_t n;
+        snprintf(path, sizeof path, i ? "sdmc:/%s" : "sdmc:/switch/boz/%s", name);
+        f = fopen(path, "rb");
+        if (!f)
+            continue;
+        n = fread(out, 1, cap - 1, f);
+        fclose(f);
+        out[n] = 0;
+        while (n && (unsigned char)out[n - 1] <= ' ')
+            out[--n] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int settings_have(const char *key) {
+    return settings_get(key, NULL) != NULL;
+}
+
+/* What the import did, reported later: this all happens before stdout is
+ * redirected to the development host, so anything printed here would land on
+ * the console screen and never reach the log. */
+static unsigned g_imported;
+static int      g_import_saved;
+
+/* The one-time import. A key already in config.txt always wins: this exists
+ * for cards that predate it, not to keep the files authoritative. */
+static void advanced_import_legacy(void) {
+    static const struct { const char *key; const char *file; } presence[] = {
+        { "fastmem",       "fastmem.txt" },
+        { "predecode",     "predecode.txt" },
+        { "profilers",     "profile.txt" },
+        { "fixed_clock",   "fixedclock.txt" },
+        { "watch_object",  "watch.txt" },
+        { "touch_debug",   "touchdbg.txt" },
+        { "jit_chain",     "chain.txt" },
+        { "jit_verify",    "jitverify.txt" },
+        { "recomp_verify", "recompverify.txt" },
+        { "recomp_ablate", "recompablate.txt" },
+    };
+    unsigned i, n = 0;
+    long v;
+
+    for (i = 0; i < sizeof presence / sizeof presence[0]; i++) {
+        if (settings_have(presence[i].key) || !legacy_flag(presence[i].file, &v))
+            continue;
+        settings_set_int(presence[i].key, 1);
+        n++;
+    }
+    /* The engine: two files, one key. dynarmic is read second so that it wins
+     * if both were left on the card. */
+    if (legacy_flag("jit.txt", &v) && !settings_have("cpu_engine")) {
+        settings_set("cpu_engine", "jit");
+        n++;
+    }
+    if (legacy_flag("dynarmic.txt", &v)) {
+        if (!settings_have("cpu_engine")) {
+            settings_set("cpu_engine", "dynarmic");
+            n++;
+        }
+        if (v > 0 && !settings_have("dynarmic_cache_mb")) {
+            settings_set_int("dynarmic_cache_mb", (int)v);
+            n++;
+        }
+    }
+    /* recycle.txt is the one that meant something by its CONTENTS: it held
+     * "0" to turn recycling off, and existing at all left it on. */
+    if (legacy_flag("recycle.txt", &v) && !settings_have("heap_recycle")) {
+        settings_set_int("heap_recycle", v == 0 ? 0 : 1);
+        n++;
+    }
+    if (legacy_flag("bench.txt", &v)) {
+        if (!settings_have("bench")) {
+            settings_set_int("bench", 1);
+            n++;
+        }
+        if (v > 0 && !settings_have("bench_million")) {
+            settings_set_int("bench_million", (int)v);
+            n++;
+        }
+    }
+    if (legacy_flag("recomp.txt", &v)) {
+        if (!settings_have("recomp")) {
+            settings_set_int("recomp", 1);
+            n++;
+        }
+        if (v > 0 && !settings_have("recomp_mask")) {
+            settings_set_int("recomp_mask", (int)v);
+            n++;
+        }
+    }
+    /* Not a flag: the development host stdout is streamed to. Its file held
+     * an address rather than a number, so it is read as text. */
+    if (!settings_have("nxlink_host")) {
+        char host[64];
+        if (legacy_text("nxlink_host.txt", host, sizeof host) && host[0]) {
+            settings_set("nxlink_host", host);
+            n++;
+        }
+    }
+    if (n) {
+        g_imported = n;
+        g_import_saved = settings_save() != 0;
+    }
+}
+
+/* From run(), once the log is going where it can be read. */
+static void advanced_report(void) {
+    if (g_imported)
+        printf("  [cfg  ] imported %u old flag file setting(s) into config.txt%s\n",
+               g_imported, g_import_saved ? "" : " (SAVE FAILED)");
+    if (g_imported)
+        printf("  [cfg  ] the .txt flag files are no longer read; delete them\n");
+    if (g_safe_mode)
+        printf("  [cfg  ] SAFE MODE: the last launch did not finish starting,"
+               " so every Advanced setting is ignored this run\n");
+}
+
+/* Read an advanced key. Under safe mode every one returns its built-in
+ * default, whatever the file says. */
+static int adv_int(const char *key, int def) {
+    return g_safe_mode ? def : settings_get_int(key, def);
+}
+
+static const char *adv_str(const char *key, const char *def) {
+    return g_safe_mode ? def : settings_get(key, def);
+}
+
+/* From main(), once the card is readable and the crash breadcrumb has been
+ * read: that breadcrumb is what decides safe mode. */
+static void advanced_init(int previous_run_died) {
+    settings_load();
+    advanced_import_legacy();
+    g_safe_mode = previous_run_died;
+}
+
+/* For the menu (menu.h). */
+int port_safe_mode(void) {
+    return g_safe_mode;
+}
+
+const char *port_runtime_label(void) {
+    return g_runtime_label[0] ? g_runtime_label : "interpreter";
+}
+
+
+
 static int startup_stage_read(char *out, size_t cap) {
     unsigned i;
     for (i = 0; i < sizeof(g_stage_paths) / sizeof(g_stage_paths[0]); i++) {
@@ -5854,8 +6068,8 @@ static uint32_t fnv1a32(const unsigned char *p, size_t n) {
     return h;
 }
 
-static int      g_want_dyn;         /* dynarmic.txt */
-static unsigned g_dyn_mb = 32;      /* code cache, MB; a number in the file */
+static int      g_want_dyn;         /* cpu_engine = dynarmic */
+static unsigned g_dyn_mb = 32;      /* code cache, MB; dynarmic_cache_mb */
 static int      g_dyn_live;         /* dyn_init actually succeeded */
 static int g_want_fastmem;
 static VirtmemReservation *g_fastmem_rv;
@@ -6029,8 +6243,8 @@ static void fastmem_setup(GuestMem *m) {
 
 #define RECOMP_MAX 8
 
-static int      g_recomp_on;             /* recomp.txt */
-static int      g_recomp_verify;         /* recompverify.txt */
+static int      g_recomp_on;             /* the recomp setting */
+static int      g_recomp_verify;         /* recomp_verify */
 static uint32_t g_recomp_hook0;          /* index of the first recomp hook */
 /* Set ONLY around the interpreter's re-run. While it is set every
  * translated hook stands aside so the real instructions execute. */
@@ -6049,11 +6263,11 @@ static int      g_recomp_rerun;
  * verification re-running inside another has no meaning. So depth selects
  * the plain path, and only the re-run itself suppresses the hook. */
 static int      g_recomp_depth;
-static int      g_recomp_ablate;         /* recompablate.txt */
-/* Which entries of g_recomp[] to install, as a bitmask read from
- * recomp.txt. One flag enabling the whole table makes a second
- * translation unmeasurable -- its effect cannot be separated from the
- * first one's. Empty file, or no number, means all of them. */
+static int      g_recomp_ablate;         /* recomp_ablate */
+/* Which entries of g_recomp[] to install, as a bitmask: recomp_mask, which
+ * the menu edits as a checkbox per function. One flag enabling the whole
+ * table makes a second translation unmeasurable -- its effect cannot be
+ * separated from the first one's. Unset means all of them. */
 static uint32_t g_recomp_mask = 0xFFFFFFFFu;
 /* g_recomp[] index -> the hook slot it was installed in. Once the mask
  * can skip entries the two stop being the same number, and a handler
@@ -6067,6 +6281,16 @@ static uint32_t g_recomp_declined[RECOMP_MAX];
 static uint32_t g_recomp_diverged[RECOMP_MAX];
 static uint32_t g_recomp_verified[RECOMP_MAX];
 static uint32_t g_recomp_unverified[RECOMP_MAX];
+/* The recompiled functions, so the menu can offer one checkbox each rather
+ * than asking anyone to write a bitmask by hand. */
+unsigned port_recomp_count(void) {
+    return g_recomp_count < RECOMP_MAX ? g_recomp_count : RECOMP_MAX;
+}
+
+const char *port_recomp_name(unsigned i) {
+    return i < port_recomp_count() ? g_recomp[i].name : "";
+}
+
 
 /* Registers only, and not r15: the translation never touches PC (the loop
  * branches to LR for it) while the interpreter's run ends with PC already at
@@ -6384,7 +6608,8 @@ static void recomp_report(void) {
  * change of one byte means stopping, ejecting the card, editing on a PC and
  * putting it back -- and a run that differs from its pair by a file nobody
  * noticed is the single failure that has cost this project the most time
- * today. chain.txt quietly enabling the whole JIT is the same disease.
+ * today. A stray chain flag quietly enabling the whole JIT is the same
+ * disease.
  *
  * So the NRO listens. It already speaks to the PC in one direction (stdout
  * over nxlink); this is the other, a small line protocol on port 28772 that
@@ -6522,7 +6747,8 @@ static void port_settings_apply(void) {
         "aim_speed", "hide_sticks", "show_fps", "music",
     };
     unsigned i, applied = 0;
-    settings_load();
+    /* advanced_init read the file at startup; reloading here would throw
+     * away nothing, but it would also invite a second source of truth. */
     for (i = 0; i < sizeof keys / sizeof keys[0]; i++) {
         const int current = port_setting_get(keys[i]);
         const int value = settings_get_int(keys[i], current);
@@ -6531,8 +6757,8 @@ static void port_settings_apply(void) {
             applied++;
         }
     }
-    printf("  [menu ] config.txt: %u setting(s) applied; hold - for 2 s for the menu\n",
-           applied);
+    printf("  [menu ] config.txt: %u setting(s) applied; hold - for 2 s for the"
+           " menu\n", applied);
 }
 #endif
 
@@ -7148,6 +7374,7 @@ static void run(void) {
     GuestStatus st;
 
     startup_stage_write("01 run entered");
+    advanced_report();
 
     for (i = 0; i < 2 && !file; i++)
         file = slurp(paths[i], &size);
@@ -7264,12 +7491,9 @@ static void run(void) {
          * the interpreter only stamps mem.current_pc while a watch is armed,
          * and guest_wptr tests every store against the watched word, so
          * leaving it on costs about 3% for a diagnostic nothing is reading.
-         * Re-arm by dropping watch.txt next to the NRO. */
-        FILE *wf = fopen("sdmc:/switch/boz/watch.txt", "rb");
-        if (!wf)
-            wf = fopen("sdmc:/watch.txt", "rb");
-        if (wf) {
-            fclose(wf);
+         * Re-arm with watch_object in the menu's Advanced tab. */
+        if (adv_int("watch_object", 0)) {
+            runtime_note("watch");
             g.mem.watch_addr = g_img.load_base + RVA_OBJ_GLOBAL;
             printf("watch: object global at %08x (RVA %06x)\n",
                    (unsigned)g.mem.watch_addr, (unsigned)RVA_OBJ_GLOBAL);
@@ -7281,41 +7505,27 @@ static void run(void) {
          * oracle: run_boz.py single-steps the interpreter against Unicorn and
          * cannot follow a block-at-a-time execution, and the JIT only exists
          * on AArch64 so the host harness cannot run it at all. Until coverage
-         * is broad enough to have been exercised for a long time, a file on
-         * the card is the right switch.
+         * is broad enough to have been exercised for a long time, it stays
+         * something chosen rather than the default.
          *
-         *   jit.txt        compile and run hot blocks
-         *   jitverify.txt  re-run every compiled block through the interpreter
-         *                  and compare -- much slower, and the only way this
-         *                  gets trustworthy
+         *   cpu_engine = jit   compile and run hot blocks
+         *   jit_verify         re-run every compiled block through the
+         *                      interpreter and compare -- much slower, and the
+         *                      only way this gets trustworthy
+         *   jit_chain          run block to block without returning to the
+         *                      dispatcher. Separate from the self-check
+         *                      because it is the one thing that check cannot
+         *                      cover -- verification re-runs a single block,
+         *                      and a chain is by definition not one block --
+         *                      so it is forced off whenever verify is on.
          *
-         * Verification implies the JIT; asking for the check without the thing
-         * being checked is a mistake worth silently fixing rather than
-         * obeying. */
-        static const char *jit_paths[] = {
-            "sdmc:/switch/boz/jit.txt", "sdmc:/jit.txt" };
-        static const char *ver_paths[] = {
-            "sdmc:/switch/boz/jitverify.txt", "sdmc:/jitverify.txt" };
-        /* Chaining is separate from the JIT and from its self-check, because
-         * it is the one thing the self-check cannot cover: verification
-         * re-runs a single block through the interpreter, and a chain is by
-         * definition not a single block. So it gets its own switch, and it is
-         * forced off whenever verification is on. */
-        static const char *chain_paths[] = {
-            "sdmc:/switch/boz/chain.txt", "sdmc:/chain.txt" };
-        int want_jit = 0, want_ver = 0, want_chain = 0, k;
-        for (k = 0; k < 2; k++) {
-            FILE *f = fopen(jit_paths[k], "rb");
-            if (f) { fclose(f); want_jit = 1; }
-            f = fopen(ver_paths[k], "rb");
-            if (f) { fclose(f); want_ver = 1; }
-            f = fopen(chain_paths[k], "rb");
-            if (f) { fclose(f); want_chain = 1; }
-        }
-        if (want_ver)
-            want_jit = 1;
-        if (want_chain)
-            want_jit = 1;
+         * Both only mean anything under this engine: read through it, so that
+         * a leftover jit_verify cannot quietly start a second CPU underneath
+         * dynarmic. */
+        const int engine_jit = !strcmp(adv_str("cpu_engine", "interpreter"), "jit");
+        const int want_jit = engine_jit;
+        const int want_ver = engine_jit && adv_int("jit_verify", 0);
+        const int want_chain = engine_jit && adv_int("jit_chain", 0);
         if (want_jit && guest_jit_init(&g)) {
             g.jit_verify = want_ver;
             g.jit_chain = want_chain && !want_ver;
@@ -7327,37 +7537,21 @@ static void run(void) {
                    want_ver ? ", self-verifying (slow)" : "",
                    g.jit_chain ? ", chaining" :
                    (want_chain ? ", chaining suppressed by verify" : ""));
+            runtime_note(want_ver ? "block JIT (verifying)" : "block JIT");
         } else if (want_jit) {
             printf("jit: requested but guest_jit_init failed\n");
         }
     }
 
-    {   /* Allocator recycling is off unless the card asks for it back, so the
-         * two behaviours can be compared without a rebuild. */
-        static const char *paths[] = {"sdmc:/switch/boz/recycle.txt",
-                                      "sdmc:/recycle.txt"};
-        unsigned k;
-        for (k = 0; k < 2; k++) {
-            FILE *f = fopen(paths[k], "rb");
-            char c = 0;
-            if (!f)
-                continue;
-            if (fread(&c, 1, 1, f) == 1 && c == '0')
-                g_recycle_freed = 0;
-            fclose(f);
-            break;
-        }
+    {   /* Handing freed blocks back to the guest allocator, which can be
+         * turned off so the two behaviours compare without a rebuild. */
+        g_recycle_freed = adv_int("heap_recycle", g_recycle_freed) ? 1 : 0;
         printf("heap: recycle freed blocks = %d\n", g_recycle_freed);
+        if (!g_recycle_freed)
+            runtime_note("no heap recycling");
     }
-    {   /* touchdbg.txt: on-screen touch markers and pointer logging. */
-        static const char *tp[] = {"sdmc:/switch/boz/touchdbg.txt",
-                                   "sdmc:/touchdbg.txt"};
-        unsigned k;
-        for (k = 0; k < 2; k++) {
-            FILE *f = fopen(tp[k], "rb");
-            if (f) { fclose(f); g_touch_dbg = 1; break; }
-        }
-    }
+    /* On-screen touch markers and pointer logging. */
+    g_touch_dbg = adv_int("touch_debug", 0);
     startup_stage_write("04 VFS and GL allocator ready");
 
     /* Page-aligned so svcMapMemory can alias them into the fastmem window;
@@ -7376,20 +7570,14 @@ static void run(void) {
          * through the region table. The guest address space is 32 bits, so a
          * 4 GB window covers it exactly and no bounds test is needed at all.
          *
-         * Opt-in behind fastmem.txt, because it changes what an unmapped guest
-         * access does: today guest_ptr returns NULL and the interpreter faults
-         * with an address and a PC history, and under fastmem the process
-         * takes a data abort instead. Bad accesses have been a recurring bug
-         * class here, so the safe path stays one file away.
+         * Opt-in, because it changes what an unmapped guest access does:
+         * today guest_ptr returns NULL and the interpreter faults with an
+         * address and a PC history, and under fastmem the process takes a
+         * data abort instead. Bad accesses have been a recurring bug class
+         * here, so the diagnosable path stays the default.
          *
          * Any failure leaves fast_base NULL and everything falls back. */
-        static const char *fm_paths[] = {
-            "sdmc:/switch/boz/fastmem.txt", "sdmc:/fastmem.txt" };
-        int want_fm = 0, k;
-        for (k = 0; k < 2; k++) {
-            FILE *f = fopen(fm_paths[k], "rb");
-            if (f) { fclose(f); want_fm = 1; }
-        }
+        const int want_fm = adv_int("fastmem", 0);
         if (want_fm) {
             /* The loader callocs the image, so it is not page aligned; copy it
              * into an aligned buffer now that relocations have been applied. */
@@ -7419,6 +7607,9 @@ static void run(void) {
             g_stack     = g.mem.fast_base + STACK_BASE;
             g_heap      = g.mem.fast_base + HEAP_BASE;
             g_surf      = g.mem.fast_base + SURF_BASE;
+            runtime_note("fastmem");
+        } else {
+            runtime_note("fastmem FAILED");
         }
     }
     startup_stage_write("06 guest memory mapped");
@@ -7503,16 +7694,10 @@ static void run(void) {
      * left both running permanently, folding their cost into every frame the
      * game has ever rendered here.
      *
-     * Put profile.txt on the card when choosing what to hook; leave it off to
+     * Turn the profilers on when choosing what to hook; leave them off to
      * play. The reports already handle a NULL pointer by printing nothing. */
     {
-        static const char *prof_paths[] = {
-            "sdmc:/switch/boz/profile.txt", "sdmc:/profile.txt" };
-        int want_prof = 0, k;
-        for (k = 0; k < 2; k++) {
-            FILE *f = fopen(prof_paths[k], "rb");
-            if (f) { fclose(f); want_prof = 1; }
-        }
+        const int want_prof = adv_int("profilers", 0);
         g.pcprof_base = g_img.load_base;
         g.pcprof_buckets = (g_img.image_size + 15u) >> 4;
         if (want_prof) {
@@ -7525,36 +7710,33 @@ static void run(void) {
              * shipping build paid for a measurement nobody was reading. */
             g.prof = hle_profile;
             g_prof_on = 1;
+            runtime_note("profilers");
         }
         if (!g.pcprof)
             g.pcprof_buckets = 0;
-        printf("profilers %s\n", want_prof ? "on (profile.txt)" : "off");
+        printf("profilers %s\n", want_prof ? "on" : "off");
     }
 
     /* Real time, or the old fixed 16 ms step; see hle_timer_ms. Real time
      * is the default now -- the fixed step made game speed a function of
-     * frame rate. fixedclock.txt puts the reproducible clock back, which is
-     * what a run compared against the Unicorn reference needs. */
+     * frame rate. fixed_clock puts the reproducible clock back, which is what
+     * a run compared against the Unicorn reference needs. */
     {
-        static const char *clk_paths[] = {
-            "sdmc:/switch/boz/fixedclock.txt", "sdmc:/fixedclock.txt" };
-        int k;
-        for (k = 0; k < 2; k++) {
-            FILE *f = fopen(clk_paths[k], "rb");
-            if (f) { fclose(f); g_clock_fixed = 1; }
-        }
+        g_clock_fixed = adv_int("fixed_clock", 0);
         printf("clock %s\n", g_clock_fixed
-               ? "fixed 16 ms/query (fixedclock.txt)" : "real time");
+               ? "fixed 16 ms/query" : "real time");
+        if (g_clock_fixed)
+            runtime_note("fixed clock");
     }
 
-    /* Dynarmic, opt-in behind dynarmic.txt.
+    /* Dynarmic, chosen with cpu_engine.
      *
-     * A flag rather than a build switch because the whole point is to compare
-     * it against the interpreter on the same binary in the same scene: two
-     * builds is exactly the mistake that made the predecode spike look like a
-     * 6% win when it was worth nothing at all.
+     * A setting rather than a build switch because the whole point is to
+     * compare it against the interpreter on the same binary in the same
+     * scene: two builds is exactly the mistake that made the predecode spike
+     * look like a 6% win when it was worth nothing at all.
      *
-     * A number in the file sets the code cache in MB. The default is far below
+     * dynarmic_cache_mb sets the code cache. The default is far below
      * dynarmic's own 128 MB: this is one game, the translations are bounded by
      * how much of the image actually runs, and on this console that memory is
      * taken from a heap the guest also needs.
@@ -7563,61 +7745,39 @@ static void run(void) {
      * depends on how the homebrew was launched -- so dyn_init reports and
      * returns 0, and everything below carries on interpreting. */
     {
-        static const char *dy_paths[] = {
-            "sdmc:/switch/boz/dynarmic.txt", "sdmc:/dynarmic.txt" };
-        int k;
-        for (k = 0; k < 2; k++) {
-            FILE *f = fopen(dy_paths[k], "rb");
-            if (f) {
-                unsigned mb = 0;
-                if (fscanf(f, "%u", &mb) == 1 && mb >= 4 && mb <= 256)
-                    g_dyn_mb = mb;
-                fclose(f);
-                g_want_dyn = 1;
-                break;
-            }
-        }
-        printf("cpu: %s\n", g_want_dyn ? "dynarmic (dynarmic.txt)" : "interpreter");
+        const int mb = adv_int("dynarmic_cache_mb", (int)g_dyn_mb);
+        g_want_dyn = !strcmp(adv_str("cpu_engine", "interpreter"), "dynarmic");
+        if (mb >= 4 && mb <= 256)
+            g_dyn_mb = (unsigned)mb;
+        printf("cpu: %s\n", g_want_dyn ? "dynarmic" : "interpreter");
     }
 
     /* Benchmark mode; see the comment on g_bench. Deliberately NOT combined
      * with anything else -- the point of the run is that one thing differs
      * between it and its pair, so the other switches stay where they are. */
     {
-        static const char *bn_paths[] = {
-            "sdmc:/switch/boz/bench.txt", "sdmc:/bench.txt" };
-        int k;
-        for (k = 0; k < 2; k++) {
-            FILE *f = fopen(bn_paths[k], "rb");
-            if (f) {
-                unsigned long long m = 0;
-                if (fscanf(f, "%llu", &m) == 1 && m)
-                    g_bench_target = (uint64_t)m * 1000000ull;
-                fclose(f);
-                g_bench = 1;
-            }
-        }
+        const int million = adv_int("bench_million", 0);
+        g_bench = adv_int("bench", 0);
+        if (million > 0)
+            g_bench_target = (uint64_t)million * 1000000ull;
         if (g_bench) {
             if (!g_bench_target)
                 g_bench_target = BENCH_INSTR;
             printf("bench on: stopping at %lluM instructions,"
                    " real input suppressed\n",
                    (unsigned long long)(g_bench_target / 1000000ull));
+            runtime_note("BENCHMARK (input off)");
         }
     }
 
     /* T16 0x46 predecode fast path; see g_predecode in interp.c. Off by
-     * default so the two arms of an A/B differ by a file, not a build. */
+     * default so the two arms of an A/B differ by a setting, not a build. */
     {
-        static const char *pd_paths[] = {
-            "sdmc:/switch/boz/predecode.txt", "sdmc:/predecode.txt" };
-        int k;
-        for (k = 0; k < 2; k++) {
-            FILE *f = fopen(pd_paths[k], "rb");
-            if (f) { fclose(f); g_predecode = 1; }
-        }
+        g_predecode = adv_int("predecode", 0);
         printf("predecode %s\n",
-               g_predecode ? "on (predecode.txt): T16 0x46 fast path" : "off");
+               g_predecode ? "on: T16 0x46 fast path" : "off");
+        if (g_predecode)
+            runtime_note("predecode");
     }
 
     report_clocks("start");
@@ -7735,31 +7895,20 @@ static void run(void) {
         g.hook_count = d + 9;
     }
 
-    /* Statically recompiled functions, opt-in behind recomp.txt and
-     * verified against the interpreter behind recompverify.txt. Installed
-     * last so the indices above are untouched whether it runs or not. */
+    /* Statically recompiled functions, opt-in, and verified against the
+     * interpreter under recomp_verify. Installed last so the indices above
+     * are untouched whether it runs or not. recomp_mask picks which of them
+     * are installed, one bit per entry of g_recomp[]; the menu shows it as a
+     * checkbox per function. */
     {
-        static const char *on_paths[] = {
-            "sdmc:/switch/boz/recomp.txt", "sdmc:/recomp.txt" };
-        static const char *vf_paths[] = {
-            "sdmc:/switch/boz/recompverify.txt", "sdmc:/recompverify.txt" };
-        static const char *ab_paths[] = {
-            "sdmc:/switch/boz/recompablate.txt", "sdmc:/recompablate.txt" };
-        int k;
-        for (k = 0; k < 2; k++) {
-            FILE *f = fopen(on_paths[k], "rb");
-            if (f) {
-                unsigned long mask = 0;
-                if (fscanf(f, "%lu", &mask) == 1)
-                    g_recomp_mask = (uint32_t)mask;
-                fclose(f);
-                g_recomp_on = 1;
-            }
-            f = fopen(vf_paths[k], "rb");
-            if (f) { fclose(f); g_recomp_on = g_recomp_verify = 1; }
-            f = fopen(ab_paths[k], "rb");
-            if (f) { fclose(f); g_recomp_on = g_recomp_ablate = 1; }
-        }
+        const int mask = adv_int("recomp_mask", -1);
+        g_recomp_on = adv_int("recomp", 0);
+        g_recomp_verify = adv_int("recomp_verify", 0);
+        g_recomp_ablate = adv_int("recomp_ablate", 0);
+        if (g_recomp_verify || g_recomp_ablate)
+            g_recomp_on = 1;
+        if (mask >= 0)
+            g_recomp_mask = (uint32_t)mask;
         if (g_recomp_on) {
             uint32_t r = g.hook_count;
             unsigned i;
@@ -7783,6 +7932,7 @@ static void run(void) {
                    g_recomp_ablate ? " (ablating: alternate 300-frame windows)"
                                    : "",
                    g_recomp_count);
+            runtime_note(g_recomp_verify ? "recomp (verifying)" : "recomp");
         } else {
             printf("recomp off\n");
         }
@@ -7811,6 +7961,15 @@ static void run(void) {
         g_dyn_live = dyn_init(&g, g_dyn_mb);
         if (!g_dyn_live)
             printf("cpu: falling back to the interpreter\n");
+    }
+    {   /* Only now is the engine actually known: dynarmic asks the kernel for
+         * executable memory and does not always get it. */
+        char note[48];
+        if (g_dyn_live)
+            snprintf(note, sizeof note, "dynarmic %u MB", g_dyn_mb);
+        else
+            snprintf(note, sizeof note, "interpreter");
+        runtime_note(note);
     }
     startup_stage_write("09 entering guest interpreter");
     {
@@ -7996,7 +8155,7 @@ static void run(void) {
  * nxlinkStdio() has nothing to connect to -- it returns -1 and the whole log
  * is stranded on a console that the framebuffer takes over at the first frame.
  * The address is just a global, so read it off the card instead. Put the PC's
- * IPv4 address in nxlink_host.txt and run a listener on port 28771
+ * IPv4 address in the nxlink_host setting and run a listener on port 28771
  * (NXLINK_CLIENT_PORT); the stream is plain text with no handshake.
  *
  * This removes netloader from the loop entirely, which matters because
@@ -8008,8 +8167,8 @@ static void run(void) {
  * main thread, before run() is ever reached. That is fine when the PC is
  * there. With the PC off -- which is the normal state for simply PLAYING the
  * game -- it blocks for the full TCP SYN timeout and the game looks like it
- * does not start at all. A nxlink_host.txt on the card makes that the
- * guaranteed path rather than a rare one, because the file is what supplies
+ * does not start at all. A configured nxlink_host makes that the
+ * guaranteed path rather than a rare one, because it is what supplies
  * an address to hang on; without it __nxlink_host is zero and the call fails
  * immediately, which is why this never showed up while netloading.
  *
@@ -8055,28 +8214,20 @@ static int nxlink_reachable(void) {
     return 0;
 }
 
+/* The development host that stdout is streamed to when the game was not
+ * launched by nxlink. A config.txt key like every other switch; the old
+ * nxlink_host.txt was imported into it at startup. */
 static int nxlink_host_from_file(void) {
-    static const char *paths[] = {"sdmc:/switch/boz/nxlink_host.txt",
-                                  "sdmc:/nxlink_host.txt"};
-    unsigned i;
-    for (i = 0; i < 2; i++) {
-        char buf[64];
-        size_t n;
-        FILE *f = fopen(paths[i], "rb");
-        if (!f)
-            continue;
-        n = fread(buf, 1, sizeof buf - 1, f);
-        fclose(f);
-        buf[n] = 0;
-        while (n && (unsigned char)buf[n - 1] <= ' ')
-            buf[--n] = 0;                       /* trailing newline/space */
-        if (inet_pton(AF_INET, buf, &__nxlink_host) == 1) {
-            printf("nxlink host %s (from %s)\n", buf, paths[i]);
-            return 1;
-        }
-        printf("bad address \"%s\" in %s\n", buf, paths[i]);
+    const char *host = settings_get("nxlink_host", NULL);
+    if (!host || !host[0]) {
+        printf("no nxlink_host in config.txt\n");
+        return 0;
     }
-    printf("no nxlink_host.txt on the card\n");
+    if (inet_pton(AF_INET, host, &__nxlink_host) == 1) {
+        printf("nxlink host %s (config.txt)\n", host);
+        return 1;
+    }
+    printf("bad nxlink_host \"%s\" in config.txt\n", host);
     return 0;
 }
 
@@ -8102,17 +8253,24 @@ int main(int argc, char **argv) {
                (unsigned long long)mask, (int)g_main_prio);
     }
 
-    if (startup_stage_read(previous_stage, sizeof previous_stage)) {
-        printf("PREVIOUS RUN LAST REACHED:\n%s\n\nPress A to continue.\n",
-               previous_stage);
-        consoleUpdate(NULL);
-        while (appletMainLoop()) {
-            padUpdate(&g_pad);
-            if (padGetButtonsDown(&g_pad) & HidNpadButton_A)
-                break;
+    {   /* A breadcrumb still on the card means the last launch died before it
+         * finished starting -- which is also what puts this run in safe mode,
+         * so the settings that could have caused it are ignored once. */
+        const int died = startup_stage_read(previous_stage, sizeof previous_stage);
+        if (died) {
+            printf("PREVIOUS RUN LAST REACHED:\n%s\n\nPress A to continue.\n",
+                   previous_stage);
             consoleUpdate(NULL);
-            svcSleepThread(10000000ull);
+            while (appletMainLoop()) {
+                padUpdate(&g_pad);
+                if (padGetButtonsDown(&g_pad) & HidNpadButton_A)
+                    break;
+                consoleUpdate(NULL);
+                svcSleepThread(10000000ull);
+            }
         }
+        /* Before anything reads a setting, nxlink's host included. */
+        advanced_init(died);
     }
 
 #ifdef BOZ_PGO

@@ -526,10 +526,164 @@ void tab_help() {
     ImGui::BulletText("- and + together for 1 s: quit the game");
     ImGui::Spacing();
     ImGui::TextWrapped("Settings are saved to sdmc:/switch/boz/config.txt when "
-                       "the menu closes.");
+                       "the menu closes. The Advanced tab replaces the flag "
+                       "files that used to sit next to the game.");
     ImGui::Spacing();
     ImGui::TextDisabled("%s", port_build_label());
     help("");
+}
+
+/* ---- the Advanced tab ----------------------------------------------------
+ *
+ * These were files on the card until now -- fastmem.txt, dynarmic.txt and a
+ * dozen others -- which meant that changing how the port runs took a PC and a
+ * card reader. They are keys in the same config.txt as everything else here.
+ *
+ * All of them are read once, at launch, so this tab edits the NEXT run. It
+ * says so, and it shows what the run in progress actually settled on, which
+ * is not always what was asked for: dynarmic can decline to start, and safe
+ * mode ignores the lot. */
+
+/* A launch-time setting: written to the file, never applied live. */
+void set_boot(const char *key, int value) {
+    settings_set_int(key, value);
+    g_dirty = true;
+}
+
+bool boot_check(const char *label, const char *key, bool def, const char *text) {
+    bool v = settings_get_int(key, def ? 1 : 0) != 0;
+    if (ImGui::Checkbox(label, &v))
+        set_boot(key, v);
+    help(text);
+    return v;
+}
+
+const char *const kEngineKeys[] = {"interpreter", "dynarmic", "jit"};
+const char *const kEngineNames[] = {"Interpreter (slowest, most checked)",
+                                    "Dynarmic (recommended)",
+                                    "Block JIT (experimental)"};
+
+void tab_advanced() {
+    if (port_safe_mode()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.2f, 1.0f));
+        ImGui::TextWrapped("Safe mode: the last launch did not finish "
+                           "starting, so everything on this tab was ignored "
+                           "for this run. It applies again next launch.");
+        ImGui::PopStyleColor();
+    }
+    ImGui::TextDisabled("Running now: %s", port_runtime_label());
+    ImGui::Separator();
+
+    /* ---- the CPU ---- */
+    const char *engine = settings_get("cpu_engine", "interpreter");
+    int sel = 0;
+    for (int i = 0; i < 3; i++)
+        if (!strcmp(engine, kEngineKeys[i]))
+            sel = i;
+    ImGui::TextUnformatted("CPU");
+    ImGui::SetNextItemWidth(-1.0f);
+    focus_here_if_first();
+    if (ImGui::Combo("##engine", &sel, kEngineNames, 3)) {
+        settings_set("cpu_engine", kEngineKeys[sel]);
+        g_dirty = true;
+    }
+    help("How the game's ARM code is run. Dynarmic translates it and is much "
+         "faster. The interpreter runs one instruction at a time and is the "
+         "one to fall back to if something misbehaves.");
+
+    if (sel == 1) {
+        int mb = settings_get_int("dynarmic_cache_mb", 32);
+        ImGui::TextUnformatted("Translation cache");
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::SliderInt("##dyncache", &mb, 4, 256, "%d MB"))
+            set_boot("dynarmic_cache_mb", mb);
+        help("Memory held for translated code. Larger is not faster once the "
+             "game fits; this memory comes out of what the game itself uses.");
+    }
+    if (sel == 2) {
+        boot_check("Chain blocks", "jit_chain", false,
+                   "Run block to block without returning to the dispatcher. "
+                   "Faster, and the one thing the self-check cannot verify, "
+                   "so it is turned off while verifying.");
+        boot_check("Verify every block (very slow)", "jit_verify", false,
+                   "Re-run each compiled block through the interpreter and "
+                   "compare. For finding JIT bugs, not for playing.");
+    }
+
+    boot_check("Fast memory", "fastmem", false,
+               "Map the game's memory so an address needs no lookup. Faster, "
+               "but a bad access crashes the port instead of being reported "
+               "with an address and a history.");
+    boot_check("Predecode fast path", "predecode", false,
+               "A shortcut for one common Thumb instruction. Off by default: "
+               "it has never measured as a clear win.");
+    boot_check("Recycle freed memory", "heap_recycle", true,
+               "Hand freed blocks back to the game's allocator. Off makes the "
+               "game use more memory, and is only useful for comparison.");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Diagnostics");
+    help("");
+    boot_check("Profilers", "profilers", false,
+               "Measure where time goes, reported every 300 frames on the log. "
+               "Costs speed in every frame, so leave it off to play.");
+    boot_check("Fixed 16 ms clock", "fixed_clock", false,
+               "Give the game the same time step every frame, so a run is "
+               "reproducible. Game speed then follows frame rate.");
+    boot_check("Touch markers", "touch_debug", false,
+               "Draw where the screen is being touched, and log it.");
+    boot_check("Watch the object global", "watch_object", false,
+               "Log every write to one address the old crash was chasing. "
+               "Costs about 3%.");
+
+    const bool bench = boot_check("Benchmark mode", "bench", false,
+                                  "Run a fixed number of instructions and "
+                                  "stop, ignoring the controller, so two "
+                                  "builds can be compared. Not for playing.");
+    if (bench) {
+        int m = settings_get_int("bench_million", 0);
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::SliderInt("##benchm", &m, 0, 4000,
+                             m > 0 ? "%d million instructions" : "built-in default"))
+            set_boot("bench_million", m);
+        help("How far the benchmark runs before it stops.");
+    }
+
+    ImGui::Separator();
+    if (ImGui::TreeNode("Static recompiler")) {
+        const bool on = boot_check("Use recompiled functions", "recomp", false,
+                                   "Run hand-translated versions of a few hot "
+                                   "functions instead of interpreting them.");
+        if (on) {
+            boot_check("Verify against the interpreter", "recomp_verify", false,
+                       "Run both and compare. Very slow; for finding "
+                       "translation bugs.");
+            boot_check("Ablate (alternate 300-frame windows)", "recomp_ablate",
+                       false,
+                       "Turn them on and off every 300 frames, so one run "
+                       "measures both arms.");
+            const unsigned count = port_recomp_count();
+            int mask = settings_get_int("recomp_mask", -1);
+            for (unsigned i = 0; i < count; i++) {
+                bool used = mask < 0 || (mask & (1 << i)) != 0;
+                char label[80];
+                snprintf(label, sizeof label, "%s##rc%u", port_recomp_name(i), i);
+                if (ImGui::Checkbox(label, &used)) {
+                    if (mask < 0)
+                        mask = (int)((1u << count) - 1u);
+                    mask = used ? (mask | (1 << i)) : (mask & ~(1 << i));
+                    set_boot("recomp_mask", mask);
+                }
+                help("Whether this one function is replaced. Leaving one out "
+                     "is how a single translation gets measured on its own.");
+            }
+        }
+        ImGui::TreePop();
+    }
+
+    ImGui::Spacing();
+    ImGui::TextWrapped("Everything on this tab applies the next time the game "
+                       "starts.");
 }
 
 void draw_menu(float w, float h) {
@@ -549,8 +703,9 @@ void draw_menu(float w, float h) {
                 local.tm_sec, ImGui::GetIO().Framerate);
 
     int &tab = g_tab;
-    static const char *names[] = {"Controls", "Online", "Display", "Help"};
-    const int count = 4;
+    static const char *names[] = {"Controls", "Online", "Display", "Advanced",
+                                  "Help"};
+    const int count = 5;
     int forced = -1;
     if (g_tab_step) {
         tab = (tab + g_tab_step + count) % count;
@@ -571,6 +726,7 @@ void draw_menu(float w, float h) {
                 case 0: tab_controls(); break;
                 case 1: tab_online(); break;
                 case 2: tab_display(); break;
+                case 3: tab_advanced(); break;
                 default: tab_help(); break;
                 }
                 ImGui::EndTabItem();

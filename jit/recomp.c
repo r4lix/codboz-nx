@@ -434,7 +434,7 @@ static int r_07c304(Guest *gu) {
  * dispatching the callee inline rather than re-entering the interpreter, is
  * the prerequisite for any of this being worth extending.
  *
- * All three are off unless recomp.txt selects them by bitmask. */
+ * All three are off unless recomp_mask selects them. */
 
 /* The table the harness installs from. Adding the next translated function is
  * one line here plus the function itself -- which is the property the emitter

@@ -2365,7 +2365,7 @@ uint64_t g_fastpath_hits, g_fastpath_miss;
 static uint8_t  g_hook_map[256];
 static uint32_t g_hook_map_for = 0xFFFFFFFFu;
 
-/* Off unless predecode.txt is on the card.
+/* Off unless the predecode setting asks for it.
  *
  * The point of the flag is that both arms of a measurement then run the
  * SAME BINARY. Comparing two builds left the frame counts free to differ --

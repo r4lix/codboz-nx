@@ -425,8 +425,9 @@ public:
          * inside DispatchStub. At this game's ~3900 crossings per frame that
          * is ~15 600 reads per frame, paid in every build. They are worth
          * paying only when someone is reading the numbers, so they follow the
-         * same profile.txt gate as the other profilers: g->prof is set only
-         * then, and it is the flag tested here. */
+         * same gate as the other profilers -- the Profilers setting in the
+         * menu's Advanced tab -- because g->prof is set only then, and it is
+         * the flag tested here. */
         const bool timed = g->prof != nullptr;
         const std::uint64_t t_enter = timed ? armGetSystemTick() : 0;
         svc_calls++;

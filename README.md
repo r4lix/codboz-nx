@@ -79,8 +79,23 @@ sdmc:/switch/boz/blackops_gles1.obb    from the APK's assets
 sdmc:/switch/s3e_interp.nro
 ```
 
-Optional: `sdmc:/switch/boz/nxlink_host.txt` containing your PC's IPv4 address.
-The NRO reads it and streams its log there — run `jit/s3e_interp/nxlog.py` to
+## Settings
+
+Everything the port itself offers is in `sdmc:/switch/boz/config.txt`, and the
+game writes and reads it: hold **-** for two seconds for the settings menu.
+The **Advanced** tab holds what used to be flag files next to the NRO
+(`fastmem.txt`, `dynarmic.txt`, `profile.txt` and the rest) — the CPU engine,
+fast memory, the profilers, benchmark mode. Those take effect at the next
+launch, and a card that still has the old files has them imported into
+`config.txt` once, at the next startup, after which the files are ignored and
+can be deleted.
+
+If a launch dies before it finishes starting, the next one ignores every
+Advanced setting and says so, so a bad one cannot lock you out of the menu
+that would undo it.
+
+Optional, for development: set `nxlink_host` in that file to your PC's IPv4
+address. The NRO streams its log there — run `jit/s3e_interp/nxlog.py` to
 listen on port 28771. This works when launching from hbmenu, unlike
 `nxlinkStdio()`, which only connects if netloader started the process.
 
