@@ -1,5 +1,7 @@
 # codboz-nx
 
+<img width="2048" height="1536" alt="2048-1536-max" src="https://github.com/user-attachments/assets/ca97fb70-0bf9-4115-b353-7dc973a48395" />
+
 *Call of Duty: Black Ops Zombies* (Activision, 2011 — a Marmalade `.s3e`
 game for ARMv7 Android) running natively on the Nintendo Switch as homebrew.
 
