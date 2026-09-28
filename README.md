@@ -78,7 +78,7 @@ Extract from your own copy of the game and place on the SD card:
 sdmc:/switch/boz/boz.s3e.unpacked      the LZMA-decompressed .s3e image
 sdmc:/switch/boz/boz_files.idx         built by loader/mkfileidx.py
 sdmc:/switch/boz/blackops_gles1.obb    from the APK's assets
-sdmc:/switch/s3e_interp.nro
+sdmc:/switch/boz/codboz.nro
 ```
 
 ## Settings
