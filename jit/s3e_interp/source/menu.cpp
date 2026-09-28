@@ -513,6 +513,15 @@ void tab_display() {
         set_live("show_fps", fps);
     help("The frame rate in the top-left corner.");
 
+    int cap = port_setting_get("frame_cap") == 30 ? 1 : 0;
+    const char *caps[] = {"60 fps (uncapped)", "30 fps (steady)"};
+    ImGui::TextUnformatted("Frame rate");
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::Combo("##framecap", &cap, caps, 2))
+        set_live("frame_cap", cap ? 30 : 60);
+    help("When the game cannot hold 60, frames alternate between 60 and 30 "
+         "and motion judders. A steady 30 is smoother in busy scenes.");
+
     bool hide = port_setting_get("hide_sticks") != 0;
     if (ImGui::Checkbox("Hide on-screen sticks", &hide))
         set_live("hide_sticks", hide);

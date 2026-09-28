@@ -5524,6 +5524,8 @@ void gl_hide_sticks(int on);
 int  gl_sticks_hidden(void);
 void gl_show_fps(int on);
 int  gl_fps_shown(void);
+void gl_set_frame_cap(int fps);
+int  gl_frame_cap(void);
 void gl_stick_probe(int n);
 unsigned gl_hidden_draws(void);
 
@@ -5583,6 +5585,7 @@ int port_setting_get(const char *key) {
     if (!strcmp(key, "aim_sensitivity_y")) return g_aim_y_pct;
     if (!strcmp(key, "hide_sticks"))    return gl_sticks_hidden();
     if (!strcmp(key, "show_fps"))       return gl_fps_shown();
+    if (!strcmp(key, "frame_cap"))      return gl_frame_cap();
     if (!strcmp(key, "music"))          return snd_out_music_enabled();
     return 0;
 }
@@ -5597,6 +5600,7 @@ void port_setting_set(const char *key, int v) {
     else if (!strcmp(key, "aim_sensitivity_y")) aim_y_apply(v);
     else if (!strcmp(key, "hide_sticks"))   gl_hide_sticks(v ? 1 : 0);
     else if (!strcmp(key, "show_fps"))      gl_show_fps(v ? 1 : 0);
+    else if (!strcmp(key, "frame_cap"))     gl_set_frame_cap(v);
     else if (!strcmp(key, "music"))         snd_out_music_enable(v ? 1 : 0);
 }
 
@@ -5610,7 +5614,7 @@ static void port_settings_apply(void) {
     static const char *keys[] = {
         "control_layout", "aim_hold", "run_toggle", "y_hold_frames", "aim_stick",
         "aim_sensitivity", "aim_sensitivity_y", "hide_sticks", "show_fps",
-        "music",
+        "frame_cap", "music",
     };
     unsigned i, applied = 0;
     /* advanced_init read the file at startup; reloading here would throw

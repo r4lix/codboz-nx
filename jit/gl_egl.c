@@ -509,6 +509,17 @@ static const char *fps_glyph(char ch) {
 /* Whether the counter is drawn. It is still measured and logged either way. */
 static int g_show_fps = 0;   /* off unless the menu or config.txt turns it on */
 void gl_show_fps(int on) { g_show_fps = on ? 1 : 0; }
+
+/* Frame-rate cap, as a swap interval: 1 = every vblank (up to 60), 2 = every
+ * other one (30). A frame that needs 17-33 ms misses a vblank and waits for
+ * the next, so an uncapped game that cannot hold 60 alternates between 16.7
+ * and 33.3 ms frames -- an average of 40 that feels worse than a steady 30.
+ * The menu writes the wish from any thread; it is applied on the thread that
+ * owns the EGL context, just before the next swap. */
+static volatile int g_swap_want = 1;
+static int g_swap_set = 1;              /* EGL's default */
+void gl_set_frame_cap(int fps) { g_swap_want = fps > 0 && fps <= 30 ? 2 : 1; }
+int  gl_frame_cap(void) { return g_swap_want == 2 ? 30 : 60; }
 int  gl_fps_shown(void) { return g_show_fps; }
 
 /* The in-game settings menu (s3e_interp/source/menu.cpp). */
@@ -1083,6 +1094,13 @@ static void te_SwapBuffers(GuestCpu *c, GuestMem *m, void *u) {
         menu_render((int)w, (int)h);
     }
     g_tex_frame++;
+    if (g_swap_want != g_swap_set) {
+        const int want = g_swap_want;
+        const EGLBoolean ok = eglSwapInterval((EGLDisplay)dpy, want);
+        g_swap_set = want;
+        printf("  [egl  ] swap interval %d (%s)%s\n", want,
+               want == 2 ? "30 fps cap" : "up to 60 fps", ok ? "" : " FAILED");
+    }
     {
         const uint64_t t0 = armGetSystemTick();
         c->r[0] = (uint32_t)eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)s);
