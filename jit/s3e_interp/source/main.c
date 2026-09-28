@@ -6621,6 +6621,7 @@ int main(int argc, char **argv) {
         /* ctl_poll now runs on its own thread; see ctl_thread_start. */
         consoleUpdate(NULL);
     }
+    s3e_vfs_sync();             /* saves still queued for the card */
     if (nxfd >= 0)
         close(nxfd);
     if (sockets_up)

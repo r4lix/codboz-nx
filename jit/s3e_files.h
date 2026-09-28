@@ -44,4 +44,8 @@ int      s3e_vfs_error(void);
 int      s3e_vfs_delete(const char *name);
 int      s3e_vfs_mkdir(const char *name);
 
+/* Save files are written to the card from a background thread; this waits
+ * until every queued write has landed. Call before the process exits. */
+void     s3e_vfs_sync(void);
+
 #endif /* S3E_FILES_H */
