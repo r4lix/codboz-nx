@@ -39,7 +39,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	$(notdir $(CURDIR))
 BUILD		:=	build
-APP_TITLE	:=	s3e interpreter test
+APP_TITLE	:=	CoD Black Ops Zombies
 APP_AUTHOR	:=	codboz_nx
 APP_VERSION	:=	0.1
 SOURCES		:=	source .. ../../loader ../third_party/imgui
@@ -59,22 +59,15 @@ CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
 			$(ARCH) $(DEFINES)
 
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__
-# The JIT dispatch in guest_run is compiled out unless this is defined, so a
-# build without it pays nothing at all rather than relying on a branch being
-# predicted. Whether that branch actually costs anything could not be
-# resolved on the host bench -- the difference was inside its noise -- which
-# is reason to remove the question rather than answer it. The JIT itself is
-# still opt-in at runtime via jit.txt on the card.
-CFLAGS	+=	-DBOZ_JIT
 # VFP VMLA/VMLS are not fused: the interpreter rounds the product separately,
 # and GCC's default -ffp-contract=fast would merge it back into an FMA and
 # reintroduce the last-bit difference against real hardware.
 CFLAGS	+=	-ffp-contract=off
 
-# Dynarmic. Opt-in with `make DYNARMIC=1`, because the library is checked out
-# beside this repo rather than vendored into it -- it is 150 MB of archive and
-# carries its own externals -- and a build should not fail merely because a
-# sibling directory is missing.
+# Dynarmic runs the game. The library is checked out beside this repo rather
+# than vendored into it -- it is 150 MB of archive and carries its own
+# externals. `make DYNARMIC=0` builds without it (interpreter only, ~8 fps),
+# for when that sibling directory is missing.
 #
 # Both trees are patched for Horizon by jit/dynarmic_patches/*.py; see there
 # for what and why. Build the library first with:
@@ -85,37 +78,11 @@ CFLAGS	+=	-ffp-contract=off
 # command line REPLACES the devkitPro platform module's own flags and silently
 # drops -D__SWITCH__, which compiles every Horizon branch out and still
 # "succeeds".
+DYNARMIC	?=	1
 DYNARMIC_ROOT	?=	$(TOPDIR)/../../../dynarmic
 BOOST_ROOT	?=	$(TOPDIR)/../../../boost_hdr
 ifeq ($(DYNARMIC),1)
 CFLAGS	+=	-DBOZ_DYNARMIC 			-I$(DYNARMIC_ROOT)/src 			-I$(DYNARMIC_ROOT)/externals/mcl/include 			-I$(DYNARMIC_ROOT)/externals/oaknut/include 			-I$(DYNARMIC_ROOT)/externals/robin-map/include 			-I$(DYNARMIC_ROOT)/externals/fmt/include 			-I$(BOOST_ROOT)
-endif
-
-# Profile-guided optimisation, the last item on the performance plan with a
-# plausible double-digit gain. Two passes:
-#
-#   make PGO=gen     instrumented; run the benchmark, then fetch the .gcda
-#                    files off the card with the control socket's GET
-#   make PGO=use     rebuilt using them
-#
-# BOZ_PGO also switches on the GCOV_PREFIX redirection and the explicit
-# __gcov_dump() in main.c -- nothing calls exit() on the normal path, so the
-# counters would never be flushed otherwise.
-#
-# -fprofile-correction because the guest runs on one thread but the profile is
-# gathered across a run that libnx may service from another; without it gcc
-# treats inconsistent counters as an error rather than smoothing them.
-ifeq ($(PGO),gen)
-CFLAGS	+=	-fprofile-generate -DBOZ_PGO
-LDFLAGS	+=	-fprofile-generate
-# -lgcov goes in LIBS, not LDFLAGS. devkitPro's link rule expands LDFLAGS
-# BEFORE the object files, and a static archive only resolves references the
-# linker has already seen -- so -lgcov placed there is scanned against nothing
-# and every __gcov_merge_* reference comes out undefined even though libgcov.a
-# defines all of them.
-endif
-ifeq ($(PGO),use)
-CFLAGS	+=	-fprofile-use -fprofile-correction -Wno-missing-profile
 endif
 
 # Dear ImGui (the settings menu): no shell on Horizon to open URLs with.
@@ -125,15 +92,6 @@ ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
 LIBS	:= -lGLESv1_CM -lEGL -lglapi -ldrm_nouveau -lstdc++ -lm -lnx
-
-# After the assignment above, not before it: LIBS is set with := further down
-# the file than the PGO block, so adding -lgcov up there was simply
-# overwritten. It has to be here, and it has to be in LIBS rather than LDFLAGS
-# because devkitPro expands LDFLAGS ahead of the object files and a static
-# archive only resolves references the linker has already seen.
-ifeq ($(PGO),gen)
-LIBS	:=	-lgcov $(LIBS)
-endif
 
 # Dynarmic and its externals, ahead of -lstdc++ because a static archive only
 # resolves what the linker has already seen and all three need the C++ runtime.
@@ -239,7 +197,7 @@ endif
 #---------------------------------------------------------------------------------
 # Build identity.
 #
-# The banner was "jit-r82 " __DATE__ " " __TIME__, and those two macros expand
+# The banner was once built from __DATE__ " " __TIME__, and those two macros expand
 # when main.c is COMPILED -- not when the binary is linked. Change jit.c alone
 # and main.o is not rebuilt, so the banner keeps reporting the moment main.o
 # was built and two binaries that behave differently announce themselves with

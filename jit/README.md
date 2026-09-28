@@ -1,5 +1,12 @@
 # ARM32 CPU layer
 
+> **Status:** phase 4 is done, with Dynarmic (`dynarmic_glue.cpp`). The
+> interpreter below stays as the verified reference, the fallback when
+> executable memory cannot be had, and the executor for observe hooks. A custom
+> block JIT and a static recompiler were tried along the way and removed; see
+> `../docs/performance-investigation.md` and the git history. What follows is
+> the original plan.
+
 The game is ARMv7-A (mostly Thumb-2, ARM entry stub). The Switch is AArch64-only
 and Horizon fixes execution state per process, so guest code cannot run natively
 inside a 64-bit NRO. This directory is the CPU that executes it.

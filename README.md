@@ -1,11 +1,8 @@
 # codboz-nx
 
 Running *Call of Duty: Black Ops Zombies* (Marmalade `.s3e`, ARMv7 + GLES1,
-Android 2011) on the Nintendo Switch, by interpreting the ARM image and
-bridging Marmalade's s3e API to libnx and mesa.
-
-The game renders its real menus through GLES1 on the Switch GPU and takes
-touchscreen input.
+Android 2011) on the Nintendo Switch, by running the ARM image on Dynarmic
+(ARMv7 -> AArch64) and bridging Marmalade's s3e API to libnx and mesa.
 
 **No game data is in this repository.** The `.apk`, the `.obb`, and the `.s3e`
 image are Activision's and are not ours to redistribute. Supply them from your
@@ -15,12 +12,13 @@ own copy — see *Runtime data* below.
 
 | path | what |
 |---|---|
-| `jit/interp.c` | ARMv7-A / Thumb-2 interpreter, the reference execution path |
-| `jit/jit.c` | incremental ARM → AArch64 basic-block JIT (Switch only) |
+| `jit/dynarmic_glue.cpp` | runs the guest on Dynarmic: page table, HLE stub page, native hooks |
+| `jit/dynarmic_patches/` | the Horizon (W^X) patches applied to the Dynarmic checkout |
+| `jit/interp.c` | ARMv7-A / Thumb-2 interpreter: the Unicorn-verified reference, the fallback when Dynarmic cannot start, and what runs the instructions at observe hooks |
 | `jit/guest.{c,h}` | CPU state, sparse guest memory, HLE dispatch |
 | `jit/gl_thunks.c` | 247 generated GL/EGL entry points |
 | `jit/gl_egl.c` | hand-written EGL layer + GL overrides that the generator cannot express |
-| `jit/s3e_interp/` | the Switch NRO: s3e HLE, display, input |
+| `jit/s3e_interp/` | the Switch NRO: s3e HLE, display, input, audio, network, settings menu |
 | `jit/hostdiff/` | the differential harness — see below |
 | `loader/run_boz.py` | Unicorn reference implementation, the correctness oracle |
 | `loader/mkglthunks.py` | generates `gl_thunks.c` from the GLES/EGL headers |
@@ -56,11 +54,15 @@ synthetic-input models differ.
 
 ## Building
 
-Switch NRO (devkitPro, `libnx`, `mesa`/`nouveau`):
+Switch NRO (devkitPro, `libnx`, `mesa`/`nouveau`), with Dynarmic built in
+`../dynarmic/build-nx` beside this repo (see the Makefile for the recipe):
 
 ```
 cd jit/s3e_interp && make
 ```
+
+`make DYNARMIC=0` builds without it; the game then runs on the interpreter at
+single-digit frame rates.
 
 Host differential harness (MSVC):
 
@@ -83,12 +85,11 @@ sdmc:/switch/s3e_interp.nro
 
 Everything the port itself offers is in `sdmc:/switch/boz/config.txt`, and the
 game writes and reads it: hold **-** for two seconds for the settings menu.
-The **Advanced** tab holds what used to be flag files next to the NRO
-(`fastmem.txt`, `dynarmic.txt`, `profile.txt` and the rest) — the CPU engine,
-fast memory, the profilers, benchmark mode. Those take effect at the next
-launch, and a card that still has the old files has them imported into
-`config.txt` once, at the next startup, after which the files are ignored and
-can be deleted.
+The **Advanced** tab holds the development switches — Dynarmic's translation
+cache size, the profilers, the fixed clock, touch markers, benchmark mode.
+Those take effect at the next launch. A card that still has the old flag files
+(`dynarmic.txt`, `profile.txt`, `bench.txt`, ...) has them imported into
+`config.txt` once, after which they are ignored and can be deleted.
 
 If a launch dies before it finishes starting, the next one ignores every
 Advanced setting and says so, so a bad one cannot lock you out of the menu
@@ -101,11 +102,7 @@ listen on port 28771. This works when launching from hbmenu, unlike
 
 ## Status
 
-Working: CPU verified against Unicorn to 2.765B instructions; EGL/GLES1 context
-on hardware; menus rendering with correct fonts and layout; touchscreen
-(handheld) and stick+A (docked) input; ~7 fps interpreted.
-
-Open: real textures never reach GL (only the engine's 2×2 default is uploaded —
-a resource-loading question, not a format one; the driver does expose ETC1);
-NULL-object faults from subsystems that return 0 where the game expects a
-constructed object; no audio output.
+Playable: runs on Dynarmic at 44–60 fps at stock clocks, rendered at 1280×720
+through GLES1; sound effects and music; saves; controller and touchscreen;
+Play Online and local Wi-Fi co-op; an in-game settings menu. The interpreter is
+verified against Unicorn to 2.765B instructions.

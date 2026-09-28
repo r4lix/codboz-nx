@@ -37,16 +37,12 @@ const char *port_build_label(void);
 
 /* The Advanced tab edits settings that only take effect at launch, so it
  * shows what this run is actually using rather than what is in the file:
- * a comma-separated list like "dynarmic 32 MB, fastmem". */
+ * a comma-separated list like "dynarmic 32 MB, profilers". */
 const char *port_runtime_label(void);
 
 /* Non-zero when the previous launch died before it finished starting, and
  * every advanced setting was therefore ignored for this run. */
 int  port_safe_mode(void);
-
-/* The statically recompiled functions, for the per-function mask. */
-unsigned    port_recomp_count(void);
-const char *port_recomp_name(unsigned i);
 
 #ifdef __cplusplus
 }

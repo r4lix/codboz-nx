@@ -161,8 +161,6 @@ static GuestStatus step_arm(Guest *g) {
 
     if (!guest_ifetch32(&g->mem, pc, &insn))
         MEMFAULT(g, pc);
-    if (g->iprof)
-        g->iprof[512u + ((insn >> 20) & 0xFFu)]++;
 
     uint32_t cond = insn >> 28;
     if (cond != 0xF && !cond_ok(c->cpsr, cond)) {
@@ -1791,8 +1789,6 @@ static GuestStatus step_thumb(Guest *g) {
 
     if (!guest_ifetch16(&g->mem, pc, &hw))
         MEMFAULT(g, pc);
-    if (g->iprof)
-        g->iprof[((hw & 0xF800u) >= 0xE800u ? 256u : 0u) + (hw >> 8)]++;
 
     const uint32_t read_pc = pc + 4;
     const uint32_t lit_pc = (pc + 4) & ~3u;   /* Align(PC,4) for literal loads */
@@ -2207,173 +2203,12 @@ static GuestStatus dispatch_stub(Guest *g) {
     return GUEST_OK;
 }
 
-/* Re-run a block the JIT just executed, through the interpreter, and report
- * whether the two agree. `before` is the register state the block started
- * from; g->cpu currently holds the JIT's result. See Guest::jit_verify for why
- * the device has to be the oracle here, and for the standing precondition that
- * compiled blocks contain no stores.
- *
- * Registers only, plus CPSR. That is what a block's lowering can get wrong in
- * a way this can catch: a shifter carry not merged into C, an IT block advanced
- * wrongly, a writeback register not updated. Memory is not compared because
- * nothing compiled writes it yet -- when that changes this needs an undo log,
- * not a wider comparison. */
-/* The block's writes, taken out of the shared log before the interpreter's
- * re-run starts appending to it. */
-static GuestUndo jit_undo_snapshot[GUEST_UNDO_MAX];
-
-static int jit_verify_block(Guest *g, const GuestCpu *before, uint32_t retired) {
-    GuestCpu jitted = g->cpu;
-    uint32_t nwrote = g->mem.undo_n;
-    uint32_t i;
-    int bad = -1;
-
-    /* Roll the block's stores back so the interpreter re-runs against the same
-     * memory it started from. Without this a block doing ldr/add/str on one
-     * address makes the re-run read what the JIT just wrote and compute a
-     * different answer -- a divergence manufactured by the check itself. The
-     * JIT's values are captured first, since they are what gets compared. */
-    if (nwrote > GUEST_UNDO_MAX)
-        nwrote = GUEST_UNDO_MAX;
-    for (i = 0; i < nwrote; i++) {
-        GuestUndo *u = &guest_undo_log[i];
-        u->val = 0;
-        (void)guest_ld32(&g->mem, u->addr, &u->val);
-        if (u->size < 4u)
-            u->val &= (1u << (u->size * 8u)) - 1u;
-        jit_undo_snapshot[i] = *u;      /* the re-run reuses the log */
-    }
-    for (i = nwrote; i-- > 0; ) {
-        GuestUndo *u = &jit_undo_snapshot[i];
-        switch (u->size) {
-        case 1:  (void)guest_st8(&g->mem, u->addr, u->old);  break;
-        case 2:  (void)guest_st16(&g->mem, u->addr, u->old); break;
-        default: (void)guest_st32(&g->mem, u->addr, u->old); break;
-        }
-    }
-    g->mem.undo_n = 0;
-    g->cpu = *before;
-    for (i = 0; i < retired; i++) {
-        GuestStatus st = guest_is_thumb(&g->cpu) ? step_thumb(g) : step_arm(g);
-        if (st != GUEST_OK) {
-            printf("  [jitv ] block %08x: interpreter faulted at step %u\n",
-                   (unsigned)before->r[15], (unsigned)i);
-            g->cpu = jitted;
-            return 0;
-        }
-    }
-    for (i = 0; i < 16; i++)
-        if (g->cpu.r[i] != jitted.r[i]) { bad = (int)i; break; }
-    if (bad < 0 && (g->cpu.cpsr & 0xF8000000u) != (jitted.cpsr & 0xF8000000u))
-        bad = 16;
-
-    /* Memory now holds the interpreter's stores. Anywhere the JIT wrote should
-     * agree; where it wrote and the interpreter did not, the restored original
-     * still stands and disagrees with what the JIT left, which is the same
-     * signal. A location the interpreter wrote and the JIT did not is not
-     * caught here, but that almost always shows up in the registers first. */
-    if (bad < 0) {
-        for (i = 0; i < nwrote; i++) {
-            GuestUndo *u = &jit_undo_snapshot[i];
-            uint32_t now = 0;
-            if (!guest_ld32(&g->mem, u->addr, &now))
-                continue;
-            if (u->size < 4u)
-                now &= (1u << (u->size * 8u)) - 1u;
-            if (now != u->val) {
-                g->jit_diverged++;
-                if (g->jit_diverged <= 20)
-                    printf("  [jitv ] block %08x: mem[%08x]/%u jit=%08x "
-                           "interp=%08x\n",
-                           (unsigned)before->r[15], (unsigned)u->addr,
-                           (unsigned)u->size, (unsigned)u->val, (unsigned)now);
-                g->mem.undo_n = 0;
-                return 0;
-            }
-        }
-    }
-    g->mem.undo_n = 0;
-
-    if (bad >= 0) {
-        g->jit_diverged++;
-        if (g->jit_diverged <= 20) {
-            if (bad == 16)
-                printf("  [jitv ] block %08x (%u insns): cpsr jit=%08x interp=%08x\n",
-                       (unsigned)before->r[15], (unsigned)retired,
-                       (unsigned)(jitted.cpsr & 0xF8000000u),
-                       (unsigned)(g->cpu.cpsr & 0xF8000000u));
-            else
-                printf("  [jitv ] block %08x (%u insns): r%d jit=%08x interp=%08x\n",
-                       (unsigned)before->r[15], (unsigned)retired, bad,
-                       (unsigned)jitted.r[bad], (unsigned)g->cpu.r[bad]);
-        }
-        /* Keep the INTERPRETER's state, not the JIT's. A divergence means the
-         * compiled block is wrong, so continuing from its answer would carry
-         * the fault forward into everything after it -- and the point of a
-         * verification run is to survive long enough to find more than one. */
-        return 0;
-    }
-    g->cpu = jitted;
-    g->jit_verify_blocks++;
-    return 1;
-}
-
-/* ---- T16 MOV high-register fast path (predecode spike) -----------------
- *
- * 0x46xx is 9% of the in-game instruction stream -- the single largest entry
- * in the mix, ahead of LDR immediate at 7%. It is also one of the cheapest
- * instructions in the ISA: copy one register to another, no flags, no memory.
- * Which is the whole argument for predecoding: at ~105 cycles per guest
- * instruction, essentially all of that is dispatch, not work.
- *
- * What the normal path costs for this instruction: a call into step_thumb
- * (7.3 KB, not inlined), a reload of r15, the instruction fetch, a load from
- * g_thumb_kind[], a 20-way switch through a jump table -- the worst-predicted
- * branch in the loop -- and only then three lines of actual semantics.
- *
- * This spike skips all of it and keeps only the fetch. It deliberately does
- * NOT build the predecode cache: the point is to find out whether removing
- * the call, the kind load and the switch is worth anything on this core
- * BEFORE committing weeks to a cache. Your ledger records that removing five
- * to eight independent host instructions per guest instruction measured
- * exactly 0.0%, because an out-of-order A57 hides them in stalls it takes
- * anyway. Only shortening a dependency chain has ever paid here.
- *
- * The cost side is honest and measurable: every Thumb instruction that is NOT
- * 0x46xx now pays one extra guest_ifetch16, because step_thumb fetches again.
- * That is 91% of the stream paying a duplicated L1 load to save 9% a call and
- * a mispredict. If the result is positive, the full cache -- which removes the
- * duplicate fetch and covers the other formats -- is clearly worth building.
- * If it is zero or negative, the approach is answered for a day's work rather
- * than a month's.
- *
- * Semantics replicated exactly from TK_HIREG op 2: rd from bit 7 and bits 2-0,
- * rm from bits 6-3, the value being pc+4 when rm is 15 (Align is not applied
- * for MOV) and r[rm] otherwise, no flag update, pc advancing by 2.
- *
- * Excluded from the fast path, each falling through to step_thumb unchanged:
- *   - rd == 15, which is a branch with interworking, not a move
- *   - itstate != 0, so the IT machinery is never bypassed
- *   - a failed fetch, which must fault through the normal path
- */
-uint64_t g_fastpath_hits, g_fastpath_miss;
-
 /* Direct-mapped "could this PC be a hook" filter, and the hook_count it
  * was built for. File scope rather than a Guest field to leave that
  * struct's layout alone -- the fields the interpreter touches per access
  * are on cache lines worth not disturbing for 256 bytes of table. */
 static uint8_t  g_hook_map[256];
 static uint32_t g_hook_map_for = 0xFFFFFFFFu;
-
-/* Off unless the predecode setting asks for it.
- *
- * The point of the flag is that both arms of a measurement then run the
- * SAME BINARY. Comparing two builds left the frame counts free to differ --
- * the control landed on 420 frames in the gameplay window where every other
- * run gave 475 -- and a window whose frame count does not match its pair is
- * not a comparison at all. With one binary the guest workload is identical
- * by construction and the only variable is this flag. */
-int g_predecode;
 
 GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
     uint64_t start = g->executed;
@@ -2403,34 +2238,10 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
      * buffer. The ring itself is worth keeping; reading its index from memory
      * a hundred million times a second was not. */
     uint32_t hp = g->hist_pos;
-    /* Hoisted so the hot loop tests a register rather than reloading a field.
-     * The compiler cannot do this itself: handlers called from inside the loop
-     * are opaque to it, so it must assume any of them could set g->jit. The
-     * JIT is enabled once at startup, before the first guest_run, so a local
-     * copy cannot go stale within a call -- and if it ever could, the worst
-     * outcome is that the JIT starts one guest_run later than it might have.
-     * Left as a plain load-and-branch this measured 2.6% on the host bench,
-     * paid by every build whether the JIT was on or not. */
-#ifdef BOZ_JIT
-    void *jitctx = g->jit;
-#endif
-    /* Hoisted for the run, for the same reason jitctx is: handlers called
-     * from inside this loop are opaque, so the compiler must assume any of
-     * them could change these and reload on every guest instruction.
-     * Between them that was four loads and a read-modify-write per
-     * instruction on the one path every instruction takes. guest_run is
-     * entered once per few million instructions, so a stale copy is at
-     * worst one run late -- hooks are installed at startup and the watch is
-     * a bring-up tool. */
-    uint32_t *pcprof = g->pcprof;
-    uint32_t pcprof_base = g->pcprof_base;
-    uint32_t pcprof_buckets = g->pcprof_buckets;
-    uint32_t watch_addr = g->mem.watch_addr;
+    /* Hoisted: handlers called from inside the loop are opaque, so the
+     * compiler would otherwise reload it on every guest instruction. Hooks are
+     * installed once at startup, so a local copy cannot go stale. */
     uint32_t hook_count = g->hook_count;
-    /* Hoisted for the run, as jitctx and pcprof are: set once at startup
-     * from the card, so a stale copy is at worst one guest_run late, and
-     * the hot path tests a register instead of reloading a global. */
-    int predecode = g_predecode;
     /* Once per guest_run, not once per instruction: this is entered every few
      * million instructions, so the guard costs nothing measurable and no call
      * site has to remember to initialise the interpreter. */
@@ -2439,20 +2250,11 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
         thumb_kind_init();
         kinds_ready = 1;
     }
-    /* Built once, not once per guest_run.
-     *
-     * This was a 256-byte memset plus a loop over every hook on every entry to
-     * guest_run -- free when that happens once per 5M instructions, which is
-     * what it did when it was written. It stopped being free the moment
-     * recomp_call started re-entering guest_run for every outbound call a
-     * translated function makes: a list walk with a virtual call per element
-     * pays the whole setup per element, against the seven interpreted
-     * instructions the translation was supposed to save.
-     *
-     * Keyed on hook_count because hooks are installed once during startup and
-     * never move afterwards. The `observe` flag does change at runtime -- both
-     * hook_recomp and the fast-path decline path toggle it -- but observe is
-     * not part of this map, only the addresses are. */
+    /* Built once, not once per guest_run: dynarmic re-enters guest_run for a
+     * single instruction at every observe hook, so per-call setup is paid per
+     * interception. Keyed on hook_count because hooks are installed once
+     * during startup and never move afterwards; the map holds addresses only,
+     * so a hook toggling its own `observe` flag does not invalidate it. */
     if (hook_count && g_hook_map_for != hook_count) {
         uint32_t i;
         memset(g_hook_map, 0, sizeof g_hook_map);
@@ -2471,17 +2273,6 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
         }
 
         g->hist[hp++ & 15u] = pc;
-        /* Only stamp the PC when something is actually watching for it. The
-         * watch is a bring-up tool for finding what corrupts a guest word;
-         * paying a store per instruction to keep it ready cost 2.8%. */
-        if (watch_addr)
-            g->mem.current_pc = pc;
-
-        if (pcprof) {
-            uint32_t off = ((pc & ~1u) - pcprof_base) >> 4;
-            if (off < pcprof_buckets)
-                pcprof[off]++;
-        }
 
         if (hook_count && g_hook_map[(pc >> 1) & 0xFFu]) {
             uint32_t hi;
@@ -2499,75 +2290,10 @@ GuestStatus guest_run(Guest *g, uint32_t until, uint64_t limit) {
             }
         }
 
-#ifdef BOZ_JIT
-        /* The JIT gets first refusal on every PC. It declines whenever the
-         * block is not compiled, not hot yet, or contains anything without an
-         * exact lowering, and declining is free of consequence: execution
-         * simply continues here at the same PC. */
-        if (jitctx) {
-            uint32_t retired = 0;
-            int ran;
-            /* Snapshot the register file only when something will compare
-             * it. This is a 68-byte copy and it was being made on every
-             * dispatch whether verifying or not -- the compiler cannot sink
-             * it past the call, because the call can read g->cpu. At three
-             * guest instructions per block that copy was a real share of
-             * what the JIT had to earn back before it broke even. */
-            GuestCpu before;
-            if (g->jit_verify)
-                before = g->cpu;
-            /* Record stores only while the block itself is running.
-             *
-             * Arming this once at startup was wrong in a way that took a
-             * corrupted run to see: guest_wptr then logs every store the
-             * INTERPRETER makes as well, so by the time a block was checked
-             * the log held thousands of unrelated writes, and rolling it back
-             * undid ordinary execution rather than the block. The log is also
-             * reset here so the interpreter's re-run cannot overwrite the
-             * entries the comparison still needs. */
-            if (g->jit_verify) {
-                g->mem.undo_n = 0;
-                g->mem.undo_active = 1;
-            }
-            ran = guest_jit_try_run(g, until, limit - (g->executed - start),
-                                    &retired);
-            g->mem.undo_active = 0;
-            if (ran && retired) {
-                if (!g->jit_verify || jit_verify_block(g, &before, retired)) {
-                    g->executed += retired;
-                    continue;
-                }
-                /* Verification failed: the interpreter has already re-executed
-                 * the block and its state stands, so the instructions still
-                 * retired and must be counted. */
-                g->executed += retired;
-                continue;
-            }
-        }
-#endif
 
         if (guest_is_stub(pc)) {
             st = dispatch_stub(g);
         } else if (guest_is_thumb(&g->cpu)) {
-            uint32_t hw;
-            if (predecode && !g->cpu.itstate &&
-                guest_ifetch16(&g->mem, pc, &hw) &&
-                (hw & 0xFF00u) == 0x4600u) {
-                uint32_t rd = ((hw >> 4) & 8u) | (hw & 7u);
-                if (rd != 15u) {
-                    uint32_t rm = (hw >> 3) & 0xFu;
-                    /* step_thumb would have counted this one; keep the mix
-                     * report honest rather than silently hiding 9% of it. */
-                    if (g->iprof)
-                        g->iprof[hw >> 8]++;
-                    g->cpu.r[rd] = (rm == 15u) ? (pc + 4u) : g->cpu.r[rm];
-                    g->cpu.r[15] = pc + 2u;
-                    g->executed++;
-                    g_fastpath_hits++;
-                    continue;
-                }
-            }
-            g_fastpath_miss++;
             st = step_thumb(g);
         } else {
             st = step_arm(g);

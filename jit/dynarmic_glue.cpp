@@ -2,7 +2,7 @@
  *
  * The interpreter in interp.c is the reference: it has been checked against
  * Unicorn to 2.7 billion instructions, and everything the game depends on --
- * the HLE stub page, the native hooks, the fastmem window -- was built around
+ * the HLE stub page, the native hooks -- was built around
  * its behaviour. So this file changes exactly one thing, who executes guest
  * instructions, and reproduces the rest verbatim rather than reinventing it.
  * Where a comment here says "as guest_run does", that is a promise about
@@ -14,9 +14,8 @@
  *
  * The page table means memory accesses do not have to go through callbacks.
  * Configured with absolute_offset_page_table false, generated code computes
- * page_table[addr >> 12] + (addr & 0xFFF) inline -- one load and an add, which
- * is what the interpreter's fastmem window costs and without needing the
- * window to exist. It matters because the alternative, a call per guest load,
+ * page_table[addr >> 12] + (addr & 0xFFF) inline -- one load and an add. It
+ * matters because the alternative, a call per guest load,
  * would give back most of what a JIT is for; and because dynarmic's OTHER fast
  * path, fastmem, needs a segfault handler to patch faulting accesses, and
  * Horizon has no signals to build one from.
@@ -612,11 +611,9 @@ public:
      *
      * Read-only regions are mapped here too, so a store into the image would
      * succeed instead of faulting. That is a real difference from the region
-     * path -- and it is the behaviour the port already has, because the
-     * fastmem window in guest_wptr returns fast_base + addr before it ever
-     * consults the writable flag. Nothing in this image writes its own code;
-     * if that assumption ever needs enforcing, it needs enforcing in both
-     * places at once. */
+     * path in guest_wptr. Nothing in this image writes its own code (every
+     * region is registered writable today anyway); if that assumption ever
+     * needs enforcing, it needs enforcing here as well. */
     bool BuildPageTable() {
         page_table.reset(new (std::nothrow) PageTable());
         if (!page_table)

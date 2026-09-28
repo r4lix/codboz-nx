@@ -1,8 +1,8 @@
-/* Interpreter bring-up test.
+/* Call of Duty: Black Ops Zombies on the Switch.
  *
- * Loads the image, binds every GOT slot to the stub page, and interprets from
- * the ARM entry stub. The HLE set here is the minimum the Unicorn reference
- * (../../loader/run_boz.py) showed is needed to get through early startup.
+ * Loads the Marmalade image, binds every GOT slot to the stub page, and runs
+ * the ARM entry stub on Dynarmic (dynarmic_glue.cpp), with the s3e SDK
+ * implemented here as HLE handlers.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +32,6 @@
 #include "net.h"
 #include "menu.h"
 #endif
-#include "recomp.h"
 #include "s3e_loader.h"
 #include "s3e_files.h"
 #include "s3e_config.h"
@@ -40,22 +39,11 @@
 #include "gl_thunks.h"
 #endif
 
-/* Compact guest address space, so every region fits one alias window.
- *
- * These addresses were spread across 1.86 GB for no reason beyond being easy
- * to read: image at 0x4a000000, stack at 0x20000000, surface at 0x40000000,
- * heap at 0x60000000. The regions themselves total only ~343 MB. That spread
- * is what makes fastmem impossible here -- svcMapMemory's destination must sit
- * in the alias region, and probing this process found 512 MB available and
- * nothing larger, so the window has to span the whole guest address space and
- * 1.86 GB will never fit.
- *
- * Packed, the top of the heap lands at 0x18000000 (384 MB) and the whole guest
- * address space fits with room. Nothing depended on the old values: they are
- * used only through these defines, the image is position-independent and
- * relocated at load, and every durable reference in this project -- hook
- * addresses, the profiler, the disassembly mapping -- is an RVA computed from
- * load_base, so all of it follows automatically.
+/* Compact guest address space: the regions total ~343 MB and the top of the
+ * heap lands at 0x18000000. Nothing depends on the values beyond these
+ * defines -- the image is position-independent and relocated at load, and
+ * every durable reference in this project (hook addresses, the disassembly
+ * mapping) is an RVA computed from load_base.
  *
  * The bottom 8 MB is deliberately left unmapped so a null guest pointer still
  * lands on nothing. */
@@ -67,7 +55,7 @@
 /* No __DATE__/__TIME__ here on purpose -- they record when THIS file was
  * compiled, which is not when the binary was built, and the difference is
  * exactly what made a working fix look like a failed copy. */
-#define BOZ_BUILD_LABEL "jit-r82-" BOZ_BUILD_ID
+#define BOZ_BUILD_LABEL "codboz-" BOZ_BUILD_ID
 /* The allocator is a pure bump allocator and free() reclaims nothing, so
  * exhaustion is self-inflicted and the game does not NULL-check malloc -- it
  * runs a C++ constructor on the result and faults writing the vtable. The
@@ -115,11 +103,6 @@ static GuestAlloc *g_allocs;
 static uint32_t g_alloc_n, g_alloc_cap;
 static uint32_t g_free_head[4096];  /* exact-size reuse, hash collisions chained */
 static uint32_t g_live_bytes, g_peak_bytes;
-/* On by default. Disabling it was tried in r29 on the theory that the game
- * reads through freed pointers; it fixed neither known fault (r27 died at
- * 3.44B and r29 at 3.5B, same site) and only costs memory, so recycling stays.
- * Turn heap_recycle off in the Advanced tab to disable it and compare. */
-static int g_recycle_freed = 1;
 
 static void galloc_record(uint32_t addr, uint32_t size) {
     if (g_alloc_n == g_alloc_cap) {
@@ -135,26 +118,6 @@ static void galloc_record(uint32_t addr, uint32_t size) {
     g_allocs[g_alloc_n].next_free = 0;
     g_allocs[g_alloc_n].in_use = 1;
     g_alloc_n++;
-}
-
-/* The allocation containing `addr`, rather than the one starting at it. Only
- * fresh bump allocations are recorded, so g_allocs stays sorted by address and
- * this can binary-search for the last block starting at or below the target.
- * Returns -1 when the address falls in no live block -- which for a field the
- * game is reading means the read is out of bounds. */
-static int32_t galloc_containing(uint32_t addr) {
-    uint32_t lo = 0, hi = g_alloc_n;
-    int32_t best = -1;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2u;
-        if (g_allocs[mid].addr <= addr) {
-            best = (int32_t)mid;
-            lo = mid + 1u;
-        } else {
-            hi = mid;
-        }
-    }
-    return best;
 }
 
 static int32_t galloc_index(uint32_t addr) {
@@ -254,7 +217,7 @@ static void gfree(uint32_t addr) {
      * The cost is memory. Recycling held the high-water mark at 27 MB against
      * a 1 GB heap, and the OOM path already reports if that stops being true,
      * so the ceiling is visible rather than silent. */
-    if (g_recycle_freed) {
+    {
         bucket = (g_allocs[i].size >> 4) & 4095u;
         g_allocs[i].next_free = g_free_head[bucket];
         g_free_head[bucket] = i + 1u;
@@ -548,7 +511,7 @@ static void hook_realloc(GuestCpu *cpu, GuestMem *mem, void *user) {
  *
  * Refusing these four frees leaks at most four small objects. The slots are
  * read fresh rather than cached because an earlier attempt cached them from
- * watch_image_handler, which only runs on the first dispatcher call -- by then
+ * repair_image_handler, which only runs on the first dispatcher call -- by then
  * the free had already happened, the guard never fired, and it looked like
  * evidence against a use-after-free when it was only evidence of arming late. */
 static int is_registry_handler(GuestMem *mem, uint32_t addr) {
@@ -579,10 +542,10 @@ static void hook_free(GuestCpu *cpu, GuestMem *mem, void *user) {
     cpu->r[0] = 0;
 }
 
-/* Verified ARM EABI memory primitives in this exact image. These two routines
- * dominate interpreted startup and frame time; executing their byte/word loops
- * as guest instructions is pure overhead. The normal non-observe hook return
- * preserves ARM/Thumb interworking through LR. */
+/* Verified ARM EABI memory primitives in this exact image. Kept under
+ * dynarmic because their cost is amortised over the bytes they move rather
+ * than paid per call. The normal non-observe hook return preserves ARM/Thumb
+ * interworking through LR. */
 #define RVA_NATIVE_MEMCPY 0x365dc0u
 #define RVA_NATIVE_MEMSET 0x3664f4u
 static uint64_t g_fast_mem_bytes[2];
@@ -614,124 +577,6 @@ static void slow_fill(GuestMem *mem, uint32_t dst, uint32_t byte, uint32_t len) 
                    (unsigned)i, (unsigned)dst, (unsigned)len);
             return;
         }
-}
-
-/* Software vertex transform, RVA 0x00524c -- 92 bytes, and 6% of every guest
- * instruction the game executes. The top entry in pcprof by a wide margin.
- *
- *   out[i] = ((m[i]*x + m[i+3]*y + m[i+6]*z) >> 12) + m[i+9]   for i = 0,1,2
- *
- * r0 = out (3 x int32), r1 = matrix (12 x int32, Q12), r2 = vertex
- * (3 x int16, sign extended). A 3x3 rotate in 12.12 fixed point plus a
- * translation. The game reports Transform -> HW and then does this on the CPU
- * anyway -- skinning or culling, most likely.
- *
- * Two details decide whether this is bit-exact rather than merely close. MUL
- * and MLA wrap modulo 2^32 and signed overflow is undefined in C, so the
- * accumulation is done in uint32_t and only the shift is signed. And ASR
- * rounds toward minus infinity, not toward zero, so it has to be an arithmetic
- * shift of a signed value rather than a division.
- *
- * The scratch registers are set to what the real function leaves behind: r1
- * from its last load, r2 the sign-extended z, and ip the second output. r4-r8
- * it pushes and pops, so they are untouched here. That makes the hook register
- * identical to the code it replaces, which is what lets the differential
- * harness compare equal instead of reporting three false divergences. */
-/* Componentwise 16-bit vector add, RVA 0x00506c -- 26 bytes, 2% of all guest
- * instructions. r0 = out, r1 = a, r2 = b, three u16 components each.
- *
- * The adds are Thumb ADD (register) T2, which does NOT set flags, so there is
- * nothing to reproduce in CPSR. The one observable clobber is r2: the guest
- * computes a.x + b.x into it as a full 32-bit value and only the store
- * truncates, so the register keeps the untruncated sum. */
-#define RVA_VEC3_ADD16 0x00506cu
-
-static uint32_t g_vadd_hits, g_vadd_skips;
-
-static void hook_vec3_add16(GuestCpu *cpu, GuestMem *mem, void *user) {
-    const void *ap, *bp;
-    void *op;
-    uint16_t A[3], B[3], O[3];
-    (void)user;
-    ap = guest_ptr(mem, cpu->r[1], (uint32_t)sizeof A);
-    bp = guest_ptr(mem, cpu->r[2], (uint32_t)sizeof B);
-    op = guest_wptr(mem, cpu->r[0], (uint32_t)sizeof O);
-    if (!ap || !bp || !op) { g_vadd_skips++; return; }
-    memcpy(A, ap, sizeof A);
-    memcpy(B, bp, sizeof B);
-    O[0] = (uint16_t)(A[0] + B[0]);
-    O[1] = (uint16_t)(A[1] + B[1]);
-    O[2] = (uint16_t)(A[2] + B[2]);
-    memcpy(op, O, sizeof O);
-    cpu->r[2] = (uint32_t)A[0] + (uint32_t)B[0];
-    g_vadd_hits++;
-}
-
-/* Normalise, RVA 0x0035d0 -- 2% of all guest instructions in ten bytes:
- *
- *     while ((int32_t)r2 >= 0) { r0--; r2 <<= 1; }   then bx lr
- *
- * The loop head is also the function tail, so a hook here returning to LR is
- * exactly what the guest does. It collapses to one count-leading-zeros.
- *
- * Flags matter here, unlike the vector add. The loop leaves CPSR from its
- * final `cmp r2, #0` on a negative value: N set, Z clear, C set (a subtract of
- * zero never borrows), V clear. The caller is free to branch on that.
- *
- * r2 == 0 is not handled because the guest cannot handle it either -- shifting
- * zero never sets bit 31, so the original spins forever. Counting it and
- * returning is the least-bad answer; a hang would be worse and inventing a
- * result would be a lie. */
-#define RVA_NORMALISE 0x0035d0u
-
-static uint32_t g_norm_hits, g_norm_skips;
-
-static void hook_normalise(GuestCpu *cpu, GuestMem *mem, void *user) {
-    uint32_t v = cpu->r[2];
-    unsigned n;
-    (void)mem; (void)user;
-    if (!v) { g_norm_skips++; return; }
-    n = (unsigned)__builtin_clz(v);
-    cpu->r[2] = v << n;
-    cpu->r[0] -= n;
-    cpu->cpsr = (cpu->cpsr & ~(CPSR_N | CPSR_Z | CPSR_C | CPSR_V))
-              | CPSR_N | CPSR_C;
-    g_norm_hits++;
-}
-
-#define RVA_VTX_TRANSFORM 0x00524cu
-
-static uint32_t g_vtx_hits, g_vtx_skips;
-
-static void hook_vtx_transform(GuestCpu *cpu, GuestMem *mem, void *user) {
-    const void *mp, *vp;
-    void *op;
-    int32_t M[12], O[3];
-    int16_t V[3];
-    int i;
-    (void)user;
-    mp = guest_ptr(mem, cpu->r[1], (uint32_t)sizeof M);
-    vp = guest_ptr(mem, cpu->r[2], (uint32_t)sizeof V);
-    op = guest_wptr(mem, cpu->r[0], (uint32_t)sizeof O);
-    if (!mp || !vp || !op) {
-        /* Unmapped: leave the state alone rather than inventing a result. The
-         * real function would have faulted here; this at least does not lie. */
-        g_vtx_skips++;
-        return;
-    }
-    memcpy(M, mp, sizeof M);
-    memcpy(V, vp, sizeof V);
-    for (i = 0; i < 3; i++) {
-        uint32_t acc = (uint32_t)M[i]     * (uint32_t)(int32_t)V[0]
-                     + (uint32_t)M[i + 3] * (uint32_t)(int32_t)V[1]
-                     + (uint32_t)M[i + 6] * (uint32_t)(int32_t)V[2];
-        O[i] = (int32_t)((uint32_t)((int32_t)acc >> 12) + (uint32_t)M[i + 9]);
-    }
-    memcpy(op, O, sizeof O);
-    cpu->r[1] = (uint32_t)M[9];
-    cpu->r[2] = (uint32_t)(int32_t)V[2];
-    cpu->r[12] = (uint32_t)O[1];
-    g_vtx_hits++;
 }
 
 static void hook_native_memcpy(GuestCpu *cpu, GuestMem *mem, void *user) {
@@ -768,346 +613,6 @@ static void hook_native_memset(GuestCpu *cpu, GuestMem *mem, void *user) {
     g_fast_mem_bytes[1] += len;
 }
 
-/* --------------------------------------------------- float guard, natively
- *
- * 96 bytes holding 7% of all guest instructions in a menu, which is what made
- * it worth reading:
- *
- *   61128  vmov s15,r1 / vldr s14,<-FLT_MAX> / vcmpe / vmrs / blt <zero>
- *          vldr s14,<+FLT_MAX> / vcmpe / vldr s14,<0.0> / vmrs
- *          it hi / vmovhi.f32 s15,s14 / vstr s15,[r0]
- *   61168  vmov s14,r1 / vldr s15,[r0] / vmul.f32 / bl 61128
- *
- * So: *r0 = v, with anything not finite replaced by +0.0, and a wrapper that
- * multiplies first. An engine sanitising every float it stores.
- *
- * The range test is written negated so NaN lands where the guest puts it. NaN
- * compares unordered against everything, which leaves N=0 V=1, so the guest's
- * `blt` is taken and NaN becomes zero -- a plain `v < -FLT_MAX || v > FLT_MAX`
- * would read as if NaN fell through to the store instead.
- *
- * In-range values are passed through as the original bit pattern rather than
- * as a float that happens to compare equal, so -0.0 and denormals survive
- * exactly. The multiply uses a plain C float, matching what the interpreter's
- * own VFP path does -- there is no FPSCR emulation here, so this introduces no
- * new divergence. */
-#define RVA_F32_GUARD     0x61128u
-#define RVA_F32_MUL_GUARD 0x61168u
-
-static uint32_t g_f32_hits[2];
-
-static uint32_t f32_guard(uint32_t bits) {
-    float v;
-    memcpy(&v, &bits, sizeof v);
-    if (!(v >= -FLT_MAX && v <= FLT_MAX))
-        return 0;
-    return bits;
-}
-
-static void hook_f32_guard(GuestCpu *cpu, GuestMem *mem, void *user) {
-    (void)user;
-    if (!guest_st32(mem, cpu->r[0], f32_guard(cpu->r[1])))
-        printf("  [fast ] f32 guard: store faulted at %08x\n",
-               (unsigned)cpu->r[0]);
-    g_f32_hits[0]++;
-}
-
-static void hook_f32_mul_guard(GuestCpu *cpu, GuestMem *mem, void *user) {
-    uint32_t cur, out;
-    float a, b;
-    (void)user;
-    if (!guest_ld32(mem, cpu->r[0], &cur)) {
-        printf("  [fast ] f32 guard: load faulted at %08x\n",
-               (unsigned)cpu->r[0]);
-        return;
-    }
-    memcpy(&a, &cur, sizeof a);
-    memcpy(&b, &cpu->r[1], sizeof b);
-    a = a * b;
-    memcpy(&out, &a, sizeof out);
-    guest_st32(mem, cpu->r[0], f32_guard(out));
-    g_f32_hits[1]++;
-}
-
-/* ------------------------------------------------ integer divide, natively
- *
- * This image has no hardware divide, so every division is a call into a
- * clz-driven shift-and-subtract routine that computes one quotient bit per
- * three instructions. It is 4-5% of guest instructions in EVERY profile window
- * -- menus, loading and gameplay alike -- which is what makes it worth more
- * than its headline share: nothing else is uniformly hot.
- *
- * Three entry points, read off the disassembly:
- *
- *   378d48  __aeabi_uidiv     subs r2,r1,#1 / bxeq lr / bcc <div0> / ...
- *                             returns quotient in r0, r1 untouched
- *   378f34  __aeabi_uidivmod  cmp r1,#0 / beq <div0> / push {r0,r1,lr}
- *                             bl 378d48 / mul r3,r2,r0 / sub r1,r1,r3
- *                             returns quotient r0, remainder r1
- *   378f54  __aeabi_idiv      cmp r1,#0 / beq <div0> / eor ip,r0,r1 / ...
- *                             signed, truncating toward zero
- *
- * Each hook is placed AFTER that routine's divide-by-zero test, not at its
- * entry. That is deliberate: a replacing hook always returns through LR, so it
- * cannot reproduce the zero case, which branches to __aeabi_idiv0 rather than
- * returning. Hooking past the test leaves the zero path running the game's own
- * code, exactly as before, and guarantees a non-zero divisor here. The skipped
- * instructions are a compare and a branch; the loop they guard is the cost.
- *
- * Nothing is pushed before these offsets, so LR still holds the caller's
- * return address, and r2/r3/ip are caller-saved -- leaving them untouched
- * where the real routine would clobber them cannot be observed. */
-#define RVA_UIDIV    0x378d54u    /* past `bxeq lr` / `bcc div0`: r1 >= 2 */
-#define RVA_UIDIVMOD 0x378f3cu    /* past `beq div0`: r1 != 0 */
-#define RVA_IDIV     0x378f5cu    /* past `beq div0`: r1 != 0 */
-
-static uint32_t g_div_hits[3];
-
-static void hook_uidiv(GuestCpu *cpu, GuestMem *mem, void *user) {
-    (void)mem; (void)user;
-    cpu->r[0] = cpu->r[0] / cpu->r[1];
-    g_div_hits[0]++;
-}
-
-static void hook_uidivmod(GuestCpu *cpu, GuestMem *mem, void *user) {
-    uint32_t n = cpu->r[0], d = cpu->r[1], q = n / d;
-    (void)mem; (void)user;
-    cpu->r[0] = q;
-    cpu->r[1] = n - q * d;
-    g_div_hits[1]++;
-}
-
-static void hook_idiv(GuestCpu *cpu, GuestMem *mem, void *user) {
-    int32_t n = (int32_t)cpu->r[0], d = (int32_t)cpu->r[1];
-    (void)mem; (void)user;
-    /* INT_MIN / -1 is undefined in C and would trap, but the guest routine
-     * defines it: it negates the magnitude and wraps, yielding 0x80000000.
-     * Match that rather than let the host decide. */
-    if (n == (int32_t)0x80000000 && d == -1)
-        cpu->r[0] = 0x80000000u;
-    else
-        cpu->r[0] = (uint32_t)(n / d);
-    g_div_hits[2]++;
-}
-
-/* ------------------------------------------------------- ctype, natively
- *
- * The 16-byte profile put two ARM leaf functions in the library range among
- * the busiest code in the menus. They are tolower and toupper:
- *
- *   ldr r3,[pc,#36] / ldr r2,[pc,#36] / add r3,pc,r3 / ldr r3,[r3,r2]
- *   ldr r3,[r3] / add r3,r3,r0 / ldrb r3,[r3,#1] / and r3,r3,#3
- *   cmp r3,#1 / addeq r0,r0,#32 / bx lr          <- tolower  (#2/sub = toupper)
- *
- * Ten interpreted ARM instructions, called per character, is what a
- * case-insensitive string compare costs -- and the game keys its resource maps
- * on strings, which is also why an std::map node walk sits nearby in the same
- * profile.
- *
- * The replacement performs the identical table lookup rather than assuming C
- * locale: same __ctype_ptr__ table, same class bits, same 32-bit wraparound on
- * table+c. Anything else would be a behaviour change hiding inside an
- * optimisation, and the Unicorn differential would be right to call it.
- *
- * The GOT slot address is not hardcoded. It is recomputed at install time from
- * the two literals the guest itself loads, so if this image is not laid out the
- * way it was read here the hooks simply do not install. */
-#define RVA_TOLOWER 0x36f16cu
-#define RVA_TOUPPER 0x36f1a0u
-#define RVA_CTYPE_LIT_PC 0x36f17cu    /* pc at `add r3,pc,r3`, i.e. insn+8 */
-#define RVA_CTYPE_LIT_A  0x36f198u
-#define RVA_CTYPE_LIT_B  0x36f19cu
-
-uint32_t g_ctype_got;          /* guest address of the __ctype_ptr__ slot */
-uint32_t g_ctype_hits[2];
-
-/* Who calls tolower. 11,284 calls a frame in a menu is not tolower's fault --
- * it is one caller doing case-insensitive work far too often, and replacing
- * that caller removes the loop around the conversion as well as the
- * conversions. LR at hook entry is the return address, so a census of it names
- * the caller directly. Small open-addressed table; a caller that cannot get a
- * slot is simply not counted, which is fine for finding the top one. */
-#define CTYPE_CALLERS 64
-static uint32_t g_ctype_lr[CTYPE_CALLERS];
-static uint32_t g_ctype_lr_n[CTYPE_CALLERS];
-
-static void ctype_note_caller(uint32_t lr) {
-    uint32_t h = (lr >> 2) & (CTYPE_CALLERS - 1), i;
-    for (i = 0; i < CTYPE_CALLERS; i++) {
-        uint32_t k = (h + i) & (CTYPE_CALLERS - 1);
-        if (g_ctype_lr[k] == lr) { g_ctype_lr_n[k]++; return; }
-        if (!g_ctype_lr[k]) { g_ctype_lr[k] = lr; g_ctype_lr_n[k] = 1; return; }
-    }
-}
-
-static void ctype_report_callers(uint32_t base) {
-    int k, b;
-    for (b = 0; b < 4; b++) {
-        uint32_t bestv = 0;
-        int best = -1;
-        for (k = 0; k < CTYPE_CALLERS; k++)
-            if (g_ctype_lr_n[k] > bestv) { bestv = g_ctype_lr_n[k]; best = k; }
-        if (best < 0 || !bestv)
-            break;
-        printf("  [fast ]   called from %06x  %u\n",
-               (unsigned)(g_ctype_lr[best] - base), (unsigned)bestv);
-        g_ctype_lr_n[best] = 0;
-    }
-    memset(g_ctype_lr, 0, sizeof g_ctype_lr);
-    memset(g_ctype_lr_n, 0, sizeof g_ctype_lr_n);
-}
-
-/* Resolve the table slot the way the guest does. Returns 0 -- and so disables
- * the hooks -- if anything about the sequence fails to read. */
-static uint32_t ctype_resolve_got(GuestMem *mem, uint32_t base) {
-    uint32_t a, b;
-    if (!guest_ld32(mem, base + RVA_CTYPE_LIT_A, &a) ||
-        !guest_ld32(mem, base + RVA_CTYPE_LIT_B, &b))
-        return 0;
-    return base + RVA_CTYPE_LIT_PC + a + b;
-}
-
-static void ctype_convert(GuestCpu *cpu, GuestMem *mem, uint32_t want,
-                          int32_t delta, int which) {
-    uint32_t p, tbl, cls, c = cpu->r[0];
-    if (guest_ld32(mem, g_ctype_got, &p) && guest_ld32(mem, p, &tbl) &&
-        guest_ld8(mem, tbl + c + 1u, &cls) && (cls & 3u) == want)
-        cpu->r[0] = c + (uint32_t)delta;
-    /* Otherwise r0 is already the answer: a character of any other class is
-     * returned unchanged, which is also the safe result if the table read
-     * fails on an out-of-range argument. */
-    g_ctype_hits[which]++;
-    ctype_note_caller(cpu->r[GUEST_LR]);
-}
-
-static void hook_tolower(GuestCpu *cpu, GuestMem *mem, void *user) {
-    (void)user;
-    ctype_convert(cpu, mem, 1u, 32, 0);
-}
-
-static void hook_toupper(GuestCpu *cpu, GuestMem *mem, void *user) {
-    (void)user;
-    ctype_convert(cpu, mem, 2u, -32, 1);
-}
-
-/* r25 died at RVA 0x23f234 dereferencing 0x033d0080 -- a heap pointer with its
- * top nibble cleared, since 0x633d0080 & 0x0FFFFFFF is exactly that, and r11
- * held a healthy 0x633d90f4 nearby. Z was clear at the fault, so the preceding
- * `addeq` did not run and the value came from `ldr r3,[r3,#0x84]` two
- * instructions earlier: it was already wrong in memory.
- *
- * This observe hook fires just before that load and names the guest word the
- * bad pointer lives in, which is the address to watch next. It only speaks
- * when the value actually looks truncated, so it stays silent otherwise.
- *
- * It has to run on hardware: hostrun reached 2.5B instructions with 97 imports
- * against the device's 5688 at the same point, so the host never gets here. */
-#define RVA_IMG_PTR_LOAD 0x23f228u
-
-/* The struct-copy loop that writes the field. r31 established the field is
- * inside the object's own 288-byte block, so this is not an out-of-bounds
- * read -- one subsystem fills the block with 20-byte vertex structs while
- * another reads +0x84 as a pointer.
- *
- * The remaining question is whether the loop is writing inside its own buffer
- * (two owners for one block, as with the image handler) or has walked past the
- * end of a different buffer into this one. Comparing the block containing the
- * loop's cursor against the block containing the object answers it. Reported
- * only when the cursor actually lands on the watched word, so the hot loop
- * pays a compare and nothing else. */
-#define RVA_STRUCT_COPY_STORE 0x2431ecu
-
-/* object = *(*(GOT + 0x17f4)); the GOT slot at RVA 0x412808 holds 0x4a492f74,
- * so this BSS global is the one storing the object pointer. Same address every
- * run, which is what makes it watchable from startup. */
-#define RVA_OBJ_GLOBAL 0x492f74u
-
-static void watch_struct_copy(GuestCpu *cpu, GuestMem *mem, void *user) {
-    static int logged;
-    uint32_t dst = cpu->r[3] - 2u;
-    int32_t bi;
-    (void)user;
-    /* Any store landing in the watched word, matching the store watch's own
-     * 4-byte window. This is a halfword store and it lands on watch_addr+2 --
-     * testing for an exact match rejected the one write it exists to catch. */
-    if (logged >= 6 || !mem->watch_addr || (dst - mem->watch_addr) >= 4u)
-        return;
-    logged++;
-    bi = galloc_containing(cpu->r[3]);
-    if (bi >= 0)
-        printf("  [copy ] cursor %08x is in block %08x+%u (offset %u)\n",
-               (unsigned)cpu->r[3], (unsigned)g_allocs[bi].addr,
-               (unsigned)g_allocs[bi].size,
-               (unsigned)(cpu->r[3] - g_allocs[bi].addr));
-    else
-        printf("  [copy ] cursor %08x is in no recorded block\n",
-               (unsigned)cpu->r[3]);
-}
-
-/* The watch is armed here now, not on the image handler: that fault is handled
- * by the vtable repair, and this is the site still killing every run.
- *
- * The field is not a corrupted pointer. Across four runs it has held
- * 033d0080, 02f20080, 06210080 and 06da0080 -- low halfword always 0x0080,
- * high halfword varying -- so it is a two-u16 structure being read where the
- * game expects a pointer or NULL. r29 ran with allocator recycling disabled,
- * which makes fresh blocks strictly contiguous and zero-filled, and the value
- * appeared anyway. Nothing aliased it; something wrote it. With allocations
- * contiguous, an overflow out of the neighbouring block is the likeliest
- * writer, and the watch will name it. */
-static void watch_truncated_ptr(GuestCpu *cpu, GuestMem *mem, void *user) {
-    static int logged;
-    uint32_t src = cpu->r[3] + 0x84u, val = 0;
-    (void)user;
-    if (!guest_ld32(mem, src, &val))
-        return;
-
-    /* No longer arms the watch. r33 settled what this fault is: the copy
-     * loop's cursor and the object live in the *same* 288-byte block (cursor
-     * at offset 136, the read field at 132), so nothing is out of bounds --
-     * one subsystem fills the block with 20-byte vertex structs while this
-     * code reads offset 132 as a pointer. The block is not the object this
-     * code wants.
-     *
-     * The object comes from *(*(GOT+0x17f4)), which resolves statically to the
-     * BSS global at RVA 0x492f74 -- a fixed address in every run, unlike the
-     * heap addresses. RVA_OBJ_GLOBAL is watched from startup instead, so the
-     * writer that stores a vertex block into that global names itself. */
-
-    if (logged < 12 && val >= 0x01000000u && val < 0x10000000u) {
-        uint32_t g = 0;
-        int32_t bi;
-        guest_ld32(mem, g_img.load_base + RVA_OBJ_GLOBAL, &g);
-        printf("  [glob ] global %08x -> obj %08x | %llu writes, "
-               "last from RVA %06x\n",
-               (unsigned)(g_img.load_base + RVA_OBJ_GLOBAL), (unsigned)g,
-               (unsigned long long)mem->watch_changes,
-               (unsigned)(mem->watch_last_pc - g_img.load_base));
-        bi = galloc_containing(cpu->r[3]);
-        if (bi >= 0) {
-            uint32_t base = g_allocs[bi].addr, size = g_allocs[bi].size;
-            uint32_t off = cpu->r[3] - base;
-            printf("  [trunc] obj %08x lives in block %08x+%u (offset %u); "
-                   "field +0x84 is %s\n", (unsigned)cpu->r[3], (unsigned)base,
-                   (unsigned)size, (unsigned)off,
-                   (off + 0x88u <= size) ? "INSIDE" : "PAST THE END");
-        } else {
-            printf("  [trunc] obj %08x is in no recorded block\n",
-                   (unsigned)cpu->r[3]);
-        }
-    }
-    if (logged < 12 && val >= 0x01000000u && val < 0x10000000u) {
-        logged++;
-        printf("  [trunc] %08x at %08x obj=%08x lr=%06x | watch %08x: "
-               "%llu writes, last from RVA %06x\n",
-               (unsigned)val, (unsigned)src, (unsigned)cpu->r[3],
-               (unsigned)(cpu->r[GUEST_LR] - g_img.load_base),
-               (unsigned)mem->watch_addr,
-               (unsigned long long)mem->watch_changes,
-               (unsigned)(mem->watch_last_pc - g_img.load_base));
-    }
-}
-
 /* The image-conversion registry is built by RVA 0x2720d4. It owns four tiny
  * format handlers, then the dispatcher at RVA 0x27109c looks one up and
  * immediately calls vtable[5].
@@ -1126,7 +631,7 @@ static void watch_truncated_ptr(GuestCpu *cpu, GuestMem *mem, void *user) {
  * vtable is zeroed in place while the registry still points at them, which is
  * what the repair below exists to undo. */
 
-static void watch_image_handler(GuestCpu *cpu, GuestMem *mem, void *user) {
+static void repair_image_handler(GuestCpu *cpu, GuestMem *mem, void *user) {
     static int repairs;
     static const uint32_t vtable_rva[4] = {
         0x409fb0u, 0x409e10u, 0x409f78u, 0x409dd8u
@@ -1155,35 +660,13 @@ static void watch_image_handler(GuestCpu *cpu, GuestMem *mem, void *user) {
     if (!guest_ld32(mem, cpu->r[0], &vtable))
         return;
 
-    /* r23 settled what r20 and r22 could only hint at. Both died at RVA
-     * 0x2710bc reading vtable[5] of object 0x600564d0, whose first word held
-     * 0x01980118 -- and early in r23 that same object is entirely healthy:
-     * vtable 0x4a409f78, which is exactly vtable_rva[2], slot 2, format 0x27.
-     * So the object is constructed correctly and then overwritten. 0x01980118
-     * is not a memset pattern; as little-endian halfwords it is 280 and 408,
-     * i.e. some other object's fields. With 322k frees in a session the
-     * mechanism is a use-after-free: the game frees a handler, the allocator
-     * reissues the block, and the registry keeps the stale pointer.
-     *
-     * So complain rather than repair. Writing the vtable back would scribble
-     * on whatever owns the block now; hook_free refuses the free instead. */
-    /* Arm the store watch on the object itself the first time it is seen
-     * healthy. This address has been 600564d0 in every run since r20, and it
-     * is the object that gets clobbered -- with 00000000, then 01980118, then
-     * 009f009e, i.e. different garbage each time and again after a repair. So
-     * this is not a zeroing memset, not a use-after-free and not truncation:
-     * something writes over a live object, repeatedly. The watch names it. */
-    /* No longer arms the watch: this fault is handled by the repair below, and
-     * the single watch slot is needed for the RVA 0x23f228 site, which still
-     * kills every run. Whichever site armed first would starve the other. */
+    /* A registered handler whose vtable is not the one it was built with has
+     * been overwritten; say so. Only a NULL vtable is repaired below --
+     * anything else belongs to whoever owns the block now. */
     if (slot >= 0 && vtable != g_img.load_base + vtable_rva[slot]) {
         static int warned;
         if (warned < 8) {
             warned++;
-            printf("  [trunc] watch %08x: %llu writes, last from RVA %06x\n",
-                   (unsigned)mem->watch_addr,
-                   (unsigned long long)mem->watch_changes,
-                   (unsigned)(mem->watch_last_pc - g_img.load_base));
             printf("  [img  ] slot%d object %08x has vtable %08x, expected "
                    "%08x (fmt 0x%x, lr %06x)\n", slot, (unsigned)cpu->r[0],
                    (unsigned)vtable,
@@ -1221,10 +704,11 @@ static void watch_image_handler(GuestCpu *cpu, GuestMem *mem, void *user) {
  *
  * A bad upstream value made this execute ~44 million guest iterations on the
  * loading screen. fmodf is equivalent for the intended range and prevents one
- * malformed frame value from consuming minutes of interpreter time. This is
+ * malformed frame value from consuming minutes of guest time. This is
  * deliberately tied to the verified game RVA rather than changing general VFP
  * semantics. The hook is observe-mode; moving PC makes the interpreter execute
- * the first instruction after the loop in the same step. */
+ * the first instruction after the loop in the same step. Not a speed-up but a
+ * fix: skipping it hangs the game. */
 #define RVA_FAST_ANGLE_NORMALIZE 0x118be8u
 static void fast_angle_normalize(GuestCpu *cpu, GuestMem *mem, void *user) {
     static int shown;
@@ -1473,18 +957,6 @@ static int cb_find_chan(const char *kind, uint32_t chan, uint32_t id) {
     return -1;
 }
 
-static int cb_queue_chan(const char *kind, uint32_t id, uint32_t chan,
-                         uint32_t sysdata) {
-    int i = cb_find_chan(kind, chan, id);
-    if (i < 0 || !g_cbs[i].used ||
-        g_cb_queue_n >= (int)(sizeof g_cb_queue / sizeof *g_cb_queue))
-        return 0;
-    g_cb_queue[g_cb_queue_n].slot = i;
-    g_cb_queue[g_cb_queue_n].sysdata = sysdata;
-    g_cb_queue_n++;
-    return 1;
-}
-
 static void hle_register(GuestCpu *cpu, GuestMem *mem, void *user) {
     uint32_t idx = (uint32_t)(uintptr_t)user;
     char kind[28];
@@ -1728,8 +1200,8 @@ static int g_saw_real_input;         /* once true, the synthetic tap stands down
  * somewhere real and quietly corrupted whatever lived there, with effects that
  * varied by screen and looked like a dozen different bugs.
  *
- * Below the image and outside the fastmem window, so it resolves through the
- * region path and anything out of range still fails cleanly. */
+ * Its own small region below the image, so anything out of range still fails
+ * cleanly. */
 /* Set once the regions exist; the sound handlers sit far above the Guest
  * object in this file and cannot name it directly. */
 static GuestMem *g_memp;
@@ -3524,18 +2996,12 @@ static void win_release(void) {
     g_win = WIN_NONE;
 }
 
-/* Called from the eglSwapBuffers thunk. On the GL path the game never calls
- * s3eSurfaceShow, so g_presents would stay at 0 and the synthetic tap -- armed
- * from inside that handler -- would never fire. The game sits on "TOUCH SCREEN
- * TO START" forever. A GL swap is the same event, so it counts as a frame. */
 /* ------------------------------------------------------------ frame profile
  *
- * Overclocking to 2400 MHz -- 2.35x the stock CPU -- moved the frame rate only
- * 9.6 -> 13.5. If interpreting guest instructions were the whole frame that
- * would have been close to linear, so most of a frame is going somewhere else.
- * This splits it: ticks spent inside HLE handlers (GL, EGL, file, everything
- * reached through the stub page) versus ticks spent interpreting, plus the
- * worst individual imports by name. Everything is 19.2 MHz system ticks. */
+ * Splits a frame into ticks spent inside HLE handlers (GL, EGL, file,
+ * everything reached through the stub page) versus ticks spent running guest
+ * code, plus the worst individual imports by name. Everything is 19.2 MHz
+ * system ticks. */
 static uint64_t g_prof_hle_ticks;         /* inside handlers, this window */
 static uint64_t g_prof_enter;             /* tick at the current handler entry */
 static uint32_t g_prof_depth;             /* handlers can re-enter via callbacks */
@@ -3548,15 +3014,6 @@ static uint32_t g_prof_slot;
  * the time, which is the number that made the clock a bug, not a detail. */
 static uint32_t g_clock_queries;
 static int g_clock_fixed;
-
-/* Up here for the same reason as the clock counters: the frame report
- * prints it, and the hook that increments it is defined far below. */
-static uint32_t g_affine_calls;
-
-/* The T16 0x46 fast path in interp.c; see the comment on it there. */
-extern uint64_t g_fastpath_hits, g_fastpath_miss;
-extern int g_predecode;
-extern uint64_t g_jitprof_ticks, g_jitprof_samples, g_jitprof_ran;
 
 static void hle_profile(uint32_t slot, int enter) {
     uint64_t now = armGetSystemTick();
@@ -3580,17 +3037,8 @@ static void hle_profile(uint32_t slot, int enter) {
 /* Set with g.prof, from the profilers setting: is the handler split measured? */
 static int g_prof_on;
 
-/* Scheduling of the interpreter thread itself; filled in at startup. */
+/* Scheduling of the guest thread itself; filled in at startup. */
 static int32_t g_main_prio = -1;
-
-/* Defined below, next to the Guest it reads. */
-static void pc_profile_report(void);
-static void pc_profile_clear(void);
-static void i_profile_report(void);
-static void i_profile_clear(void);
-static void jit_report(void);
-static void recomp_report(void);
-static void recomp_clear(void);
 
 /* Reported every 300 frames rather than every frame: the point is the split,
  * and printing it per frame would itself distort the thing being measured. */
@@ -3609,12 +3057,6 @@ static void frame_profile_report(void) {
         g_prof_hle_ticks = 0;
         memset(g_prof_slot_ticks, 0, sizeof g_prof_slot_ticks);
         memset(g_prof_slot_calls, 0, sizeof g_prof_slot_calls);
-        /* The PC histogram too. Leaving it would charge the whole loading
-         * phase to the first steady-state window, which is how the handler
-         * split came to report glClear 12% on its first print. */
-        pc_profile_clear();
-        i_profile_clear();
-        recomp_clear();
         g_clock_queries = 0;
         return;
     }
@@ -3630,7 +3072,7 @@ static void frame_profile_report(void) {
                " Advanced tab for the handler split)\n",
                (unsigned long long)(total * 1000ull / freq));
     } else {
-        printf("  [prof ] %llu ms/300f: handlers %llu%%, interpreting %llu%%\n",
+        printf("  [prof ] %llu ms/300f: handlers %llu%%, guest code %llu%%\n",
                (unsigned long long)(total * 1000ull / freq),
                (unsigned long long)(hle * 100ull / total),
                (unsigned long long)((total - (hle < total ? hle : total)) * 100ull
@@ -3704,37 +3146,6 @@ static void frame_profile_report(void) {
     memset(g_prof_slot_ticks, 0, sizeof g_prof_slot_ticks);
     memset(g_prof_slot_calls, 0, sizeof g_prof_slot_calls);
     g_prof_hle_ticks = 0;
-    if (g_ctype_hits[0] || g_ctype_hits[1]) {
-        printf("  [fast ] ctype: %u tolower, %u toupper\n",
-               (unsigned)g_ctype_hits[0], (unsigned)g_ctype_hits[1]);
-        ctype_report_callers(g_img.load_base);
-        g_ctype_hits[0] = g_ctype_hits[1] = 0;
-    }
-    if (g_fastpath_hits || g_fastpath_miss) {
-        uint64_t tot = g_fastpath_hits + g_fastpath_miss;
-        printf("  [fast ] T16 mov fast path: %llu hits of %llu thumb"
-               " (%llu%%)\n",
-               (unsigned long long)g_fastpath_hits,
-               (unsigned long long)tot,
-               (unsigned long long)(tot ? g_fastpath_hits * 100ull / tot : 0));
-        g_fastpath_hits = g_fastpath_miss = 0;
-    }
-    if (g_affine_calls) {
-        printf("  [fast ] affine compose: %u calls\n",
-               (unsigned)g_affine_calls);
-        g_affine_calls = 0;
-    }
-    if (g_f32_hits[0] || g_f32_hits[1]) {
-        printf("  [fast ] f32 guard: %u store, %u mul-store\n",
-               (unsigned)g_f32_hits[0], (unsigned)g_f32_hits[1]);
-        g_f32_hits[0] = g_f32_hits[1] = 0;
-    }
-    if (g_div_hits[0] || g_div_hits[1] || g_div_hits[2]) {
-        printf("  [fast ] divide: %u uidiv, %u uidivmod, %u idiv\n",
-               (unsigned)g_div_hits[0], (unsigned)g_div_hits[1],
-               (unsigned)g_div_hits[2]);
-        g_div_hits[0] = g_div_hits[1] = g_div_hits[2] = 0;
-    }
     {   /* Which core we are on, and whether we stayed there.
          *
          * The guest is single-threaded -- 391 imports and not one thread,
@@ -3752,10 +3163,6 @@ static void frame_profile_report(void) {
         printf("  [sched] core %d, %d migrations seen, prio %d\n",
                core, migrations, (int)g_main_prio);
     }
-    jit_report();
-    pc_profile_report();
-    i_profile_report();
-    recomp_report();
     window_start = now;
 }
 
@@ -3773,10 +3180,7 @@ static void frame_profile_report(void) {
  * directly -- across builds, across card-flag settings, across sessions.
  * Read that, not fps, when asking whether a change made the CPU faster;
  * fps still answers whether the frame got faster, which is a different
- * question whenever the work per frame is not fixed.
- *
- * Only sound because the counter is now honest about hooks that stand in
- * for several instructions -- see hook_recomp. */
+ * question whenever the work per frame is not fixed. */
 #define INSTR_WINDOW 500000000ull
 
 static uint64_t g_iw_next;      /* executed count at the next report */
@@ -3813,6 +3217,10 @@ static void instr_profile_report(uint64_t executed, int presents) {
     g_iw_next = executed + INSTR_WINDOW;
 }
 
+/* Called from the eglSwapBuffers thunk. On the GL path the game never calls
+ * s3eSurfaceShow, so g_presents would stay at 0 and the synthetic tap -- armed
+ * from inside that handler -- would never fire. The game sits on "TOUCH SCREEN
+ * TO START" forever. A GL swap is the same event, so it counts as a frame. */
 void egl_frame_presented(void) {
     g_presents++;
     tap_arm(g_presents);
@@ -5050,177 +4458,6 @@ static void net_pump_guest(void) {
 static void net_pump_guest(void) {}
 #endif
 
-/* ------------------------------------------------------------ PC histogram */
-
-/* Instruction mix. pcprof says which code is hot; this says what it is made
- * of. The host bench can report the same counters, but its 300M instructions
- * are the loading phase and come out ~100%% ARM library code -- gameplay is
- * Thumb, so the number that matters can only be taken here. */
-static uint32_t g_iprof[GUEST_IPROF_N];
-
-static void jit_report(void) {
-    if (!g.jit && !g.jit_blocks)
-        return;
-    /* Coverage as a share of everything executed, which is the number that
-     * actually tracks progress. Mean block length does not: lowering a branch
-     * turns blocks that previously failed to compile into valid one-instruction
-     * blocks, so the mean falls while coverage rises -- which is exactly what
-     * r71 did, 1.67 down to 1.48 while covering strictly more. */
-    if (g.executed)
-        printf("  [jit  ] covering %llu%% of instructions\n",
-               (unsigned long long)(g.jit_executed * 100ull / g.executed));
-    printf("  [jit  ] %u blocks, %lluM insns via JIT, %llu verified, %u diverged\n",
-           (unsigned)g.jit_blocks,
-           (unsigned long long)(g.jit_executed / 1000000ull),
-           (unsigned long long)g.jit_verify_blocks,
-           (unsigned)g.jit_diverged);
-    printf("  [jit  ] %llu bails (%llu retiring nothing), %llu insns lost to them\n",
-           (unsigned long long)g.jit_bails,
-           (unsigned long long)g.jit_bails_empty,
-           (unsigned long long)g.jit_bail_lost);
-    guest_jit_report_blockers(&g);
-}
-
-static void i_profile_clear(void) {
-    memset(g_iprof, 0, sizeof g_iprof);
-}
-
-static void i_profile_report(void) {
-    uint64_t tot = 0;
-    unsigned i, k;
-    for (i = 0; i < GUEST_IPROF_N; i++)
-        tot += g_iprof[i];
-    if (!tot)
-        return;
-    printf("  [iprof] instruction mix:\n");
-    for (k = 0; k < 10; k++) {
-        unsigned best = 0;
-        uint32_t bv = 0;
-        for (i = 0; i < GUEST_IPROF_N; i++)
-            if (g_iprof[i] > bv) { bv = g_iprof[i]; best = i; }
-        if (!bv)
-            break;
-        printf("  [iprof]   %-3s %02x  %2llu%%  %8lluk\n",
-               best < 256 ? "T16" : best < 512 ? "T32" : "ARM",
-               (unsigned)(best & 0xFFu),
-               (unsigned long long)((uint64_t)bv * 100ull / tot),
-               (unsigned long long)(bv / 1000u));
-        g_iprof[best] = 0;
-    }
-    i_profile_clear();
-    /* One report is all this is for, and the counter is not free: the null
-     * check alone measured 3.9% on the host bench, which is a lot to pay
-     * forever to answer a question once. Disarm it so every window after the
-     * first is timed without it. */
-    g.iprof = NULL;
-    printf("  [iprof] counter disarmed; later windows are untaxed\n");
-}
-
-static void pc_profile_clear(void) {
-    if (g.pcprof)
-        memset(g.pcprof, 0, (size_t)g.pcprof_buckets * sizeof(uint32_t));
-}
-
-/* Coalesce runs of executed buckets back into functions and print the busiest.
- * Adjacency is what does the work here: a hot routine is a contiguous span of
- * 64-byte buckets, so printing raw buckets would split one function across a
- * dozen lines and hide it under something flatter. Gaps of up to four empty
- * buckets -- 64 bytes -- stay inside a span, since a cold error path in the
- * middle of a hot function is normal and breaking there would report its two
- * halves separately. */
-static void pc_profile_report(void) {
-    struct span { uint32_t lo, hi; uint64_t hits; } top[12], cur;
-    uint32_t i, n = g.pcprof_buckets;
-    uint64_t total = 0;
-    int ntop = 0, k, j;
-
-    if (!g.pcprof || !n)
-        return;
-    for (i = 0; i < n; i++)
-        total += g.pcprof[i];
-    if (!total)
-        return;
-
-    printf("  [pcprof] %lluM guest instructions, busiest code:\n",
-           (unsigned long long)(total / 1000000ull));
-
-    for (i = 0; i < n; ) {
-        uint32_t gap = 0;
-        if (!g.pcprof[i]) { i++; continue; }
-        cur.lo = cur.hi = i;
-        cur.hits = 0;
-        while (i < n && gap <= 4) {
-            if (g.pcprof[i]) {
-                cur.hits += g.pcprof[i];
-                cur.hi = i;
-                gap = 0;
-            } else {
-                gap++;
-            }
-            i++;
-        }
-        for (k = 0; k < ntop; k++)
-            if (cur.hits > top[k].hits)
-                break;
-        if (k < (int)(sizeof top / sizeof top[0])) {
-            for (j = (ntop < (int)(sizeof top / sizeof top[0])
-                      ? ntop : (int)(sizeof top / sizeof top[0]) - 1); j > k; j--)
-                top[j] = top[j - 1];
-            top[k] = cur;
-            if (ntop < (int)(sizeof top / sizeof top[0]))
-                ntop++;
-        }
-    }
-
-    /* RVAs, because that is what the disassembler and every logged address in
-     * this file are in -- the load base is added back only inside the guest. */
-    for (k = 0; k < ntop; k++)
-        printf("  [pcprof]   %06x..%06x %6u B %3llu%% %8lluk\n",
-               (unsigned)(top[k].lo << 4),
-               (unsigned)((top[k].hi << 4) + 15u),
-               (unsigned)((top[k].hi - top[k].lo + 1) << 4),
-               (unsigned long long)(top[k].hits * 100ull / total),
-               (unsigned long long)(top[k].hits / 1000ull));
-
-    /* The merged ranges answer "where is the time", but they bridge gaps of up
-     * to 64 bytes, so a 1760-byte range at 10%% can hold a dozen functions and
-     * say nothing about which of them matters. That ambiguity has sent this
-     * project after the wrong function twice -- RVA 0x006450, which turned out
-     * to start at 0x00645c and not to be hot at all, and 0x062f60, whose 10%%
-     * is spread across twelve entry points.
-     *
-     * A single 16-byte bucket is the finest grain the profiler has, and the
-     * hottest ones point at the hot instruction rather than its neighbourhood.
-     * Cheap: one more pass over an array already in cache. */
-    {
-        struct { uint32_t idx, hits; } hot[10];
-        int nhot = 0;
-        for (i = 0; i < n; i++) {
-            uint32_t h = g.pcprof[i];
-            if (!h)
-                continue;
-            for (k = 0; k < nhot; k++)
-                if (h > hot[k].hits)
-                    break;
-            if (k < 10) {
-                for (j = (nhot < 10 ? nhot : 9); j > k; j--)
-                    hot[j] = hot[j - 1];
-                hot[k].idx = i;
-                hot[k].hits = h;
-                if (nhot < 10)
-                    nhot++;
-            }
-        }
-        printf("  [pcprof] hottest single buckets (16 B each):\n");
-        for (k = 0; k < nhot; k++)
-            printf("  [pcprof]   %06x  %3llu%% %8lluk\n",
-                   (unsigned)(hot[k].idx << 4),
-                   (unsigned long long)(hot[k].hits * 100ull / total),
-                   (unsigned long long)(hot[k].hits / 1000ull));
-    }
-
-    pc_profile_clear();
-}
 volatile uint32_t g_native_stage;
 
 /* libnx userland exception capture.  This turns an otherwise opaque Atmosphere
@@ -5828,17 +5065,16 @@ static void startup_stage_clear(void) {
 
 /* ---- advanced settings ---------------------------------------------------
  *
- * Every switch below used to be a file on the card: fastmem.txt turned
- * fastmem on by existing, dynarmic.txt carried a cache size in its text,
- * bench.txt an instruction count. That was a reasonable mechanism while the
- * only way to run this was from a PC with the card in it, and a poor one
- * now: a player holding a console cannot create a file, but can open a menu.
- * They are keys in config.txt instead, edited from the menu's Advanced tab.
+ * The development switches: the code cache size, the profilers, benchmark
+ * mode, the fixed clock, the touch markers and the log host. Keys in
+ * config.txt, edited from the menu's Advanced tab.
  *
- * The old files are still read ONCE each, and only where the matching key is
- * absent, so a card set up the old way behaves exactly as it did and is
- * written into config.txt on the next launch. Nothing deletes them; they
- * stop being consulted as soon as the key exists.
+ * They used to be files on the card (dynarmic.txt, profile.txt, bench.txt
+ * and so on). Those are still read ONCE each, and only where the matching key
+ * is absent, so a card set up the old way is written into config.txt on the
+ * next launch. Nothing deletes them; they stop being consulted as soon as the
+ * key exists. Flag files for engines that no longer exist (jit.txt,
+ * fastmem.txt, recomp.txt, ...) are simply ignored.
  *
  * All of these take effect at launch and are read once, here: what the menu
  * edits is the next run, not this one.
@@ -5852,7 +5088,7 @@ static int g_safe_mode;
 
 /* What the run actually ended up using, for the menu to show. Built as each
  * switch is read, because "what was asked for" and "what is running" differ
- * under safe mode, and again when dynarmic or fastmem decline to start. */
+ * under safe mode, and again when dynarmic declines to start. */
 static char g_runtime_label[192];
 
 static void runtime_note(const char *text) {
@@ -5922,16 +5158,9 @@ static int      g_import_saved;
  * for cards that predate it, not to keep the files authoritative. */
 static void advanced_import_legacy(void) {
     static const struct { const char *key; const char *file; } presence[] = {
-        { "fastmem",       "fastmem.txt" },
-        { "predecode",     "predecode.txt" },
         { "profilers",     "profile.txt" },
         { "fixed_clock",   "fixedclock.txt" },
-        { "watch_object",  "watch.txt" },
         { "touch_debug",   "touchdbg.txt" },
-        { "jit_chain",     "chain.txt" },
-        { "jit_verify",    "jitverify.txt" },
-        { "recomp_verify", "recompverify.txt" },
-        { "recomp_ablate", "recompablate.txt" },
     };
     unsigned i, n = 0;
     long v;
@@ -5942,26 +5171,11 @@ static void advanced_import_legacy(void) {
         settings_set_int(presence[i].key, 1);
         n++;
     }
-    /* The engine: two files, one key. dynarmic is read second so that it wins
-     * if both were left on the card. */
-    if (legacy_flag("jit.txt", &v) && !settings_have("cpu_engine")) {
-        settings_set("cpu_engine", "jit");
-        n++;
-    }
-    if (legacy_flag("dynarmic.txt", &v)) {
-        if (!settings_have("cpu_engine")) {
-            settings_set("cpu_engine", "dynarmic");
-            n++;
-        }
-        if (v > 0 && !settings_have("dynarmic_cache_mb")) {
-            settings_set_int("dynarmic_cache_mb", (int)v);
-            n++;
-        }
-    }
-    /* recycle.txt is the one that meant something by its CONTENTS: it held
-     * "0" to turn recycling off, and existing at all left it on. */
-    if (legacy_flag("recycle.txt", &v) && !settings_have("heap_recycle")) {
-        settings_set_int("heap_recycle", v == 0 ? 0 : 1);
+    /* dynarmic.txt chose the engine and carried the cache size; only the
+     * size is still a choice. */
+    if (legacy_flag("dynarmic.txt", &v) && v > 0 &&
+        !settings_have("dynarmic_cache_mb")) {
+        settings_set_int("dynarmic_cache_mb", (int)v);
         n++;
     }
     if (legacy_flag("bench.txt", &v)) {
@@ -5971,16 +5185,6 @@ static void advanced_import_legacy(void) {
         }
         if (v > 0 && !settings_have("bench_million")) {
             settings_set_int("bench_million", (int)v);
-            n++;
-        }
-    }
-    if (legacy_flag("recomp.txt", &v)) {
-        if (!settings_have("recomp")) {
-            settings_set_int("recomp", 1);
-            n++;
-        }
-        if (v > 0 && !settings_have("recomp_mask")) {
-            settings_set_int("recomp_mask", (int)v);
             n++;
         }
     }
@@ -6017,10 +5221,6 @@ static int adv_int(const char *key, int def) {
     return g_safe_mode ? def : settings_get_int(key, def);
 }
 
-static const char *adv_str(const char *key, const char *def) {
-    return g_safe_mode ? def : settings_get(key, def);
-}
-
 /* From main(), once the card is readable and the crash breadcrumb has been
  * read: that breadcrumb is what decides safe mode. */
 static void advanced_init(int previous_run_died) {
@@ -6035,10 +5235,8 @@ int port_safe_mode(void) {
 }
 
 const char *port_runtime_label(void) {
-    return g_runtime_label[0] ? g_runtime_label : "interpreter";
+    return g_runtime_label[0] ? g_runtime_label : "starting";
 }
-
-
 
 static int startup_stage_read(char *out, size_t cap) {
     unsigned i;
@@ -6068,15 +5266,12 @@ static uint32_t fnv1a32(const unsigned char *p, size_t n) {
     return h;
 }
 
-static int      g_want_dyn;         /* cpu_engine = dynarmic */
 static unsigned g_dyn_mb = 32;      /* code cache, MB; dynarmic_cache_mb */
 static int      g_dyn_live;         /* dyn_init actually succeeded */
-static int g_want_fastmem;
-static VirtmemReservation *g_fastmem_rv;
 
-/* Page-aligned, zeroed. svcMapMemory requires page-aligned source, destination
- * and length, so every guest region has to start on a page and occupy whole
- * pages whether or not fastmem is switched on. */
+/* Page-aligned, zeroed: the guest regions are handed to dynarmic's page
+ * table in 4 KB pages, and a region that started mid-page would lose its
+ * first partial page to the slow path. */
 static uint8_t *page_alloc(size_t n) {
     size_t sz = (n + 0xFFFu) & ~(size_t)0xFFFu;
     void *p = memalign(0x1000, sz);
@@ -6086,545 +5281,21 @@ static uint8_t *page_alloc(size_t n) {
     return (uint8_t *)p;
 }
 
-/* Reserve 4 GB of address space and alias each guest region into it at its own
- * guest address. After this, translating a guest pointer is fast_base + addr
- * with no test of any kind: the guest address is 32 bits, so it cannot leave
- * the window.
- *
- * Horizon gives 39 bits of user address space, so a 4 GB reservation is
- * affordable; only the ~343 MB actually backed is mapped, and the holes stay
- * unmapped so a stray access faults rather than silently reading a neighbour.
- * Failure at any step leaves fast_base NULL and the region path is used. */
-static void fastmem_setup(GuestMem *m) {
-    /* virtmemFindStack, not virtmemFindAslr. svcMapMemory requires its
-     * destination in the ALIAS region; general-purpose address space is
-     * refused with kernel error 110, InvalidMemoryRegion -- which is exactly
-     * what the first attempt got back.
-     *
-     * 4 GB is preferred: then every 32-bit guest address lands inside the
-     * reservation and an unmapped one faults on a hole rather than on
-     * whatever happens to live past the end. 2 GB still covers everything
-     * backed (heap top is 0x74000000); the stub page at 0xF0000000 is only
-     * ever a PC and guest_is_stub short-circuits before any fetch. */
-    /* Probe downwards and report, because "no window" on its own does not
-     * say whether the alias region is small, fragmented, or unavailable --
-     * and the answer decides whether fastmem needs the guest address space
-     * compacted to fit. */
-    static const uint64_t want[] = {
-        0x100000000ull, 0x80000000ull, 0x40000000ull, 0x20000000ull,
-        0x10000000ull, 0x08000000ull, 0x04000000ull };
-    void *base = NULL;
-    uint64_t win = 0;
-    unsigned t;
-    int i, mapped = 0;
-    for (t = 0; t < sizeof want / sizeof *want && !base; t++) {
-        virtmemLock();
-        base = virtmemFindStack(want[t], 0x1000);
-        if (base) {
-            g_fastmem_rv = virtmemAddReservation(base, want[t]);
-            if (g_fastmem_rv) win = want[t]; else base = NULL;
-        }
-        virtmemUnlock();
-        if (!base)
-            printf("fastmem: %u MB alias window unavailable\n",
-                   (unsigned)(want[t] >> 20));
-    }
-    if (!base) {
-        printf("fastmem: no alias window available\n");
-        return;
-    }
-    for (i = 0; i < m->count; i++) {
-        const GuestRegion *r = &m->region[i];
-        uint32_t size = (r->size + 0xFFFu) & ~0xFFFu;
-        Result rc;
-        if ((uint64_t)r->base + size > win) {
-            printf("fastmem: region %08x past the %u MB window\n",
-                   (unsigned)r->base, (unsigned)(win >> 20));
-            break;
-        }
-        rc = svcMapMemory((void *)(uintptr_t)((uint64_t)(uintptr_t)base + r->base),
-                          r->host, size);
-        if (R_FAILED(rc)) {
-            printf("fastmem: map %08x (%u KB) failed %08x\n",
-                   (unsigned)r->base, (unsigned)(size >> 10), rc);
-            break;
-        }
-        mapped++;
-    }
-    if (mapped != m->count) {
-        while (--mapped >= 0) {
-            const GuestRegion *u = &m->region[mapped];
-            svcUnmapMemory((void *)(uintptr_t)((uint64_t)(uintptr_t)base + u->base),
-                           u->host, (u->size + 0xFFFu) & ~0xFFFu);
-        }
-        virtmemLock();
-        virtmemRemoveReservation(g_fastmem_rv);
-        virtmemUnlock();
-        g_fastmem_rv = NULL;
-        return;
-    }
-    /* Repoint everything at the alias, because the source is now gone.
-     *
-     * svcMapMemory does not merely add a second view: it takes the source
-     * pages away, leaving them with no permissions -- which is precisely how
-     * libnx builds thread stacks, allocating, mapping, then using the mapped
-     * address and never the original. So g_heap, g_surf, g_stack and the image
-     * became dead pointers the instant the maps succeeded, and main.c reads all
-     * four directly. The slot tables cache host pointers too, so they have to
-     * be rebuilt from the new region hosts. */
-    for (i = 0; i < m->count; i++)
-        m->region[i].host = (uint8_t *)base + m->region[i].base;
-    guest_slots_build(m);
-    /* One unsigned compare covers both ends: anything below the lowest mapped
-     * address wraps to a huge value and fails the same test that catches
-     * anything above the top. That is what restores NULL for the near-null
-     * pointers the HLE layer passes in -- s3eDebugAssertShow was called with
-     * r0 = 2, which sat inside the window and below every region. */
-    {
-        uint32_t lo = 0xFFFFFFFFu, hi = 0;
-        for (i = 0; i < m->count; i++) {
-            uint32_t rb = m->region[i].base;
-            uint32_t rt = rb + ((m->region[i].size + 0xFFFu) & ~0xFFFu);
-            if (rb < lo) lo = rb;
-            if (rt > hi) hi = rt;
-        }
-        m->fast_lo = lo;
-        m->fast_span = hi - lo;
-        printf("fastmem span %08x..%08x\n", lo, hi);
-    }
-    m->fast_base = (uint8_t *)base;
-    printf("fastmem on: %d regions in a %u MB window at %p\n",
-           m->count, (unsigned)(win >> 20), base);
-}
-
-/* ------------------------------------------- statically recompiled functions
- *
- * The spike for whole-function AOT translation; the translations themselves
- * are in recomp.c and the contract is in recomp.h.
- *
- * Entry reuses the existing hook mechanism, which already has exactly the
- * right shape: guest_run dispatches at the function's entry PC, the handler
- * runs, and the loop branches to LR. A translated function is a native hook
- * whose body happens to have been derived mechanically rather than written.
- *
- * DECLINING. A hook cannot normally refuse -- the loop branches to LR whatever
- * the handler did. So a translation that declines sets its own observe flag,
- * which the loop reads AFTER the handler returns: the branch is skipped and
- * the interpreter executes the real function instead. The flag is cleared at
- * the top of the next call, so a decline costs one wasted attempt and never
- * disables the translation permanently. The attempt is free of consequence
- * because a declining translation has not written to the CPU (see recomp.h).
- *
- * VERIFYING. recompverify.txt runs both: the translation on the real state,
- * then the state is rewound and the interpreter runs the same function to its
- * own LR through a nested guest_run, and the two results are compared. The
- * INTERPRETER's state is the one kept, so a bad translation cannot poison the
- * rest of the session -- the same rule jit_verify_block runs on.
- *
- * The nested run needs a re-entrancy guard: it re-enters guest_run at the very
- * PC that is hooked, so without the guard the handler would call itself
- * forever. With the guard set the handler returns immediately and observe is
- * on, so the nested run executes the real instructions.
- *
- * No undo log, and that is a precondition rather than an oversight: the one
- * function translated so far performs no stores, so rewinding registers is
- * enough. The FIRST translated function that writes memory needs the log
- * armed around the checked call only -- arming it globally makes it record the
- * interpreter's own stores, and rollback then destroys ordinary execution.
- *
- * MEASURING. Both sides are tick-stamped, and two overheads are calibrated at
- * startup and subtracted, because at 19.2 MHz a tick is 52 ns and the things
- * being timed are of that order: the cost of the paired tick reads themselves,
- * and the cost of entering guest_run (which rebuilds a 256-byte hook map per
- * call -- irrelevant when it runs once per 5M instructions, dominant when it
- * runs once per guest function call). Without the second subtraction the
- * interpreter would be charged setup the real interpreter never pays, and the
- * ratio would flatter the translation. */
-
-#define RECOMP_MAX 8
-
-static int      g_recomp_on;             /* the recomp setting */
-static int      g_recomp_verify;         /* recomp_verify */
-static uint32_t g_recomp_hook0;          /* index of the first recomp hook */
-/* Set ONLY around the interpreter's re-run. While it is set every
- * translated hook stands aside so the real instructions execute. */
-static int      g_recomp_rerun;
-/* Non-zero while a verification is in progress anywhere up the stack.
- *
- * One flag used to do both jobs, and it deadlocked the game. A virtual
- * method reached from a translated function can re-enter that same
- * function -- nested dispatch is ordinary in a scene graph -- and the
- * single guard made the hook return without running the translation while
- * observe was still 0, so the dispatch loop branched straight to LR and
- * skipped the nested call entirely. State went wrong and the traversal
- * stopped terminating: five minutes of total silence at 1180M.
- *
- * Nested entries must still RUN, just not recursively verify -- one
- * verification re-running inside another has no meaning. So depth selects
- * the plain path, and only the re-run itself suppresses the hook. */
-static int      g_recomp_depth;
-static int      g_recomp_ablate;         /* recomp_ablate */
-/* Which entries of g_recomp[] to install, as a bitmask: recomp_mask, which
- * the menu edits as a checkbox per function. One flag enabling the whole
- * table makes a second translation unmeasurable -- its effect cannot be
- * separated from the first one's. Unset means all of them. */
-static uint32_t g_recomp_mask = 0xFFFFFFFFu;
-/* g_recomp[] index -> the hook slot it was installed in. Once the mask
- * can skip entries the two stop being the same number, and a handler
- * that resolved its own hook by arithmetic would toggle observe on the
- * wrong one. */
-static uint32_t g_recomp_slot[RECOMP_MAX];
-static int      g_recomp_window_off;     /* this window is the control */
-
-static uint64_t g_recomp_calls[RECOMP_MAX];
-static uint32_t g_recomp_declined[RECOMP_MAX];
-static uint32_t g_recomp_diverged[RECOMP_MAX];
-static uint32_t g_recomp_verified[RECOMP_MAX];
-static uint32_t g_recomp_unverified[RECOMP_MAX];
-/* The recompiled functions, so the menu can offer one checkbox each rather
- * than asking anyone to write a bitmask by hand. */
-unsigned port_recomp_count(void) {
-    return g_recomp_count < RECOMP_MAX ? g_recomp_count : RECOMP_MAX;
-}
-
-const char *port_recomp_name(unsigned i) {
-    return i < port_recomp_count() ? g_recomp[i].name : "";
-}
-
-
-/* Registers only, and not r15: the translation never touches PC (the loop
- * branches to LR for it) while the interpreter's run ends with PC already at
- * LR, so comparing it would report a divergence on every single call. CPSR is
- * compared in full -- see recomp.h on why the flags are reproduced exactly. */
-/* Memory verification for translated functions that write.
- *
- * The first translated function performed no stores, so rewinding registers
- * was enough. Nothing real is that convenient -- the moment a translation
- * writes memory, re-running it through the interpreter reads back what the
- * translation just wrote and computes a different answer, which is a
- * divergence manufactured by the check itself.
- *
- * So: arm the undo log around the translated call ONLY, capture what it wrote
- * (that is what gets compared), put the original bytes back, and only then let
- * the interpreter run against the same memory the translation started from.
- *
- * Arming it globally is the trap this project already fell into once with the
- * JIT: guest_wptr then logs every store the INTERPRETER makes as well, so by
- * the time a block is checked the log holds thousands of unrelated writes and
- * rolling it back undoes ordinary execution rather than the call.
- *
- * Same shape as jit_verify_block, deliberately -- that one is proven over
- * 107M checked block executions and there is no reason to invent a second
- * version of a rollback that already works. */
-/* The pages as the translation left them, and as they stand after the
- * interpreter's re-run. Comparing whole pages rather than a list of
- * individual stores is not just cheaper to record -- it is STRICTER: it
- * catches a byte the interpreter wrote that the translation did not, which
- * a per-store log would have missed entirely because it only knew about
- * the addresses the translation touched. 256 KB of static buffer, only
- * touched under recompverify.txt. */
-static uint8_t recomp_pgafter[GUEST_PGSNAP_MAX][GUEST_PGSNAP_SIZE];
-static uint8_t recomp_pgnow[GUEST_PGSNAP_MAX][GUEST_PGSNAP_SIZE];
-
-/* Returns the number of stores captured, having restored the original bytes. */
-static uint32_t recomp_capture_writes(Guest *gg) {
-    uint32_t n = gg->mem.pgsnap_n;
-
-    guest_pgsnap_save(&gg->mem, recomp_pgafter);  /* what the translation made */
-    guest_pgsnap_restore(&gg->mem);               /* and back to the originals */
-    return n;
-}
-
-/* After the interpreter's re-run, does memory hold what the translation
- * produced? Compares only the locations the translation touched: anywhere
- * else the interpreter wrote and the translation did not is itself a
- * divergence, but a register-and-writes comparison catches that case as a
- * wrong value at the next read rather than missing it entirely. */
-static int recomp_diff_writes(Guest *gg, uint32_t n, uint32_t *where) {
-    uint32_t k, b;
-
-    guest_pgsnap_save(&gg->mem, recomp_pgnow);
-    for (k = 0; k < n; k++) {
-        if (!memcmp(recomp_pgnow[k], recomp_pgafter[k], GUEST_PGSNAP_SIZE))
-            continue;
-        /* Report the first differing byte rather than the page, so the address
-         * points at the field that disagrees instead of its neighbourhood. */
-        for (b = 0; b < GUEST_PGSNAP_SIZE; b++)
-            if (recomp_pgnow[k][b] != recomp_pgafter[k][b]) {
-                *where = guest_pgsnap_base[k] + b;
-                return 1;
-            }
-    }
-    return 0;
-}
-
-static int recomp_diff(const GuestCpu *a, const GuestCpu *b, unsigned *which) {
-    unsigned i;
-    for (i = 0; i < 15; i++) {
-        /* LR is excluded, and that is the harness's doing rather than the
-         * translation's. A guest function returning through pop {..., pc}
-         * never restores LR -- it keeps whatever the last BL/BLX inside it
-         * wrote. A translation cannot reproduce that, because the hook returns
-         * by branching to c->r[LR] and has no other route back, so LR must
-         * hold the caller's address at exit. Comparing it flags every function
-         * that both calls out and returns through the stack, which is most of
-         * the ones worth translating.
-         *
-         * Safe to skip: the PCS makes LR volatile across a call, so no caller
-         * may rely on it. Revisit only if the hook contract ever lets a
-         * handler set its own return PC. */
-        if (i == GUEST_LR)
-            continue;
-        if (a->r[i] != b->r[i]) { *which = i; return 1; }
-    }
-    if (a->cpsr != b->cpsr) { *which = 16; return 1; }
-    return 0;
-}
-
-static void hook_recomp(GuestCpu *c, GuestMem *m, void *user) {
-    unsigned idx = (unsigned)(uintptr_t)user;
-    (void)m;                  /* translations reach memory through g */
-    GuestHook *self = &g.hook[g_recomp_slot[idx]];
-
-    /* The interpreter is re-running this function for a check: stand aside
-     * so it executes the real instructions. observe is forced on rather
-     * than assumed, because a nested call can land on a DIFFERENT
-     * translated function whose observe is still 0 -- and the dispatch
-     * loop would branch that one straight past. */
-    if (g_recomp_rerun) {
-        self->observe = 1;
-        return;
-    }
-
-    self->observe = 0;        /* clear a decline left over from last call */
-
-    /* Ablation control window: count the call, then hand it to the
-     * interpreter exactly as a decline would. The two windows then differ in
-     * one variable and nothing else -- same scene, same session, same
-     * everything -- which a pair of separate runs can never promise. */
-    if (g_recomp_window_off) {
-        g_recomp_calls[idx]++;
-        self->observe = 1;
-        return;
-    }
-
-    /* Plain path when verification is off, and also for a nested entry
-     * inside a verification already under way: run the translation and
-     * credit it, but do not start a second check inside the first. */
-    if (!g_recomp_verify || g_recomp_depth) {
-        {
-            int retired;
-            g_recomp_calls[idx]++;
-            retired = g_recomp[idx].fn(&g);
-            if (!retired) {
-                g_recomp_declined[idx]++;
-                self->observe = 1;
-            } else {
-                /* guest_run credits exactly one instruction for a hook
-                 * that takes over the call; the translation stood in
-                 * for `retired` of them. Without this the counter --
-                 * and every throughput number derived from it -- reads
-                 * low only when the translation is on. */
-                g.executed += (uint64_t)(retired - 1);
-            }
-        }
-        return;
-    }
-
-    {
-        GuestCpu before = *c, after_c;
-        uint32_t lr = c->r[GUEST_LR];
-        unsigned which = 0;
-        int ran;
-        GuestStatus rerun_st;
-
-        uint32_t nwrote, badaddr = 0;
-        uint32_t ovf0 = g.mem.undo_overflow;
-
-        g_recomp_depth++;
-        g_recomp_calls[idx]++;
-
-        /* Armed here and disarmed immediately: see recomp_capture_writes. */
-        g.mem.undo_n = 0;
-        g.mem.pgsnap_n = 0;
-        g.mem.undo_page_mode = 1;
-        g.mem.undo_active = 1;
-        ran = g_recomp[idx].fn(&g);
-        g.mem.undo_active = 0;
-        g.mem.undo_page_mode = 0;
-        after_c = *c;
-        /* The undo log holds GUEST_UNDO_MAX entries. A translation that
-         * calls out can exhaust that in a few iterations -- every store
-         * its callees make must be logged too, or the interpreter's
-         * re-run applies them a second time.
-         *
-         * Truncating is the dangerous option, and it is what this code
-         * did until now: the rollback would restore only the first 256
-         * stores and everything past the cap would be double-applied,
-         * silently, in the middle of a session.
-         *
-         * So on overflow, keep the translation's result, skip the check
-         * and count it. An unverified call is a gap you can see in the
-         * report; a half-rolled-back one is a corrupted run you cannot.
-         * The JIT never reaches this because its blocks are about five
-         * instructions long -- this path exists precisely because whole
-         * functions are not. */
-        if (g.mem.undo_overflow != ovf0) {
-            g.mem.undo_n = 0;
-            g.mem.pgsnap_n = 0;
-            g_recomp_unverified[idx]++;
-            g_recomp_depth--;
-            return;
-        }
-        nwrote = recomp_capture_writes(&g);
-
-        *c = before;                  /* rewind; the interpreter runs it again */
-        self->observe = 1;            /* the nested run must not re-enter here */
-        g_recomp_rerun = 1;
-        /* The budget was 4096, which was sized for a thirteen-instruction leaf
-         * and is catastrophic for anything larger. A function that loops or
-         * calls out exhausts it, guest_run returns STEP_LIMIT without ever
-         * reaching lr, and the code below carried on as though the function had
-         * returned -- leaving the guest mid-function, then branching to a
-         * return address that was never established. That is how a checked
-         * string hash ended up executing from the stack, and almost certainly
-         * how the listener-dispatch check appeared to deadlock.
-         *
-         * 20M matches recomp_call. The status is now checked rather than
-         * discarded: a re-run that did not halt at lr has not verified
-         * anything, and continuing from it corrupts the session. */
-        rerun_st = guest_run(&g, lr, 20000000);
-        g_recomp_rerun = 0;
-        self->observe = 0;
-        /* The nested run counted the function's instructions itself, so
-         * the outer loop's credit for the hook dispatch is one too many. */
-        g.executed--;
-
-        if (rerun_st != GUEST_HALTED) {
-            /* Not a divergence -- a failed check. Report it loudly once: the
-             * guest is now mid-function and the session is no longer sound. */
-            if (g_recomp_unverified[idx] < 4)
-                printf("  [recomp] %s: re-run did not reach LR (%s) -- check"
-                       " abandoned, state may be inconsistent\n",
-                       g_recomp[idx].name, guest_status_str(rerun_st));
-            g_recomp_unverified[idx]++;
-        } else if (!ran) {
-            g_recomp_declined[idx]++;
-        } else {
-            g_recomp_verified[idx]++;
-            if (nwrote && recomp_diff_writes(&g, nwrote, &badaddr)) {
-                if (g_recomp_diverged[idx] < 8)
-                    printf("  [recomp] DIVERGENCE in %s: memory at %08x differs"
-                           " after %u store(s)\n",
-                           g_recomp[idx].name, (unsigned)badaddr,
-                           (unsigned)nwrote);
-                g_recomp_diverged[idx]++;
-            } else if (recomp_diff(&after_c, c, &which)) {
-                if (g_recomp_diverged[idx] < 8)
-                    printf("  [recomp] DIVERGENCE in %s: %s%u differs, "
-                           "translated %08x vs interpreter %08x\n",
-                           g_recomp[idx].name,
-                           which == 16 ? "cpsr" : "r",
-                           which == 16 ? 0u : which,
-                           (unsigned)(which == 16 ? after_c.cpsr : after_c.r[which]),
-                           (unsigned)(which == 16 ? c->cpsr : c->r[which]));
-                g_recomp_diverged[idx]++;
-            }
-        }
-        g_recomp_depth--;
-        /* c holds the interpreter's state and PC is already at LR; the loop
-         * branches there again, which is a no-op. */
-    }
-}
-
-/* Cleared with the profile window, not only printed with it. The first call
- * to frame_profile_report takes an early return -- it exists to set the window
- * origin -- so anything reset only on the printing path accumulates the whole
- * loading phase into window one. That is how the first report here came to
- * claim 34M calls, more guest instructions than the frame had: it was every
- * call since boot, most of them asset decompression. */
-static void recomp_clear(void) {
-    unsigned i;
-    for (i = 0; i < RECOMP_MAX; i++) {
-        g_recomp_calls[i] = 0;
-        g_recomp_declined[i] = 0;
-        g_recomp_verified[i] = 0;
-        g_recomp_unverified[i] = 0;
-    }
-}
-
-/* No per-call timing, deliberately.
- *
- * The first version of this stopwatched both paths with armGetSystemTick and
- * reported nanoseconds. A tick is 52 ns and the things being timed are tens of
- * ns, so every sample was 0 or 1 tick and the answer came out of subtracting a
- * 47 ns calibration from a 60 ns sample -- almost entirely calibration error.
- * It read 1.3x in one window and 4.6x in the next for identical code, which is
- * the measurement disproving itself.
- *
- * Ablation replaces it. Alternate windows run the translation and hand the
- * same calls to the interpreter, and the comparison is the [prof ] ms/300f
- * line that frame_profile_report already prints -- measured at frame scale,
- * where a 52 ns tick is irrelevant. Read the two windows against each other,
- * with calls/frame to confirm they were doing comparable work.
- *
- * Calls per frame matters as much as the timing: it is scene-dependent to an
- * extreme degree here, measured at 40439 per frame in one window and exactly
- * zero in the two after it. Ablate at a fixed spot, or the control window and
- * the live one will not be the same experiment. */
-static void recomp_report(void) {
-    unsigned i;
-
-    if (!g_recomp_on)
-        return;
-    for (i = 0; i < g_recomp_count && i < RECOMP_MAX; i++) {
-        uint64_t n = g_recomp_calls[i];
-        if (!n)
-            continue;
-        printf("  [recomp] %s: %llu calls (%llu/frame), %s, %u declined,"
-               " %u diverged of %u\n",
-               g_recomp[i].name, (unsigned long long)n,
-               (unsigned long long)(n / 300ull),        /* the report window */
-               g_recomp_window_off ? "OFF (control)"
-                                   : (g_recomp_ablate ? "ON" : "on"),
-               (unsigned)g_recomp_declined[i],
-               (unsigned)g_recomp_diverged[i],
-               (unsigned)g_recomp_verified[i]);
-        if (g_recomp_unverified[i])
-            printf("  [recomp]   %u call(s) unverified:"
-                   " undo log overflowed\n",
-                   (unsigned)g_recomp_unverified[i]);
-    }
-    recomp_clear();
-    if (g_recomp_ablate)
-        g_recomp_window_off = !g_recomp_window_off;
-}
-
 /* ------------------------------------------------------- control socket ---
  *
- * The card flags multiplied past the point of being workable: jit, jitverify,
- * chain, fastmem, profile, recycle, touchdbg, fixedclock, recomp,
- * recompverify, recompablate, bench, watch, nxlink_host, startup_stage. Every
- * change of one byte means stopping, ejecting the card, editing on a PC and
- * putting it back -- and a run that differs from its pair by a file nobody
- * noticed is the single failure that has cost this project the most time
- * today. A stray chain flag quietly enabling the whole JIT is the same
- * disease.
+ * The NRO listens for development. It already speaks to the PC in one
+ * direction (stdout over nxlink); this is the other, a small line protocol on
+ * port 28772 that writes, deletes and lists files under sdmc:/switch/boz --
+ * which is how a new build (the NRO lives there) and config.txt get onto the
+ * card without ejecting it -- plus the SND commands that drive a running game.
  *
- * So the NRO listens. It already speaks to the PC in one direction (stdout
- * over nxlink); this is the other, a small line protocol on port 28772 that
- * writes, deletes and lists files under sdmc:/switch/boz. The flags are still
- * files -- nothing about how they are READ changes, so every existing switch
- * and every habit still works -- but they no longer have to be edited by hand.
- *
- * Writes take effect at the next launch, because every flag is read once
- * during startup. That is deliberate: a flag that changed under a running
- * measurement would be worse than the problem it solves.
+ * Files written take effect at the next launch, because settings are read
+ * once during startup.
  *
  * Confined to sdmc:/switch/boz by construction -- no separators, no "..", no
  * control characters, bounded length. This is an unauthenticated listener on
  * the local network, so the confinement is the whole security model: the worst
- * a stranger on the LAN can do is toggle a debug flag for this homebrew.
+ * a stranger on the LAN can do is rewrite this homebrew's own files.
  *
  * Non-blocking throughout, polled once per 5M-instruction chunk (about four
  * times a second), so it cannot stall the guest or add jitter to a benchmark.
@@ -6978,10 +5649,9 @@ static void ctl_command(char *line) {
         dyn_diag();
         ctl_say("OK\n");
     } else if (!strcmp(line, "GET") && arg && ctl_safe(arg)) {
-        /* Added for PGO: the .gcda files a profiled run writes are useless on
-         * the card and there was no way to read them back -- PUT, DEL and LS
-         * could change the card but never report its contents. Replies
-         * "OK <len>" and then that many raw bytes.
+        /* Reads a file back off the card -- PUT, DEL and LS can change it but
+         * never report its contents. Replies "OK <len>" and then that many
+         * raw bytes.
          *
          * The send loop spins on EAGAIN because the client socket is
          * non-blocking and a file larger than the socket buffer would
@@ -7142,7 +5812,7 @@ static void ctl_thread_start(void) {
         return;
     g_ctl_thread_live = 1;
     /* Core 1: the guest owns core 0 and the scheduler leaves 3 to the system.
-     * Priority below the main thread so it can never delay the interpreter --
+     * Priority below the main thread so it can never delay the guest --
      * it only needs to run when the socket has something, and 20 ms of
      * latency on a debug channel is not worth a single guest stall. */
     rc = threadCreate(&g_ctl_thread, ctl_thread_fn, NULL, NULL, 0x8000, 0x3B, 1);
@@ -7176,141 +5846,13 @@ static void ctl_init(void) {
         listen(ctl_listen, 1) < 0) {
         close(ctl_listen);
         ctl_listen = -1;
-        printf("ctl: listen failed; card flags are hand-edited as before\n");
+        printf("ctl: listen failed; no remote control this run\n");
         return;
     }
     fcntl(ctl_listen, F_SETFL, O_NONBLOCK);
     printf("ctl: port %d open -- LS / GET name / PUT name len / DEL name,"
            " under %s\n", CTL_PORT, CTL_DIR);
     ctl_thread_start();
-}
-
-/* 2x3 affine matrix compose, RVA 0x08be46 -- 9% of the in-game instruction
- * stream, joint top of the first undistorted profile this port has taken.
- * (Every earlier in-game ranking was captured with the JIT on, which makes
- * pcprof rank what the JIT failed to cover rather than what the game runs.)
- *
- * r0 = a, which is also the destination; r1 = b. Six floats each:
- *
- *     [0] [1] [2]        m00 m01 tx
- *     [3] [4] [5]        m10 m11 ty
- *
- *     out[0] = a1*b3 + a0*b0       out[3] = a4*b3 + a3*b0
- *     out[1] = a1*b4 + a0*b1       out[4] = a4*b4 + a3*b1
- *     out[2] = a1*b5 + a0*b2 + a2  out[5] = a4*b5 + a3*b2 + a5
- *
- * Every term is computed into a temporary and only copied back at the end,
- * because each one reads the ORIGINAL a -- writing in place would feed
- * half-updated values into the later terms.
- *
- * WHY THIS IS WORTH REPLACING, beyond its share: the guest computes each term
- * and then calls the float-store guard at RVA 0x61128 to store it. That is six
- * outbound calls per compose on top of the arithmetic, and the guest also
- * identity-initialises the temporary first (a memset plus two stores) even
- * though all six slots are then overwritten. The whole call tree costs 99
- * guest instructions to do twelve multiplies and eight adds.
- *
- * THE GUARD IS REPLICATED, NOT SKIPPED. f32_guard maps NaN and both infinities
- * to zero and passes every other bit pattern through untouched -- including
- * -0.0 and denormals, which is why it returns the original bits rather than a
- * round-tripped float. Dropping it would let a NaN reach a matrix the guest
- * expects to be finite, and that divergence would surface far from here.
- *
- * ROUNDING. ARMv7 VMLA is not fused: the product is rounded to single before
- * the accumulate, and a contracted FMA would round once and give a different
- * number. Nothing is needed here to prevent that -- the Makefile already
- * builds with -ffp-contract=off, deliberately and for this exact reason. A
- * first version of this hook forced each product through a volatile to defeat
- * a contraction that could not happen, and those ~20 stack round-trips per
- * call cost roughly as much as the arithmetic they guarded: dependent
- * store-to-load chains, the one thing this core punishes hardest.
- *
- * REGISTER FIDELITY, the discipline the vertex-transform hook had to learn:
- * the real function leaves r0-r3 holding the last four words it copied back
- * (r0=out[4], r1=out[5], r2=out[2], r3=out[3]) and s12-s15 holding the working
- * values of the final term. r4-r6 it pushes and pops, so they are untouched.
- * Reproducing all of that is what lets the differential harness compare equal
- * instead of reporting a divergence per call. */
-#define RVA_AFFINE_COMPOSE 0x08be46u
-
-static float aff_get(GuestMem *m, uint32_t base, unsigned i, int *ok) {
-    uint32_t bits = 0;
-    float v;
-    if (!guest_ld32(m, base + 4u * i, &bits))
-        *ok = 0;
-    memcpy(&v, &bits, sizeof v);
-    return v;
-}
-
-static void hook_affine_compose(GuestCpu *cpu, GuestMem *mem, void *user) {
-    uint32_t a = cpu->r[0], b = cpu->r[1];
-    float av[6], bv[6];
-    uint32_t out[6];
-    unsigned i;
-    int ok = 1;
-    (void)user;
-
-    for (i = 0; i < 6; i++) {
-        av[i] = aff_get(mem, a, i, &ok);
-        bv[i] = aff_get(mem, b, i, &ok);
-    }
-    if (!ok) {
-        printf("  [fast ] affine compose: load faulted at %08x/%08x\n",
-               (unsigned)a, (unsigned)b);
-        return;
-    }
-
-    {
-        float t[6];
-        t[0] = av[1] * bv[3] + av[0] * bv[0];
-        t[3] = av[4] * bv[3] + av[3] * bv[0];
-        t[1] = av[1] * bv[4] + av[0] * bv[1];
-        t[4] = av[4] * bv[4] + av[3] * bv[1];
-        t[2] = av[1] * bv[5] + av[0] * bv[2] + av[2];
-        t[5] = av[4] * bv[5] + av[3] * bv[2] + av[5];
-        for (i = 0; i < 6; i++) {
-            uint32_t bits;
-            memcpy(&bits, &t[i], sizeof bits);
-            out[i] = f32_guard(bits);      /* exactly what RVA 0x61128 does */
-        }
-    }
-
-    for (i = 0; i < 6; i++)
-        if (!guest_st32(mem, a + 4u * i, out[i])) {
-            printf("  [fast ] affine compose: store faulted at %08x\n",
-                   (unsigned)(a + 4u * i));
-            return;
-        }
-
-    /* The scratch state the real function leaves behind. */
-    cpu->r[0] = out[4];
-    cpu->r[1] = out[5];
-    cpu->r[2] = out[2];
-    cpu->r[3] = out[3];
-    memcpy(&cpu->s[12], &av[4], sizeof(uint32_t));   /* s12 = a[4] */
-    memcpy(&cpu->s[13], &av[3], sizeof(uint32_t));   /* s13 = a[3] */
-    cpu->s[14] = out[5];                             /* s14 = final term */
-    {   /* s15 held the product-sum before the translate was added. */
-        float pre = av[4] * bv[5] + av[3] * bv[2];
-        memcpy(&cpu->s[15], &pre, sizeof(uint32_t));
-    }
-
-    /* The six guard calls the guest would have made, so the [fast ] f32 tally
-     * keeps counting the same events after they stop being separate calls. */
-    g_f32_hits[0] += 6;
-    g_affine_calls++;
-
-    /* Instruction accounting, the same correction hook_recomp needed and for
-     * the same reason: guest_run credits ONE instruction for a hook that took
-     * over a call, and the benchmark stops at a fixed instruction count. Left
-     * uncorrected, the arm with this hook would reach 2000M having done far
-     * more real work than the arm without, and the comparison would be
-     * meaningless. 99 is exact rather than estimated: the compose is
-     * straight-line (71) and so are the zero-init (12) and identity-init (9)
-     * it calls, and the memset and six guards it reaches are themselves hooks
-     * costing one apiece. The paired frame counts are the check -- if 99 is
-     * wrong they will diverge, which is precisely how this is detectable. */
-    g.executed += 99u - 1u;
 }
 
 /* ------------------------------------------------------- clock readout ---
@@ -7320,10 +5862,8 @@ static void hook_affine_compose(GuestCpu *cpu, GuestMem *mem, void *user) {
  * profile changed between two runs, nothing would have shown it, and the pair
  * would have looked like a result.
  *
- * That matters more now than it did. The goal is 30 fps at STOCK (1020 MHz),
- * and the whole plan is scaled by a 2500 -> 1020 penalty measured exactly once
- * -- in a JIT configuration later shown to be a net loss. Recording the clock
- * turns "was this run at stock?" from a memory into a fact in the log.
+ * Recording the clock turns "was this run at stock?" from a memory into a
+ * fact in the log.
  *
  * READ-ONLY, deliberately. Setting clocks belongs to the OC sysmodule, which
  * reapplies its own profile and would simply overwrite anything set here.
@@ -7483,80 +6023,10 @@ static void run(void) {
                 free(text);
         }
     }
-    {   /* The BSS global holding the object read at RVA 0x23f228, resolved
-         * from the GOT statically. Fixed in every run, so it can be watched
-         * from the start rather than discovered.
-         *
-         * Disarmed now that the crash it was chasing is fixed. It is not free:
-         * the interpreter only stamps mem.current_pc while a watch is armed,
-         * and guest_wptr tests every store against the watched word, so
-         * leaving it on costs about 3% for a diagnostic nothing is reading.
-         * Re-arm with watch_object in the menu's Advanced tab. */
-        if (adv_int("watch_object", 0)) {
-            runtime_note("watch");
-            g.mem.watch_addr = g_img.load_base + RVA_OBJ_GLOBAL;
-            printf("watch: object global at %08x (RVA %06x)\n",
-                   (unsigned)g.mem.watch_addr, (unsigned)RVA_OBJ_GLOBAL);
-        }
-    }
-    {   /* The JIT is opt-in, and its self-check is opt-in on top of that.
-         *
-         * Off by default because it is the one component with no offline
-         * oracle: run_boz.py single-steps the interpreter against Unicorn and
-         * cannot follow a block-at-a-time execution, and the JIT only exists
-         * on AArch64 so the host harness cannot run it at all. Until coverage
-         * is broad enough to have been exercised for a long time, it stays
-         * something chosen rather than the default.
-         *
-         *   cpu_engine = jit   compile and run hot blocks
-         *   jit_verify         re-run every compiled block through the
-         *                      interpreter and compare -- much slower, and the
-         *                      only way this gets trustworthy
-         *   jit_chain          run block to block without returning to the
-         *                      dispatcher. Separate from the self-check
-         *                      because it is the one thing that check cannot
-         *                      cover -- verification re-runs a single block,
-         *                      and a chain is by definition not one block --
-         *                      so it is forced off whenever verify is on.
-         *
-         * Both only mean anything under this engine: read through it, so that
-         * a leftover jit_verify cannot quietly start a second CPU underneath
-         * dynarmic. */
-        const int engine_jit = !strcmp(adv_str("cpu_engine", "interpreter"), "jit");
-        const int want_jit = engine_jit;
-        const int want_ver = engine_jit && adv_int("jit_verify", 0);
-        const int want_chain = engine_jit && adv_int("jit_chain", 0);
-        if (want_jit && guest_jit_init(&g)) {
-            g.jit_verify = want_ver;
-            g.jit_chain = want_chain && !want_ver;
-            /* undo_active is NOT armed here: guest_run turns it on around the
-             * block being checked and off again immediately. Left on globally
-             * it logs every interpreter store too, and the rollback then undoes
-             * ordinary execution. */
-            printf("jit: enabled%s%s\n",
-                   want_ver ? ", self-verifying (slow)" : "",
-                   g.jit_chain ? ", chaining" :
-                   (want_chain ? ", chaining suppressed by verify" : ""));
-            runtime_note(want_ver ? "block JIT (verifying)" : "block JIT");
-        } else if (want_jit) {
-            printf("jit: requested but guest_jit_init failed\n");
-        }
-    }
-
-    {   /* Handing freed blocks back to the guest allocator, which can be
-         * turned off so the two behaviours compare without a rebuild. */
-        g_recycle_freed = adv_int("heap_recycle", g_recycle_freed) ? 1 : 0;
-        printf("heap: recycle freed blocks = %d\n", g_recycle_freed);
-        if (!g_recycle_freed)
-            runtime_note("no heap recycling");
-    }
     /* On-screen touch markers and pointer logging. */
     g_touch_dbg = adv_int("touch_debug", 0);
     startup_stage_write("04 VFS and GL allocator ready");
 
-    /* Page-aligned so svcMapMemory can alias them into the fastmem window;
-     * the kernel requires page-aligned source, destination and size. Harmless
-     * when fastmem is off. */
     g_stack = page_alloc(STACK_SIZE);
     g_heap = page_alloc(HEAP_SIZE);
     g_surf = page_alloc(SURF_BYTES);
@@ -7565,53 +6035,12 @@ static void run(void) {
         return;
     }
     startup_stage_write("05 guest buffers allocated");
-    {   /* Fastmem: alias every guest region at fast_base + guest_addr, so a
-         * translation becomes one add rather than a chain of dependent loads
-         * through the region table. The guest address space is 32 bits, so a
-         * 4 GB window covers it exactly and no bounds test is needed at all.
-         *
-         * Opt-in, because it changes what an unmapped guest access does:
-         * today guest_ptr returns NULL and the interpreter faults with an
-         * address and a PC history, and under fastmem the process takes a
-         * data abort instead. Bad accesses have been a recurring bug class
-         * here, so the diagnosable path stays the default.
-         *
-         * Any failure leaves fast_base NULL and everything falls back. */
-        const int want_fm = adv_int("fastmem", 0);
-        if (want_fm) {
-            /* The loader callocs the image, so it is not page aligned; copy it
-             * into an aligned buffer now that relocations have been applied. */
-            uint32_t ialloc = (g_img.image_alloc + 0xFFFu) & ~0xFFFu;
-            uint8_t *ia = page_alloc(ialloc);
-            if (ia) {
-                memcpy(ia, g_img.image, g_img.image_alloc);
-                free(g_img.image);
-                g_img.image = ia;
-                g_img.image_alloc = ialloc;
-            }
-            g_want_fastmem = 1;
-        } else {
-            printf("fastmem off\n");
-        }
-    }
     guest_mem_add(&g.mem, g_img.load_base, g_img.image_alloc, g_img.image, 1);
     guest_mem_add(&g.mem, STACK_BASE, STACK_SIZE, g_stack, 1);
     guest_mem_add(&g.mem, HEAP_BASE, HEAP_SIZE, g_heap, 1);
     guest_mem_add(&g.mem, SURF_BASE, SURF_BYTES, g_surf, 1);
     guest_mem_add(&g.mem, SCRATCH_BASE, SCRATCH_SIZE, g_scratch, 1);
     g_memp = &g.mem;
-    if (g_want_fastmem) {
-        fastmem_setup(&g.mem);   /* after the regions exist, not before */
-        if (g.mem.fast_base) {
-            g_img.image = g.mem.fast_base + IMAGE_BASE;
-            g_stack     = g.mem.fast_base + STACK_BASE;
-            g_heap      = g.mem.fast_base + HEAP_BASE;
-            g_surf      = g.mem.fast_base + SURF_BASE;
-            runtime_note("fastmem");
-        } else {
-            runtime_note("fastmem FAILED");
-        }
-    }
     startup_stage_write("06 guest memory mapped");
 #ifdef __SWITCH__
     {   /* Player name. The game builds its online name with
@@ -7682,45 +6111,21 @@ static void run(void) {
         }
     }
 #endif
-    /* Guest-PC histogram. Sized to the loaded image, so a PC outside it (stub
-     * page, callback trampolines) falls out on the bounds test rather than
-     * needing its own range. ~440 KB for a 7 MB image; if the allocation
-     * fails the pointer stays NULL and the loop skips it. */
-    /* Both profilers are opt-in, because both cost per-instruction work on the
-     * one path every guest instruction takes: pcprof is three field loads and
-     * an increment into a ~440 KB array, iprof a load and an increment in both
-     * decoders. The host bench has always gated iprof for exactly this reason
-     * -- "the counter is itself per-instruction work" -- while the device build
-     * left both running permanently, folding their cost into every frame the
-     * game has ever rendered here.
-     *
-     * Turn the profilers on when choosing what to hook; leave them off to
-     * play. The reports already handle a NULL pointer by printing nothing. */
-    {
-        const int want_prof = adv_int("profilers", 0);
-        g.pcprof_base = g_img.load_base;
-        g.pcprof_buckets = (g_img.image_size + 15u) >> 4;
-        if (want_prof) {
-            g.iprof = g_iprof;
-            g.pcprof = (uint32_t *)calloc(g.pcprof_buckets, sizeof(uint32_t));
-            /* The HLE split belongs with them, and for the same reason: the
-             * dynarmic boundary times itself with four CNTPCT_EL0 reads per
-             * import call (~15 600 a frame here), and it tests this pointer to
-             * decide whether to. It used to be set unconditionally, so every
-             * shipping build paid for a measurement nobody was reading. */
-            g.prof = hle_profile;
-            g_prof_on = 1;
-            runtime_note("profilers");
-        }
-        if (!g.pcprof)
-            g.pcprof_buckets = 0;
-        printf("profilers %s\n", want_prof ? "on" : "off");
+    /* The HLE profiler: splits frame time between guest code and the
+     * handlers. Opt-in, because the dynarmic boundary times itself with four
+     * CNTPCT_EL0 reads per import call (~15 600 a frame here) and tests this
+     * pointer to decide whether to. */
+    if (adv_int("profilers", 0)) {
+        g.prof = hle_profile;
+        g_prof_on = 1;
+        runtime_note("profilers");
+        printf("profilers on\n");
     }
 
     /* Real time, or the old fixed 16 ms step; see hle_timer_ms. Real time
-     * is the default now -- the fixed step made game speed a function of
-     * frame rate. fixed_clock puts the reproducible clock back, which is what
-     * a run compared against the Unicorn reference needs. */
+     * is the default -- the fixed step made game speed a function of frame
+     * rate. fixed_clock puts the reproducible clock back, which is what a
+     * benchmark pair needs so both arms run the same guest work. */
     {
         g_clock_fixed = adv_int("fixed_clock", 0);
         printf("clock %s\n", g_clock_fixed
@@ -7729,27 +6134,14 @@ static void run(void) {
             runtime_note("fixed clock");
     }
 
-    /* Dynarmic, chosen with cpu_engine.
-     *
-     * A setting rather than a build switch because the whole point is to
-     * compare it against the interpreter on the same binary in the same
-     * scene: two builds is exactly the mistake that made the predecode spike
-     * look like a 6% win when it was worth nothing at all.
-     *
-     * dynarmic_cache_mb sets the code cache. The default is far below
+    /* dynarmic_cache_mb sets the code cache. The default is far below
      * dynarmic's own 128 MB: this is one game, the translations are bounded by
      * how much of the image actually runs, and on this console that memory is
-     * taken from a heap the guest also needs.
-     *
-     * Failure here is not fatal and not even unusual -- executable memory
-     * depends on how the homebrew was launched -- so dyn_init reports and
-     * returns 0, and everything below carries on interpreting. */
+     * taken from a heap the guest also needs. */
     {
         const int mb = adv_int("dynarmic_cache_mb", (int)g_dyn_mb);
-        g_want_dyn = !strcmp(adv_str("cpu_engine", "interpreter"), "dynarmic");
         if (mb >= 4 && mb <= 256)
             g_dyn_mb = (unsigned)mb;
-        printf("cpu: %s\n", g_want_dyn ? "dynarmic" : "interpreter");
     }
 
     /* Benchmark mode; see the comment on g_bench. Deliberately NOT combined
@@ -7768,16 +6160,6 @@ static void run(void) {
                    (unsigned long long)(g_bench_target / 1000000ull));
             runtime_note("BENCHMARK (input off)");
         }
-    }
-
-    /* T16 0x46 predecode fast path; see g_predecode in interp.c. Off by
-     * default so the two arms of an A/B differ by a setting, not a build. */
-    {
-        g_predecode = adv_int("predecode", 0);
-        printf("predecode %s\n",
-               g_predecode ? "on: T16 0x46 fast path" : "off");
-        if (g_predecode)
-            runtime_note("predecode");
     }
 
     report_clocks("start");
@@ -7802,19 +6184,26 @@ static void run(void) {
         printf("  [snd  ] no audio output; sound stays silent\n");
     startup_stage_write("07 imports bound");
 
-    /* 24, not 16: ctype takes the count to 11, the divide block to 16, and
-     * the vertex transform made that one past the end. Sized with room so
-     * the next hook is not a silent overrun. */
-    static GuestHook hooks[24];
+    /* Native hooks. None of these is a speed-up for guest code -- dynarmic
+     * compiles that itself, and an interception costs it a block exit and a
+     * register sync each way. What remains is what changes behaviour:
+     *
+     *   malloc / realloc / free  stand in for an allocator whose vtable this
+     *                            image never populates
+     *   memcpy / memset          amortised over the bytes they move
+     *   image handler repair     restores a registry handler's NULL vtable
+     *   angle normalise          fmodf instead of a subtract loop that ran
+     *                            ~44M iterations on one bad value; skipping
+     *                            it hangs the game */
+    static GuestHook hooks[8];
     hooks[0].addr = g_img.load_base + RVA_MGR_MALLOC;
     hooks[0].fn = hook_malloc;
     hooks[1].addr = g_img.load_base + RVA_MGR_REALLOC;
     hooks[1].fn = hook_realloc;
     hooks[2].addr = g_img.load_base + RVA_MGR_FREE;
     hooks[2].fn = hook_free;
-    g.hook = hooks;
     hooks[3].addr = g_img.load_base + RVA_IMAGE_HANDLER_READY;
-    hooks[3].fn = watch_image_handler;
+    hooks[3].fn = repair_image_handler;
     hooks[3].observe = 1;
     hooks[4].addr = g_img.load_base + RVA_FAST_ANGLE_NORMALIZE;
     hooks[4].fn = fast_angle_normalize;
@@ -7823,125 +6212,12 @@ static void run(void) {
     hooks[5].fn = hook_native_memcpy;
     hooks[6].addr = g_img.load_base + RVA_NATIVE_MEMSET;
     hooks[6].fn = hook_native_memset;
-    hooks[7].addr = g_img.load_base + RVA_IMG_PTR_LOAD;
-    hooks[7].fn = watch_truncated_ptr;
-    hooks[7].observe = 1;
-    hooks[8].addr = g_img.load_base + RVA_STRUCT_COPY_STORE;
-    hooks[8].fn = watch_struct_copy;
-    hooks[8].observe = 1;
-    g.hook_count = 9;
-
-    /* ctype last, because it installs only if the image really is laid out the
-     * way the disassembly said. Silence here means the game keeps running its
-     * own tolower, which is slower but never wrong. */
-    g_ctype_got = ctype_resolve_got(&g.mem, g_img.load_base);
-    /* Not under dynarmic; see the note on the divide block below. tolower is
-     * called per CHARACTER, and at 14M interceptions per 2000M instructions it
-     * was the single most frequent one measured. */
-    if (g_ctype_got && !g_want_dyn) {
-        hooks[9].addr = g_img.load_base + RVA_TOLOWER;
-        hooks[9].fn = hook_tolower;
-        hooks[10].addr = g_img.load_base + RVA_TOUPPER;
-        hooks[10].fn = hook_toupper;
-        g.hook_count = 11;
-        printf("  [fast ] ctype table slot at %08x\n", (unsigned)g_ctype_got);
-    } else if (g_ctype_got) {
-        printf("  [fast ] ctype hooks off under dynarmic\n");
-    } else {
-        printf("  [fast ] ctype hooks not installed (literals did not read)\n");
-    }
-
-    /* Every hook below -- the divides, the float guards, the vector helpers --
-     * exists only to make the INTERPRETER faster. Each replaces a small leaf
-     * function with native C because stepping that function one instruction at
-     * a time is slow.
-     *
-     * Dynarmic compiles those same leaves to native AArch64 by itself, so the
-     * hook swaps compiled code for compiled code and wins nothing -- while the
-     * interception costs a block termination, a register sync each way, and a
-     * trip through the dispatcher, none of which the interpreter pays. On a
-     * function as small as a NaN guard that is pure loss, and it is loss taken
-     * millions of times: the first full run measured 14M interceptions in
-     * 2000M instructions, one every 143, and the two most frequent were
-     * tolower and f32_guard.
-     *
-     * What stays under dynarmic is the hooks that are not optimisations:
-     * malloc, realloc and free, which stand in for an allocator whose vtable
-     * this image never populates, and memcpy/memset, whose cost is amortised
-     * over the bytes they move rather than paid per call. */
-    if (!g_want_dyn) {   /* Divide. Indices follow whatever the ctype block
-         * left hook_count at, so the two blocks stay independent. */
-        uint32_t d = g.hook_count;
-        hooks[d + 0].addr = g_img.load_base + RVA_UIDIV;
-        hooks[d + 0].fn = hook_uidiv;
-        hooks[d + 1].addr = g_img.load_base + RVA_UIDIVMOD;
-        hooks[d + 1].fn = hook_uidivmod;
-        hooks[d + 2].addr = g_img.load_base + RVA_IDIV;
-        hooks[d + 2].fn = hook_idiv;
-        hooks[d + 3].addr = g_img.load_base + RVA_F32_GUARD;
-        hooks[d + 3].fn = hook_f32_guard;
-        hooks[d + 4].addr = g_img.load_base + RVA_F32_MUL_GUARD;
-        hooks[d + 4].fn = hook_f32_mul_guard;
-        hooks[d + 5].addr = g_img.load_base + RVA_VTX_TRANSFORM;
-        hooks[d + 5].fn = hook_vtx_transform;
-        hooks[d + 6].addr = g_img.load_base + RVA_VEC3_ADD16;
-        hooks[d + 6].fn = hook_vec3_add16;
-        hooks[d + 7].addr = g_img.load_base + RVA_NORMALISE;
-        hooks[d + 7].fn = hook_normalise;
-        /* Top of the first undistorted in-game profile at 9%; see the
-         * comment on hook_affine_compose. */
-        hooks[d + 8].addr = g_img.load_base + RVA_AFFINE_COMPOSE;
-        hooks[d + 8].fn = hook_affine_compose;
-        g.hook_count = d + 9;
-    }
-
-    /* Statically recompiled functions, opt-in, and verified against the
-     * interpreter under recomp_verify. Installed last so the indices above
-     * are untouched whether it runs or not. recomp_mask picks which of them
-     * are installed, one bit per entry of g_recomp[]; the menu shows it as a
-     * checkbox per function. */
-    {
-        const int mask = adv_int("recomp_mask", -1);
-        g_recomp_on = adv_int("recomp", 0);
-        g_recomp_verify = adv_int("recomp_verify", 0);
-        g_recomp_ablate = adv_int("recomp_ablate", 0);
-        if (g_recomp_verify || g_recomp_ablate)
-            g_recomp_on = 1;
-        if (mask >= 0)
-            g_recomp_mask = (uint32_t)mask;
-        if (g_recomp_on) {
-            uint32_t r = g.hook_count;
-            unsigned i;
-            g_recomp_hook0 = r;
-            uint32_t inst = 0;
-            for (i = 0; i < g_recomp_count && i < RECOMP_MAX; i++) {
-                if (!(g_recomp_mask & (1u << i))) {
-                    printf("  [recomp] %s: not installed (mask)\n",
-                           g_recomp[i].name);
-                    continue;
-                }
-                hooks[r + inst].addr = g_img.load_base + g_recomp[i].rva;
-                hooks[r + inst].fn = hook_recomp;
-                hooks[r + inst].user = (void *)(uintptr_t)i;
-                g_recomp_slot[i] = r + inst;
-                inst++;
-            }
-            g.hook_count = r + inst;
-            printf("recomp on%s%s, %u function(s)\n",
-                   g_recomp_verify ? " (verifying)" : "",
-                   g_recomp_ablate ? " (ablating: alternate 300-frame windows)"
-                                   : "",
-                   g_recomp_count);
-            runtime_note(g_recomp_verify ? "recomp (verifying)" : "recomp");
-        } else {
-            printf("recomp off\n");
-        }
-    }
+    g.hook = hooks;
+    g.hook_count = 7;
 
     g.cpu.r[GUEST_SP] = STACK_BASE + STACK_SIZE - 16;
     g.cpu.cpsr = CPSR_Z;   /* Unicorn's reset state; flags are undefined
-                            * at entry, so match the oracle rather than
-                            * leave the differential misaligned. */
+                            * at entry, so match the reference harness. */
     g.cpu.r[15] = g_img.entry;        /* RVA 0, ARM mode: CPSR.T stays clear */
     startup_stage_write("08 CPU and hooks ready");
 
@@ -7957,21 +6233,22 @@ static void run(void) {
     /* After the regions AND the hooks: the page table is built from the
      * region list, and the interception filter from the hook table, so
      * anything registered later would be invisible to one or the other. */
-    if (g_want_dyn) {
-        g_dyn_live = dyn_init(&g, g_dyn_mb);
-        if (!g_dyn_live)
-            printf("cpu: falling back to the interpreter\n");
-    }
+    /* Failure is not fatal: executable memory depends on how the homebrew
+     * was launched, so dyn_init reports and returns 0, and dyn_run carries on
+     * with the interpreter -- slowly, but correctly. */
+    g_dyn_live = dyn_init(&g, g_dyn_mb);
+    if (!g_dyn_live)
+        printf("cpu: dynarmic unavailable, falling back to the interpreter\n");
     {   /* Only now is the engine actually known: dynarmic asks the kernel for
          * executable memory and does not always get it. */
         char note[48];
         if (g_dyn_live)
             snprintf(note, sizeof note, "dynarmic %u MB", g_dyn_mb);
         else
-            snprintf(note, sizeof note, "interpreter");
+            snprintf(note, sizeof note, "interpreter (dynarmic failed)");
         runtime_note(note);
     }
-    startup_stage_write("09 entering guest interpreter");
+    startup_stage_write("09 entering guest code");
     {
         static const uint64_t delta[] = {
             1, 9, 90, 900, 9000, 90000, 900000
@@ -8124,27 +6401,7 @@ static void run(void) {
            (unsigned)g_live_bytes, (unsigned)g_peak_bytes,
            (unsigned)(g_brk - HEAP_BASE), g_hook_hits[0],
            g_hook_hits[1], g_hook_hits[2]);
-    if (g_jitprof_samples) {
-        uint64_t freq = armGetSystemTickFreq();
-        uint64_t ns = g_jitprof_ticks * 1000000000ull
-                    / (freq * g_jitprof_samples);
-        printf("  [jitp ] dispatch %llu ns mean over %llu sampled"
-               " (%llu%% ran a block)\n",
-               (unsigned long long)ns,
-               (unsigned long long)g_jitprof_samples,
-               (unsigned long long)(g_jitprof_ran * 100ull
-                                    / g_jitprof_samples));
-    }
-    printf("jit: %u blocks, %llu / %llu guest instructions compiled (%.1f%%)\n",
-           (unsigned)g.jit_blocks, (unsigned long long)g.jit_executed,
-           (unsigned long long)g.executed,
-           g.executed ? 100.0 * (double)g.jit_executed / (double)g.executed : 0.0);
-    printf("  [fast ] vertex transform: %u hooked, %u skipped (unmapped)\n",
-           (unsigned)g_vtx_hits, (unsigned)g_vtx_skips);
-    printf("  [fast ] vec3 add: %u hooked, %u skipped; normalise: %u hooked, %u skipped\n",
-           (unsigned)g_vadd_hits, (unsigned)g_vadd_skips,
-           (unsigned)g_norm_hits, (unsigned)g_norm_skips);
-    printf("fastmem: memcpy %u calls/%llu bytes, memset %u calls/%llu bytes\n",
+    printf("native: memcpy %u calls/%llu bytes, memset %u calls/%llu bytes\n",
            (unsigned)g_fast_mem_hits[0],
            (unsigned long long)g_fast_mem_bytes[0],
            (unsigned)g_fast_mem_hits[1],
@@ -8273,17 +6530,7 @@ int main(int argc, char **argv) {
         advanced_init(died);
     }
 
-#ifdef BOZ_PGO
-    /* Instrumented build. gcov writes .gcda next to the object files it was
-     * built from, which on this target means a Windows path that does not
-     * exist -- so redirect it onto the card, where the control socket can
-     * fetch it. STRIP is deliberately huge: it flattens every directory
-     * component off the recorded path so the files land as plain basenames in
-     * one directory, which is all GET can address. */
-    setenv("GCOV_PREFIX", "sdmc:/switch/boz", 1);
-    setenv("GCOV_PREFIX_STRIP", "99", 1);
-#endif
-    printf("s3e interpreter test - %s\n\nconnecting to nxlink host...\n",
+    printf("Call of Duty: Black Ops Zombies - %s\n\nconnecting to nxlink host...\n",
            BOZ_BUILD_LABEL);
     consoleUpdate(NULL);
     if (R_SUCCEEDED(socketInitializeDefault())) {
@@ -8316,7 +6563,7 @@ int main(int argc, char **argv) {
     g_nxlink_up = (nxfd >= 0);
     setvbuf(stdout, NULL, _IONBF, 0);   /* stream lines as they happen */
 
-    printf("s3e interpreter test - %s\n\n", BOZ_BUILD_LABEL);
+    printf("Call of Duty: Black Ops Zombies - %s\n\n", BOZ_BUILD_LABEL);
     run();
     printf("\nPress + to exit.\n");
     while (appletMainLoop()) {
@@ -8326,18 +6573,6 @@ int main(int argc, char **argv) {
         /* ctl_poll now runs on its own thread; see ctl_thread_start. */
         consoleUpdate(NULL);
     }
-#ifdef BOZ_PGO
-    /* Nothing calls exit() on this path, so the atexit handler that normally
-     * flushes counters never runs. Dump explicitly, and say so, because a
-     * profiled run that silently wrote nothing looks exactly like one that
-     * worked until the rebuild reports no profile data. */
-    {
-        extern void __gcov_dump(void);
-        printf("pgo: dumping counters to sdmc:/switch/boz\n");
-        __gcov_dump();
-        printf("pgo: dump complete\n");
-    }
-#endif
     if (nxfd >= 0)
         close(nxfd);
     if (sockets_up)
