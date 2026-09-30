@@ -15,6 +15,13 @@ through the Switch GPU with OpenGL ES 1.1.
 `.s3e` image are Activision's; supply them from your own copy (see
 [Installing](#installing)).
 
+
+> [!IMPORTANT]
+> codboz-nx is a personal project intended as a temporary solution until a more official or robust alternative becomes available.
+> This project was created **entirely with the help of AI coding tools**.
+> I am **not a developer**, so the code may contain bugs, security vulnerabilities, mistakes, or unfinished features. romm-nx is a personal project that I decided to share with others who may find it useful.
+> Use it at your own risk. I cannot guarantee support, stability, compatibility, security, or regular updates.
+
 ## Status — v1.0.0
 
 Playable:
